@@ -263,6 +263,7 @@ GiantVM-Frontier-V16/
 ├── slave_daemon/
 │   ├── net_uring.c                 # 源端分片
 │   └── cpu_executor.c              # KVM Loop
+│   └── Makefile                   # 构建脚本
 ├── guest_tools/
 │   └── win_memory_hint.cpp         # vNUMA 欺骗
 └── deploy/
@@ -418,7 +419,7 @@ GiantVM-Frontier-V16/
 **文件**: `master_core/user_backend.c`, `master_core/main_wrapper.c`, `master_core/Makefile_User`
 
 ## Step 6: Slave 守护进程 (Slave daemon)
-**文件**: `slave_daemon/net_uring.c`, `slave_daemon/cpu_executor.c`, `master_core/Makefile_User`
+**文件**: `slave_daemon/net_uring.c`, `slave_daemon/cpu_executor.c`, `slave_daemon/Makefile`, `master_core/Makefile_User`
 
 ## Step 7: 控制面工具 (Control Tool)
 **文件**: `ctl_tool/main.c`, `ctl_tool/Makefile`
@@ -1200,23 +1201,19 @@ ccflags-y := -I$(src)/../common_include
 #include <sys/time.h>
 #include <stdarg.h>
 #include <errno.h>
-#include <pthread.h> // [新增] 多线程支持
+#include <pthread.h> 
 
 #include "unified_driver.h"
 #include "../common_include/giantvm_protocol.h"
 
 #define MAX_INFLIGHT_REQS 65536
+#define MASTER_PORT 8000 // [关键] Master 固定监听端口
 
 // 全局状态
 static int g_sock = -1;
 static struct sockaddr_in g_gateways[GVM_MAX_GATEWAYS];
 static uint64_t g_id_counter = 1;
-
-// [新增] 请求状态表 (0=Pending, 1=Done)
-// 使用 volatile 确保编译器不会优化读取操作
-static volatile uint8_t g_req_status[MAX_INFLIGHT_REQS];
-
-// [新增] 接收线程句柄
+static volatile uint8_t g_req_status[MAX_INFLIGHT_REQS]; // 状态表
 static pthread_t g_rx_thread;
 
 // --- Malloc Wrappers ---
@@ -1225,43 +1222,30 @@ static void u_free_large_table(void *ptr) { free(ptr); }
 static void* u_alloc_packet(size_t size, int atomic) { return malloc(size); }
 static void u_free_packet(void *ptr) { free(ptr); }
 
-// --- Network Helper: RX Thread ---
-// [新增] 独立的接收线程，模拟内核的 SoftIRQ RX 回调
+// --- RX Thread ---
 static void* rx_thread_loop(void *arg) {
     char buf[MTU_SIZE];
     struct sockaddr_in src_addr;
     socklen_t addr_len = sizeof(src_addr);
     
-    // printf("[UserBackend] RX Thread Started.\n");
-
     while (1) {
-        // 阻塞接收
-        int len = recvfrom(g_sock, buf, sizeof(buf), 0, 
-                           (struct sockaddr*)&src_addr, &addr_len);
-        
+        int len = recvfrom(g_sock, buf, sizeof(buf), 0, (struct sockaddr*)&src_addr, &addr_len);
         if (len >= sizeof(struct gvm_header)) {
             struct gvm_header *hdr = (struct gvm_header *)buf;
-            
-            // 校验 Magic
-            if (hdr->magic == GVM_MAGIC) {
-                // 判断是否为回包 (ACK / RESPONSE)
-                if (hdr->msg_type == MSG_MEM_ACK || 
-                    hdr->msg_type == MSG_VCPU_EXIT || 
-                    hdr->msg_type == MSG_MEM_READ) {
-                    
-                    // [关键] 标记请求完成
-                    // 使用 __sync_synchronize 确保写屏障
-                    uint32_t idx = hdr->req_id % MAX_INFLIGHT_REQS;
-                    g_req_status[idx] = 1;
-                    __sync_synchronize(); 
-                }
+            if (hdr->magic == GVM_MAGIC && 
+               (hdr->msg_type == MSG_MEM_ACK || hdr->msg_type == MSG_VCPU_EXIT)) {
+                
+                // 标记完成
+                uint32_t idx = hdr->req_id % MAX_INFLIGHT_REQS;
+                g_req_status[idx] = 1;
+                __sync_synchronize(); 
             }
         }
     }
     return NULL;
 }
 
-// --- Network Wrapper: Send ---
+// --- Send ---
 static void u_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
     if (gw_id < GVM_MAX_GATEWAYS) {
         g_gateways[gw_id].sin_family = AF_INET;
@@ -1272,37 +1256,24 @@ static void u_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
 
 static int u_send_packet(void *data, int len, uint32_t target_id) {
     if (g_sock < 0) return -1;
-    
     struct gvm_header *hdr = (struct gvm_header *)data;
     uint32_t gw_id = target_id >> GVM_ROUTING_SHIFT;
     struct sockaddr_in *addr = &g_gateways[gw_id];
     
-    if (addr->sin_port == 0) {
-        // 如果网关未配置，为了防止死锁，直接假装成功
-        // 或者返回错误
-        return -1; 
-    }
+    if (addr->sin_port == 0) return -1;
 
-    // [关键] 发送前重置状态位为 0 (Pending)
+    // 清除状态位
     if (len >= sizeof(struct gvm_header)) {
-        uint32_t idx = hdr->req_id % MAX_INFLIGHT_REQS;
-        g_req_status[idx] = 0;
-        __sync_synchronize(); // 写屏障
+        g_req_status[hdr->req_id % MAX_INFLIGHT_REQS] = 0;
+        __sync_synchronize();
     }
-
     return sendto(g_sock, data, len, 0, (struct sockaddr*)addr, sizeof(*addr));
 }
 
-// --- Logic Core Hooks ---
-
-// [修改] 真正的状态检查
+// --- Logic Hooks ---
 static int u_check_req_status(uint64_t id) {
-    __sync_synchronize(); // 读屏障
-    // 检查数组对应位
-    if (g_req_status[id % MAX_INFLIGHT_REQS] == 1) {
-        return 1; // REQ_DONE
-    }
-    return 0; // REQ_PENDING
+    __sync_synchronize();
+    return (g_req_status[id % MAX_INFLIGHT_REQS] == 1);
 }
 
 static void u_log(const char *fmt, ...) {
@@ -1320,7 +1291,7 @@ static uint64_t u_get_time_us(void) {
     return tv.tv_sec * 1000000UL + tv.tv_usec;
 }
 static uint64_t u_time_diff_us(uint64_t start) { return u_get_time_us() - start; }
-static void u_cpu_relax(void) { usleep(1); } // 用户态短暂休眠，避免跑死 CPU
+static void u_cpu_relax(void) { usleep(1); }
 
 struct dsm_driver_ops u_ops = {
     .alloc_large_table = u_alloc_large_table,
@@ -1344,16 +1315,21 @@ int user_backend_init(void) {
     g_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_sock < 0) return -1;
 
-    // 清空状态表
-    memset((void*)g_req_status, 0, sizeof(g_req_status));
+    // [关键] 绑定固定端口
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = htons(MASTER_PORT);
 
-    // [关键] 启动接收线程
-    if (pthread_create(&g_rx_thread, NULL, rx_thread_loop, NULL) != 0) {
-        perror("Failed to create RX thread");
+    if (bind(g_sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
+        perror("[-] Failed to bind Master Port");
         close(g_sock);
         return -1;
     }
 
+    memset((void*)g_req_status, 0, sizeof(g_req_status));
+    if (pthread_create(&g_rx_thread, NULL, rx_thread_loop, NULL) != 0) return -1;
     return 0;
 }
 ```
@@ -1362,16 +1338,34 @@ int user_backend_init(void) {
 
 ```c
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include "logic_core.h"
 
 extern struct dsm_driver_ops u_ops;
 extern int user_backend_init(void);
 
-int main() {
-    if (user_backend_init() || gvm_core_init(&u_ops)) return 1;
-    printf("User Backend Running.\n");
-    gvm_handle_page_fault_logic(0x1000); // Trigger test
+int main(int argc, char **argv) {
+    printf("[*] GiantVM User-Mode Master (Mode B) Starting...\n");
+
+    if (user_backend_init() != 0) {
+        return 1;
+    }
+
+    if (gvm_core_init(&u_ops) != 0) {
+        return 1;
+    }
+
+    // [配置] 指向本地 Slave
+    printf("[*] Configuring Gateway[0] -> 127.0.0.1:9000\n");
+    u_ops.set_gateway_ip(0, inet_addr("127.0.0.1"), htons(9000));
+
+    // [触发] 发送请求并阻塞等待
+    printf("[*] Sending Request... (Waiting for ACK)\n");
+    gvm_handle_page_fault_logic(0x1000); 
+
+    printf("[+] Test Passed! ACK received.\n");
     while(1) sleep(10);
     return 0;
 }
@@ -1381,8 +1375,7 @@ int main() {
 
 ```makefile
 CC = gcc
-# [修改] 添加 -pthread 或 -lpthread
-CFLAGS = -Wall -O2 -I../common_include -pthread 
+CFLAGS = -Wall -O2 -I../common_include -pthread
 TARGET = giantvm_master_user
 SRCS = logic_core.c user_backend.c main_wrapper.c
 
@@ -1407,223 +1400,207 @@ clean:
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/syscall.h>
-#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <linux/io_uring.h> // Only for structs
 #include <errno.h>
-
+#include <sched.h> // 包含 CPU 亲和性设置的头文件
 #include "../common_include/giantvm_protocol.h"
 
-// Raw Syscall Wrappers
-#ifndef __NR_io_uring_setup
-#define __NR_io_uring_setup 425
-#define __NR_io_uring_enter 426
-#define __NR_io_uring_register 427
-#endif
-
-#define QUEUE_DEPTH 64
+// ... (省略了 BATCH_SIZE 和 RECV_PORT 的宏定义，与原版相同)
+#define BATCH_SIZE 64
 #define RECV_PORT 9000
 
-// Internal Ring Structure
-struct app_io_sq_ring {
-    unsigned *head;
-    unsigned *tail;
-    unsigned *ring_mask;
-    unsigned *ring_entries;
-    unsigned *flags;
-    unsigned *array;
-};
+// 接口定义保持不变
+extern void handle_kvm_request(int sockfd, struct sockaddr_in *addr, struct gvm_header *hdr, void *data);
 
-struct app_io_cq_ring {
-    unsigned *head;
-    unsigned *tail;
-    unsigned *ring_mask;
-    unsigned *ring_entries;
-    struct io_uring_cqe *cqes;
-};
+// 原来的 start_network_loop 函数被改造为线程入口函数
+void* network_thread_worker(void* arg) {
+    long core_id = *(long*)arg;
+    free(arg); // 释放传递过来的参数内存
 
-struct submitter {
-    int ring_fd;
-    struct app_io_sq_ring sq_ring;
-    struct io_uring_sqe *sqes;
-    struct app_io_cq_ring cq_ring;
-};
-
-struct submitter s;
-
-// Helper: Setup io_uring via Raw Syscall
-int io_uring_setup_raw(unsigned entries, struct io_uring_params *p) {
-    return (int)syscall(__NR_io_uring_setup, entries, p);
-}
-
-int io_uring_enter_raw(int fd, unsigned to_submit, unsigned min_complete, unsigned flags) {
-    return (int)syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, NULL, 0);
-}
-
-// Memory Mapping the Ring
-void app_setup_uring(struct submitter *s) {
-    struct io_uring_params p;
-    void *sq_ptr, *cq_ptr;
-
-    memset(&p, 0, sizeof(p));
-    s->ring_fd = io_uring_setup_raw(QUEUE_DEPTH, &p);
-    if (s->ring_fd < 0) { perror("io_uring_setup"); exit(1); }
-
-    int sring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-    int cring_sz = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
-
-    // Map SQ and CQ
-    if (p.features & IORING_FEAT_SINGLE_MMAP) {
-        if (cring_sz > sring_sz) sring_sz = cring_sz;
-        cring_sz = sring_sz;
-    }
-
-    sq_ptr = mmap(0, sring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                  s->ring_fd, IORING_OFF_SQ_RING);
-    if (sq_ptr == MAP_FAILED) { perror("mmap sq"); exit(1); }
-
-    // Map SQEs (Submission Queue Entries)
-    s->sqes = mmap(0, p.sq_entries * sizeof(struct io_uring_sqe),
-                   PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                   s->ring_fd, IORING_OFF_SQES);
-    if (s->sqes == MAP_FAILED) { perror("mmap sqes"); exit(1); }
-
-    // Setup SQ Pointers
-    s->sq_ring.head = sq_ptr + p.sq_off.head;
-    s->sq_ring.tail = sq_ptr + p.sq_off.tail;
-    s->sq_ring.ring_mask = sq_ptr + p.sq_off.ring_mask;
-    s->sq_ring.ring_entries = sq_ptr + p.sq_off.ring_entries;
-    s->sq_ring.flags = sq_ptr + p.sq_off.flags;
-    s->sq_ring.array = sq_ptr + p.sq_off.array;
-
-    // Map CQ (if not single mmap)
-    if (p.features & IORING_FEAT_SINGLE_MMAP) {
-        cq_ptr = sq_ptr;
+    // 1. [核心优化] 绑定 CPU 亲和性
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+        // 在某些容器环境中可能失败，打印警告但继续运行
+        fprintf(stderr, "[Warning] Could not set thread affinity for core %ld\n", core_id);
     } else {
-        cq_ptr = mmap(0, cring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                      s->ring_fd, IORING_OFF_CQ_RING);
+        printf("[Thread %ld] Pinned to CPU Core %ld\n", core_id, core_id);
+    }
+    
+    // 2. 每个线程创建自己的 Socket
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket failed");
+        return NULL;
     }
 
-    // Setup CQ Pointers
-    s->cq_ring.head = cq_ptr + p.cq_off.head;
-    s->cq_ring.tail = cq_ptr + p.cq_off.tail;
-    s->cq_ring.ring_mask = cq_ptr + p.cq_off.ring_mask;
-    s->cq_ring.ring_entries = cq_ptr + p.cq_off.ring_entries;
-    s->cq_ring.cqes = cq_ptr + p.cq_off.cqes;
-}
-
-// Add Request to Ring
-void submit_recvmsg(struct submitter *s, int sockfd, struct msghdr *msg) {
-    unsigned tail = *s->sq_ring.tail;
-    unsigned index = tail & *s->sq_ring.ring_mask;
-    struct io_uring_sqe *sqe = &s->sqes[index];
-
-    memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode = IORING_OP_RECVMSG;
-    sqe->fd = sockfd;
-    sqe->addr = (unsigned long)msg;
-    sqe->len = 1; // For recvmsg, len is ignored usually, uses msghdr
-    sqe->user_data = (unsigned long)msg; // Pass msg back on completion
-
-    s->sq_ring.array[index] = index;
-    *s->sq_ring.tail = tail + 1;
-}
-
-extern void handle_kvm_request(struct gvm_header *hdr, void *data);
-
-void start_network_loop(void) {
-    int sockfd;
-    struct sockaddr_in addr;
-    struct msghdr msgs[QUEUE_DEPTH];
-    struct iovec iovecs[QUEUE_DEPTH];
-    char buffers[QUEUE_DEPTH][MTU_SIZE];
-    
-    // 1. Setup UDP Socket
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     int opt = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // 2.1 [核心优化] 开启 SO_REUSEPORT
+    // 允许多个 Socket 绑定到同一个 IP:PORT，内核会自动进行负载均衡
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        perror("SO_REUSEPORT failed. Your kernel might be too old.");
+        close(sockfd);
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(RECV_PORT);
-    bind(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+    addr.sin_addr.s_addr = INADDR_ANY;
 
-    // 2. Setup io_uring
-    app_setup_uring(&s);
-    printf("[Slave] io_uring (Raw Syscall) Initialized.\n");
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        close(sockfd);
+        return NULL;
+    }
+    
+    // 3. 每个线程有自己独立的接收缓冲区
+    struct mmsghdr msgs[BATCH_SIZE];
+    struct iovec iovecs[BATCH_SIZE];
+    char buffers[BATCH_SIZE][MTU_SIZE];
+    struct sockaddr_in client_addrs[BATCH_SIZE];
 
-    // 3. Pre-fill Ring
-    for (int i = 0; i < QUEUE_DEPTH; i++) {
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < BATCH_SIZE; i++) {
         iovecs[i].iov_base = buffers[i];
         iovecs[i].iov_len = MTU_SIZE;
-        msgs[i].msg_name = NULL;
-        msgs[i].msg_namelen = 0;
-        msgs[i].msg_iov = &iovecs[i];
-        msgs[i].msg_iovlen = 1;
-        msgs[i].msg_control = NULL;
-        msgs[i].msg_controllen = 0;
-        msgs[i].msg_flags = 0;
-
-        submit_recvmsg(&s, sockfd, &msgs[i]);
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &client_addrs[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
     }
 
-    // 4. Event Loop
+    // 4. 网络循环 (与原版逻辑几乎相同)
     while (1) {
-        // Submit and Wait
-        io_uring_enter_raw(s.ring_fd, 1, 1, IORING_ENTER_GETEVENTS);
+        int retval = recvmmsg(sockfd, msgs, BATCH_SIZE, 0, NULL);
+        if (retval < 0) {
+            if (errno == EINTR) continue;
+            perror("recvmmsg error");
+            break;
+        }
 
-        unsigned head = *s.cq_ring.head;
-        unsigned tail = *s.cq_ring.tail;
-
-        while (head != tail) {
-            struct io_uring_cqe *cqe = &s.cq_ring.cqes[head & *s.cq_ring.ring_mask];
-            struct msghdr *completed_msg = (struct msghdr *)cqe->user_data;
-
-            if (cqe->res > 0) {
-                // Handle Packet
-                char *buf = completed_msg->msg_iov[0].iov_base;
-                struct gvm_header *hdr = (struct gvm_header *)buf;
+        for (int i = 0; i < retval; i++) {
+            if (msgs[i].msg_len >= sizeof(struct gvm_header)) {
+                struct gvm_header *hdr = (struct gvm_header *)buffers[i];
                 if (hdr->magic == GVM_MAGIC) {
-                    handle_kvm_request(hdr, buf + sizeof(struct gvm_header));
+                    handle_kvm_request(sockfd, &client_addrs[i], hdr, buffers[i] + sizeof(struct gvm_header));
                 }
             }
-
-            // Re-submit
-            submit_recvmsg(&s, sockfd, completed_msg);
-            
-            head++;
+            msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
         }
-        *s.cq_ring.head = head;
     }
+    
+    close(sockfd);
+    return NULL;
 }
 ```
 
 **文件**: `slave_daemon/cpu_executor.c`
 
 ```c
+#define _GNU_SOURCE // 为了 sched_setaffinity
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sched.h> // 包含 CPU 亲和性设置的头文件
 #include "../common_include/giantvm_protocol.h"
 
-void handle_kvm_request(struct gvm_header *hdr, void *data) {
-    // KVM Execution Mock
+// 声明外部函数，它将在另一个文件中实现并作为线程的入口
+extern void* network_thread_worker(void* arg);
+
+// handle_kvm_request 函数保持不变，因为它将被 network_thread_worker 调用
+void handle_kvm_request(int sockfd, struct sockaddr_in *client_addr, struct gvm_header *hdr, void *data) {
     switch (hdr->msg_type) {
-        case MSG_MEM_READ:
-            // Process Memory Read
+        case MSG_MEM_READ: {
+            struct gvm_header ack_hdr;
+            char send_buf[MTU_SIZE];
+            char payload[32] = "DATA_OK"; 
+            ack_hdr.magic = GVM_MAGIC;
+            ack_hdr.msg_type = MSG_MEM_ACK;
+            ack_hdr.slave_id = hdr->slave_id;
+            ack_hdr.req_id = hdr->req_id;
+            ack_hdr.frag_seq = 0;
+            ack_hdr.is_frag = 0;
+            memcpy(send_buf, &ack_hdr, sizeof(ack_hdr));
+            memcpy(send_buf + sizeof(ack_hdr), payload, sizeof(payload));
+            int total_len = sizeof(ack_hdr) + sizeof(payload);
+            sendto(sockfd, send_buf, total_len, 0, (struct sockaddr *)client_addr, sizeof(*client_addr));
             break;
+        }
         case MSG_MEM_WRITE:
-            // Process Memory Write
             break;
     }
 }
 
+
 int main() {
-    printf("[*] GiantVM Slave Daemon (io_uring Raw)\n");
-    extern void start_network_loop(void);
-    start_network_loop();
+    // 1. 获取 CPU 核心数
+    long num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cores <= 0) {
+        num_cores = 1; // 备用值
+    }
+    printf("[*] GiantVM Slave Daemon (Multi-Threaded SO_REUSEPORT)\n");
+    printf("[*] Detected %ld CPU cores. Spawning worker threads...\n", num_cores);
+
+    // 2. 创建线程句柄数组
+    pthread_t *threads = malloc(sizeof(pthread_t) * num_cores);
+    if (!threads) {
+        perror("Failed to allocate thread array");
+        return 1;
+    }
+
+    // 3. 循环创建线程
+    for (long i = 0; i < num_cores; i++) {
+        // 我们将核心 ID (i) 作为参数传递给线程
+        // 注意：直接传递 i 的地址是错误的，因为循环会改变 i 的值
+        // 正确的做法是传递一个 long 类型的指针
+        long* core_id = malloc(sizeof(long));
+        if (!core_id) {
+            perror("Failed to allocate core_id");
+            continue;
+        }
+        *core_id = i;
+        
+        if (pthread_create(&threads[i], NULL, network_thread_worker, core_id) != 0) {
+            perror("Failed to create thread");
+        }
+    }
+
+    // 4. 等待所有线程结束 (实际服务器中这里会是个死循环)
+    for (long i = 0; i < num_cores; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    free(threads);
     return 0;
 }
+```
+
+**文件**: `slave_daemon/Makefile`
+
+```makefile
+CC = gcc
+# [修改] 添加 -pthread
+CFLAGS = -Wall -O3 -I../common_include -pthread 
+TARGET = giantvm_slave
+SRCS = cpu_executor.c net_uring.c # 文件名保持不变也可以
+
+all: $(TARGET)
+
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+clean:
+	rm -f $(TARGET)
 ```
 
 ---
