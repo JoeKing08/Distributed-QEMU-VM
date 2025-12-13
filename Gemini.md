@@ -682,7 +682,7 @@ int gvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer) {
 #include <linux/udp.h>
 #include <linux/socket.h>
 #include <linux/slab.h>
-#include <linux/vmalloc.h>
+#include <linux/vmalloc.h> // 必须包含，用于 vzalloc
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
 #include <linux/nmi.h>      
@@ -698,9 +698,13 @@ int gvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer) {
 #include "logic_core.h"
 
 #define DRIVER_NAME "giantvm"
-#define MAX_INFLIGHT_REQS 65536 // 必须是 2 的幂
+/* 
+ * [FIX] Increased to 128k (2^17) to prevent ID reuse during congestion.
+ * Must be a power of 2 for bitwise masking optimization.
+ */
+#define MAX_INFLIGHT_REQS 131072 
 
-// [关键修改] 定义唯一的 Slab 缓存名称，防止模块重载时冲突
+// 定义唯一的 Slab 缓存名称
 #define GVM_PACKET_CACHE_NAME "gvm_pkt_v16"
 
 // ---------------------------------------------------------
@@ -712,7 +716,7 @@ static struct kmem_cache *gvm_cache = NULL;
 
 // [High Performance Ring Buffer for ID Allocation]
 struct id_pool_t {
-    uint16_t ids[MAX_INFLIGHT_REQS];
+    uint32_t *ids; // [FIX] Changed to pointer for dynamic allocation
     uint32_t head;
     uint32_t tail;
     spinlock_t lock;
@@ -722,28 +726,16 @@ static struct id_pool_t g_id_pool;
 // [Request Context]
 // 存储每个 ID 对应的接收缓冲区指针和完成状态
 struct req_ctx_t {
-    void *rx_buffer;       // 如果不为NULL，RX时将数据拷贝到这里
-    volatile int done;     // 完成标志
+    void *rx_buffer;       
+    volatile int done;     
 };
-static struct req_ctx_t g_req_ctx[MAX_INFLIGHT_REQS];
+// [FIX] Changed to pointer for dynamic allocation
+static struct req_ctx_t *g_req_ctx = NULL;
 
 // ---------------------------------------------------------
 // 2. ID Allocation (O(1) Implementation)
 // ---------------------------------------------------------
-static void init_id_pool(void) {
-    int i;
-    spin_lock_init(&g_id_pool.lock);
-    g_id_pool.head = 0;
-    g_id_pool.tail = 0;
-    // 填充初始 ID
-    for (i = 0; i < MAX_INFLIGHT_REQS; i++) {
-        g_id_pool.ids[i] = (uint16_t)i;
-        g_req_ctx[i].rx_buffer = NULL;
-        g_req_ctx[i].done = 0;
-    }
-    // tail 绕一圈回到 0 (满状态: tail - head = MAX)
-    g_id_pool.tail = MAX_INFLIGHT_REQS; 
-}
+// 注意：初始化逻辑已移至 giantvm_init 中进行统一内存管理
 
 static uint64_t k_alloc_req_id(void *rx_buffer) {
     uint64_t id = (uint64_t)-1;
@@ -754,7 +746,8 @@ static uint64_t k_alloc_req_id(void *rx_buffer) {
     // 检查是否有空闲 ID (tail > head)
     if (g_id_pool.tail != g_id_pool.head) {
         // Pop ID
-        uint16_t raw_id = g_id_pool.ids[g_id_pool.head & (MAX_INFLIGHT_REQS - 1)];
+        // [FIX] ids is now uint32_t*, safe access
+        uint32_t raw_id = g_id_pool.ids[g_id_pool.head & (MAX_INFLIGHT_REQS - 1)];
         g_id_pool.head++;
         id = (uint64_t)raw_id;
         
@@ -774,7 +767,8 @@ static void k_free_req_id(uint64_t id) {
     spin_lock_irqsave(&g_id_pool.lock, flags);
     
     // Push ID back
-    g_id_pool.ids[g_id_pool.tail & (MAX_INFLIGHT_REQS - 1)] = (uint16_t)id;
+    // [FIX] ids is now uint32_t*
+    g_id_pool.ids[g_id_pool.tail & (MAX_INFLIGHT_REQS - 1)] = (uint32_t)id;
     g_id_pool.tail++;
     
     // Clear Context
@@ -786,7 +780,9 @@ static void k_free_req_id(uint64_t id) {
 
 static int k_check_req_status(uint64_t id) {
     smp_rmb(); // 读屏障
-    return g_req_ctx[id % MAX_INFLIGHT_REQS].done;
+    // [FIX] 增加边界检查
+    if (id >= MAX_INFLIGHT_REQS) return -1;
+    return g_req_ctx[id].done;
 }
 
 // ---------------------------------------------------------
@@ -839,20 +835,15 @@ static void giantvm_udp_data_ready(struct sock *sk) {
                 uint64_t rid = hdr->req_id;
                 
                 if (rid < MAX_INFLIGHT_REQS) {
-                    // [关键修复] 增加锁保护，防止 Logic Core 超时后释放了 ID，
-                    // 而 ISR 恰好在此刻写入，导致 UAF 或数据损坏。
                     spin_lock_irqsave(&g_id_pool.lock, flags);
 
-                    // 再次检查 buffer 是否有效
                     if (g_req_ctx[rid].rx_buffer) {
                         int payload_len = skb->len - sizeof(struct gvm_header);
                         if (payload_len > 0) {
-                            // 使用 memcpy (内核空间)
                             memcpy(g_req_ctx[rid].rx_buffer, 
                                    skb->data + sizeof(struct gvm_header), 
                                    payload_len);
                         }
-                        // 标记完成，锁内写屏障隐含
                         g_req_ctx[rid].done = 1;
                     }
                     
@@ -960,12 +951,12 @@ static struct dsm_driver_ops k_ops = {
     .free_packet = k_free_packet,
     .set_gateway_ip = k_set_gateway_ip,
     .send_packet = k_send_packet,
-    .handle_page_fault = NULL, // Will be set by logic_core logic if needed, but here Logic calls Ops
+    .handle_page_fault = NULL, 
     .log = k_log,
     .is_atomic_context = k_is_atomic_context,
     .touch_watchdog = k_touch_watchdog,
-    .alloc_req_id = k_alloc_req_id, // New O(1)
-    .free_req_id = k_free_req_id,   // New O(1)
+    .alloc_req_id = k_alloc_req_id,
+    .free_req_id = k_free_req_id,
     .get_time_us = k_get_time_us,
     .time_diff_us = k_time_diff_us,
     .check_req_status = k_check_req_status,
@@ -973,7 +964,7 @@ static struct dsm_driver_ops k_ops = {
 };
 
 // ---------------------------------------------------------
-// 8. Page Fault Handler (Fix Memory Leak)
+// 8. Page Fault Handler
 // ---------------------------------------------------------
 static vm_fault_t gvm_fault_handler(struct vm_fault *vmf) {
     struct page *page;
@@ -981,25 +972,19 @@ static vm_fault_t gvm_fault_handler(struct vm_fault *vmf) {
     int ret;
     uint64_t gpa = (uint64_t)vmf->pgoff << PAGE_SHIFT;
 
-    // A. Allocate Physical Page
     page = alloc_page(GFP_HIGHUSER_MOVABLE | __GFP_ZERO);
     if (!page) return VM_FAULT_OOM;
 
     page_addr = page_address(page);
 
-    // B. Call Logic Core (RPC Fetch)
-    // 逻辑核心会使用 ops->alloc_req_id(page_addr) 来让 backend 直接把数据填入这里
     if (gvm_handle_page_fault_logic(gpa, page_addr) < 0) {
         __free_page(page);
-        return VM_FAULT_SIGBUS; // Network timeout or error
+        return VM_FAULT_SIGBUS; 
     }
 
-    // C. Insert into Page Table
     ret = vm_insert_page(vmf->vma, vmf->address, page);
     
     if (likely(ret == 0)) {
-        // [CRITICAL FIX] Release the reference from alloc_page.
-        // The VMA now holds the reference.
         put_page(page); 
         return VM_FAULT_NOPAGE;
     } else {
@@ -1049,30 +1034,59 @@ static struct miscdevice gvm_misc = {
 // ---------------------------------------------------------
 static int __init giantvm_init(void) {
     int ret;
+    uint32_t i;
 
-    // 0. Init ID Ring Buffer
-    init_id_pool();
+    // [FIX] 动态分配大内存，避免 BSS 段爆炸
+    g_id_pool.ids = vzalloc(sizeof(uint32_t) * MAX_INFLIGHT_REQS);
+    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * MAX_INFLIGHT_REQS);
+
+    if (!g_id_pool.ids || !g_req_ctx) {
+        if (g_id_pool.ids) vfree(g_id_pool.ids);
+        if (g_req_ctx) vfree(g_req_ctx);
+        printk(KERN_ERR "GiantVM: Failed to allocate ID pool memory.\n");
+        return -ENOMEM;
+    }
+
+    // 初始化 ID 池
+    spin_lock_init(&g_id_pool.lock);
+    g_id_pool.head = 0;
+    g_id_pool.tail = MAX_INFLIGHT_REQS;
+    for (i = 0; i < MAX_INFLIGHT_REQS; i++) {
+        g_id_pool.ids[i] = i; // uint32_t 赋值，无溢出风险
+        g_req_ctx[i].rx_buffer = NULL;
+        g_req_ctx[i].done = 0;
+    }
 
     // 1. Init Logic Core
-    if (gvm_core_init(&k_ops) != 0) return -ENOMEM;
+    if (gvm_core_init(&k_ops) != 0) {
+        vfree(g_id_pool.ids);
+        vfree(g_req_ctx);
+        return -ENOMEM;
+    }
 
-    // 2. Create Slab [修改：使用宏定义的名字]
+    // 2. Create Slab
     gvm_cache = kmem_cache_create(GVM_PACKET_CACHE_NAME, 2048, 0, SLAB_HWCACHE_ALIGN, NULL);
     if (!gvm_cache) {
         printk(KERN_ERR "GiantVM: Failed to create slab cache %s\n", GVM_PACKET_CACHE_NAME);
+        vfree(g_id_pool.ids);
+        vfree(g_req_ctx);
         return -ENOMEM;
     }
 
     // 3. Register Device
     if ((ret = misc_register(&gvm_misc))) {
-        kmem_cache_destroy(gvm_cache); // 失败需销毁
+        kmem_cache_destroy(gvm_cache); 
+        vfree(g_id_pool.ids);
+        vfree(g_req_ctx);
         return ret;
     }
 
     // 4. Create Socket
     if ((ret = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP, &g_socket)) < 0) {
         misc_deregister(&gvm_misc);
-        kmem_cache_destroy(gvm_cache); // 失败需销毁
+        kmem_cache_destroy(gvm_cache); 
+        vfree(g_id_pool.ids);
+        vfree(g_req_ctx);
         return ret;
     }
 
@@ -1081,7 +1095,7 @@ static int __init giantvm_init(void) {
         g_socket->sk->sk_data_ready = giantvm_udp_data_ready;
     }
 
-    printk(KERN_INFO "GiantVM: Frontier-X Backend Loaded. RingBuffer Enabled.\n");
+    printk(KERN_INFO "GiantVM: Frontier-X Backend Loaded. Pool Size: %d\n", MAX_INFLIGHT_REQS);
     return 0;
 }
 
@@ -1095,10 +1109,14 @@ static void __exit giantvm_exit(void) {
     // 2. 注销设备
     misc_deregister(&gvm_misc);
     
-    // 3. [关键修复] 销毁 Slab 缓存，防止内存泄漏和重载冲突
+    // 3. 销毁 Slab
     if (gvm_cache) {
         kmem_cache_destroy(gvm_cache);
     }
+
+    // 4. [FIX] 释放动态分配的内存
+    if (g_id_pool.ids) vfree(g_id_pool.ids);
+    if (g_req_ctx) vfree(g_req_ctx);
     
     printk(KERN_INFO "GiantVM: Unloaded.\n");
 }
@@ -1142,12 +1160,15 @@ ccflags-y := -I$(src)/../common_include
 #include <errno.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <sched.h> // [FIX] Added for sched_yield
 
 #include "unified_driver.h"
 #include "../common_include/giantvm_protocol.h"
 
 #define MAX_INFLIGHT_REQS 65536
-#define MASTER_PORT 8000 // [关键] Master 固定监听端口
+#define MASTER_PORT 8000 
+// [FIX] Adaptive Spin Constant
+#define ADAPTIVE_SPIN_COUNT 2000
 
 // ---------------------------------------------------------
 // 1. Global State
@@ -1288,9 +1309,24 @@ static uint64_t u_get_time_us(void) {
     return tv.tv_sec * 1000000UL + tv.tv_usec;
 }
 static uint64_t u_time_diff_us(uint64_t start) { return u_get_time_us() - start; }
+
+// [FIX] Adaptive Spinning Strategy
 static void u_cpu_relax(void) {
-    //asm volatile("pause":::"memory"); 
-    usleep(1); // 如果性能依旧不好可以注释掉上面的代码，去掉这句话，但要保证测试稳定
+    static __thread int spin_counter = 0;
+
+    // Phase 1: Fast Spin (Low Latency for local/fast network)
+    if (spin_counter++ < ADAPTIVE_SPIN_COUNT) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause(); 
+#elif defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+        return; 
+    }
+
+    // Phase 2: Yield CPU (Avoid burning CPU on congestion)
+    spin_counter = 0; 
+    sched_yield(); 
 }
 
 // ---------------------------------------------------------
@@ -1303,7 +1339,7 @@ struct dsm_driver_ops u_ops = {
     .free_packet = u_free_packet,
     .set_gateway_ip = u_set_gateway_ip,
     .send_packet = u_send_packet,
-    .handle_page_fault = NULL, // 需要在外部设置
+    .handle_page_fault = NULL, 
     .log = u_log,
     .is_atomic_context = u_is_atomic_context,
     .touch_watchdog = u_touch_watchdog,
@@ -1321,7 +1357,7 @@ struct dsm_driver_ops u_ops = {
 int user_backend_init(void) {
     g_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_sock < 0) return -1;
-    // -----------------修改sock为no blocking-----------------
+
     // 设置套接字为非阻塞模式
     int flags = fcntl(g_sock, F_GETFL, 0);
     if (flags == -1) {
@@ -1335,7 +1371,7 @@ int user_backend_init(void) {
         close(g_sock);
         return -1;
     }
-    // -----------------修改sock为no blocking-----------------
+
     // [关键] 绑定固定端口
     struct sockaddr_in bind_addr;
     memset(&bind_addr, 0, sizeof(bind_addr));
