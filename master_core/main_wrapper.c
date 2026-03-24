@@ -663,9 +663,7 @@ int main(int argc, char **argv) {
 
     printf("[System] Initializing SHM: %s (Size: %lu MB)\n", shm_path, ram_mb);
 
-    // 清理残留
-    shm_unlink(shm_path);
-    
+    // Open existing SHM or create new (do NOT unlink -- slave may already have it mapped)
     int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0666);
     if (shm_fd < 0) { 
         fprintf(stderr, "[-] Failed to open shm file '%s': %s\n", shm_path, strerror(errno));
