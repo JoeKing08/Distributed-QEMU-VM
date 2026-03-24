@@ -9,17 +9,13 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_CS_PAT }}
     steps:
-      - name: Setup gh
-        env:
-          GH_TOKEN: ${{ secrets.GH_CS_PAT }}
-        run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
-          gh auth status
+      - name: Verify token
+        run: gh auth status
 
       - name: Ensure codespace is running
-        env:
-          GH_TOKEN: ${{ secrets.GH_CS_PAT }}
         run: |
           STATE=$(gh api /user/codespaces/symmetrical-invention-g4g6pvp5gqgr2qv5 --jq '.state')
           echo "Codespace state: $STATE"
@@ -34,8 +30,6 @@ jobs:
           fi
 
       - name: Run command on codespace
-        env:
-          GH_TOKEN: ${{ secrets.GH_CS_PAT }}
         run: |
           gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee /tmp/cs-output.txt
         timeout-minutes: 10
