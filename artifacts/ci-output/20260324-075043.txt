@@ -1,0 +1,24 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   a1aa646ef..3cae1775f  main       -> origin/main
+Updating a1aa646ef..3cae1775f
+Fast-forward
+ artifacts/ci-output/20260324-074906.txt | 44 +++++++++++++++++++++++++++++++++
+ scripts/cs_dd_check.sh                  | 32 ++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-074906.txt
+ create mode 100755 scripts/cs_dd_check.sh
+=== dd from node0 offset 0 ===
+scripts/cs_dd_check.sh: line 3: xxd: command not found
+=== dd from node0 offset 0xe0000 (BIOS area) ===
+=== dd from node0 offset 0xFFFF0 (reset vector) ===
+=== dd from node0 offset 0x1004b (BSP current IP) ===
+=== dd node0 at 0xFDEB0 ===
+=== python3 mmap check ===
+scripts/cs_dd_check.sh: line 6: xxd: command not found
+scripts/cs_dd_check.sh: line 9: xxd: command not found
+scripts/cs_dd_check.sh: line 12: xxd: command not found
+scripts/cs_dd_check.sh: line 15: xxd: command not found
+offset 0: 77f222f057ff00f0c3e200f080ff9efc
+offset 0xe0000: 00000000000000000000000000000000
+offset 0x1004b: 0000000000000000000000000000000000000000000000012800000000000000
+=== DONE ===
