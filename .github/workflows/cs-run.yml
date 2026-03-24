@@ -12,8 +12,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GH_CS_PAT }}
     steps:
-      - name: Verify token
-        run: gh auth status
+      - uses: actions/checkout@v4
 
       - name: Ensure codespace is running
         run: |
@@ -31,12 +30,15 @@ jobs:
 
       - name: Run command on codespace
         run: |
-          gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee /tmp/cs-output.txt
+          gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee output.txt || true
         timeout-minutes: 10
 
-      - name: Upload output
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cs-output
-          path: /tmp/cs-output.txt
+      - name: Push output to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          mkdir -p artifacts/ci-output
+          cp output.txt "artifacts/ci-output/$(date -u +%Y%m%d-%H%M%S).txt"
+          git add artifacts/ci-output/
+          git commit -m "ci: command output $(date -u +%H:%M:%S)" || true
+          git push || true
