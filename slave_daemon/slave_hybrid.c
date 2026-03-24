@@ -1162,6 +1162,35 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
      * The fast-return was short-circuiting ALL subsequent KVM_RUNs after
      * the first HLT, preventing the guest from ever making progress. */
 
+    /* [DBG] Dump memory at CS:IP before KVM_RUN for first 5 requests */
+    {
+        static int memdump_count = 0;
+        if (memdump_count < 5) {
+            struct kvm_regs kr_d; struct kvm_sregs ks_d;
+            ioctl(t_vcpu_fd, KVM_GET_REGS, &kr_d);
+            ioctl(t_vcpu_fd, KVM_GET_SREGS, &ks_d);
+            uint64_t linear = ks_d.cs.base + kr_d.rip;
+            uint8_t *hva = wvm_gpa_to_hva(linear);
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                "[DBG-MEM] req=%llu GPA=0x%llx (cs_base=0x%llx+rip=0x%llx) hva=%p bytes=",
+                (unsigned long long)hdr->req_id,
+                (unsigned long long)linear,
+                (unsigned long long)ks_d.cs.base,
+                (unsigned long long)kr_d.rip,
+                (void*)hva);
+            if (hva) {
+                for (int bi = 0; bi < 32 && n < (int)sizeof(buf) - 4; bi++)
+                    n += snprintf(buf + n, sizeof(buf) - n, "%02x ", hva[bi]);
+            } else {
+                n += snprintf(buf + n, sizeof(buf) - n, "(unmapped!)");
+            }
+            snprintf(buf + n, sizeof(buf) - n, "\n");
+            write(2, buf, strlen(buf));
+            memdump_count++;
+        }
+    }
+
     int ret;
 
     /* --- Thread-directed alarm: 50ms timeout for KVM_RUN --- */
