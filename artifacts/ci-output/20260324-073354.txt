@@ -1,0 +1,64 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   a366cd893..8677115c1  main       -> origin/main
+Updating a366cd893..8677115c1
+Fast-forward
+ artifacts/ci-output/20260324-072214.txt | 84 +++++++++++++++++++++++++++++++++
+ scripts/cs_clean_and_run.sh             | 32 +++++++++++++
+ 2 files changed, 116 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-072214.txt
+ create mode 100755 scripts/cs_clean_and_run.sh
++ cd /workspaces/WaveVM_Frontier-X
++ killall -9 qemu-system-x86_64 wavevm_gateway wavevm_node_master wavevm_node_slave
++ sleep 2
++ ps aux
++ grep -E 'qemu|wavevm'
++ grep -v grep
+All killed
++ echo 'All killed'
++ rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock
+=== Starting SMP test ===
++ echo '=== Starting SMP test ==='
++ mount -o remount,size=8G /dev/shm
++ sleep 20
++ bash artifacts/fract-kvm-test/run_smp_numa.sh
+ALL STARTED ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354
+++ cat /tmp/fract-kvm-artdir.txt
+ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354
+=== processes ===
++ ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354
++ echo ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354
++ echo '=== processes ==='
++ grep -E 'qemu|wavevm'
++ wc -l
++ ps aux
++ grep -v grep
+10
+=== debugcon ===
+5 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/debugcon.log
+SeaBIOS (version rel-1.14.0-0-g155821a1990b-prebuilt.qemu.org)
+BUILD: gcc: (GCC) 4.8.5 20150623 (Red Hat 4.8.5-39) binutils: version 2.27-43.base.el7_8.1
+No Xen hypervisor found.
+Running on QEMU (q35)
+Running on KVM
+=== serial ===
+0 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/vm-serial.log
+=== vm.log ===
+[KVM-MEM] region_add mr=pc.rom gpa=0xd8000 size=0x8000 offset_as=0xd8000 offset_mr=0x18000
+[KVM-MEM] set_user_memory slot=3 as_id=0 new=1 gpa=0xd8000 size=0x8000 hva=0x7fbb15018000 flags=0x3 old_flags=0
+[KVM-MEM] region_add cb mr=pc.bios gpa=0xe0000 size=0x10000
+[KVM-MEM] region_add mr=pc.bios gpa=0xe0000 size=0x10000 offset_as=0xe0000 offset_mr=0x20000
+[KVM-MEM] set_user_memory slot=4 as_id=0 new=1 gpa=0xe0000 size=0x10000 hva=0x7fbb15220000 flags=0x3 old_flags=0
+[WaveVM] region_add gpa=0xf0000 size=0x7ff10000 count=7
+[WaveVM-User] ram_block hva=0x7fba900ef000..0x7fbb0ffff000 gpa=0xf0000 size=0x7ff10000 blocks=7
+[KVM-MEM] region_add cb mr=ram0 gpa=0xf0000 size=0x7ff10000
+[KVM-MEM] region_add mr=ram0 gpa=0xf0000 size=0x7ff10000 offset_as=0xf0000 offset_mr=0xf0000
+[KVM-MEM] set_user_memory slot=5 as_id=0 new=1 gpa=0xf0000 size=0x7ff10000 hva=0x7fba900ef000 flags=0x1 old_flags=0
+=== DONE ===
++ echo '=== debugcon ==='
++ wc -l /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/debugcon.log
++ tail -30 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/debugcon.log
++ echo '=== serial ==='
++ wc -c /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/vm-serial.log
++ echo '=== vm.log ==='
++ tail -10 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/vm.log
++ echo '=== DONE ==='
