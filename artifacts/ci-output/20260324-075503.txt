@@ -1,0 +1,24 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   e8d01d2bd..05218ceab  main       -> origin/main
+Updating e8d01d2bd..05218ceab
+Fast-forward
+ artifacts/ci-output/20260324-075326.txt | 94 +++++++++++++++++++++++++++++++++
+ scripts/cs_bios_check.sh                | 54 +++++++++++++++++++
+ 2 files changed, 148 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-075326.txt
+ create mode 100755 scripts/cs_bios_check.sh
+  0xE0000: 00000000000000000000000000000000 (nonzero bytes in page: 0)
+  0xE8000: 00000000000000000000000000000000 (nonzero bytes in page: 0)
+  0xF0000: 068b0000000000000000000000000000 (nonzero bytes in page: 1384)
+  0xF8000: 000000000000000000008ec067660000 (nonzero bytes in page: 1509)
+  0xFC000: e8eb01280000000085c0000000000000 (nonzero bytes in page: 1525)
+  0xFE000: 00002b4e0090f04e004f012800000000 (nonzero bytes in page: 1499)
+  0xFF000: 1d010000000000000000000000000000 (nonzero bytes in page: 1430)
+  0xFFF00: b08a0000000000000000000000000000 (nonzero bytes in page: 283)
+  Reset vector 0xFFFF0: ea5b0000000000000000000000000000
+  JMP FAR 0000:005B -> linear 0x0005B
+  Target code at 0x0005B: 0000f0460000f0460000f0460000f046
+  BIOS file reset vector: ea5be000f030362f32332f393900fc00
+  BIOS JMP FAR F000:E05B
+  wavevm_ram 0xFFFF0: 00000000000000000000000000000000
+=== DONE ===
