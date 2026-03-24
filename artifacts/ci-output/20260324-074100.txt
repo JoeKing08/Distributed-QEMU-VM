@@ -1,0 +1,45 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   3a717d7a4..1e8e94822  main       -> origin/main
+Updating 3a717d7a4..1e8e94822
+Fast-forward
+ artifacts/ci-output/20260324-073650.txt | 127 ++++++++++++++++++++++++++++++++
+ scripts/cs_diag.sh                      |  31 ++++++++
+ 2 files changed, 158 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-073650.txt
+ create mode 100755 scripts/cs_diag.sh
+=== QEMU PID=11676 ===
+%CPU %MEM     ELAPSED
+ 1.5 12.9       16:57
+=== QEMU threads ===
+   SPID %CPU STAT WCHAN
+  11676  0.0 S<l  do_poll.constprop.0
+  11677  0.0 S<l  futex_wait_queue
+  11679  0.0 S<l  unix_stream_data_wait
+  11680  0.0 S<l  hrtimer_nanosleep
+  11684  1.2 S<l  kvm_vcpu_block
+  11686  0.1 S<l  hrtimer_nanosleep
+  11688  0.1 S<l  hrtimer_nanosleep
+  11689  0.0 S<l  vhost_task_fn
+=== vm.log BSP-DBG (all) ===
+[BSP-DBG] cpu=0 iter=0 halted=0 stop=0 exit_req=1 run->exit=0
+[BSP-DBG] cpu=0 iter=0 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=1 halted=0 stop=0 exit_req=0 run->exit=0
+[BSP-DBG] cpu=0 iter=1 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=2 halted=0 stop=0 exit_req=1 run->exit=8
+[BSP-DBG] cpu=0 iter=2 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=3 halted=0 stop=0 exit_req=0 run->exit=8
+=== full debugcon ===
+SeaBIOS (version rel-1.14.0-0-g155821a1990b-prebuilt.qemu.org)
+BUILD: gcc: (GCC) 4.8.5 20150623 (Red Hat 4.8.5-39) binutils: version 2.27-43.base.el7_8.1
+No Xen hypervisor found.
+Running on QEMU (q35)
+Running on KVM
+=== master0 dispatch ===
+4
+=== gw_l2 last 5 ===
+[Gateway] rx-stats big=0 small=28
+[Gateway] rx-stats big=0 small=30
+[Gateway] rx-stats big=0 small=32
+[Gateway] rx-stats big=0 small=34
+[Gateway] rx-stats big=0 small=36
+=== DONE ===
