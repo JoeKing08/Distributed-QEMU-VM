@@ -1181,7 +1181,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     timer_create(CLOCK_MONOTONIC, &sev, &ktimer);
 
     struct itimerspec its = {
-        .it_value = { .tv_sec = 0, .tv_nsec = 50000000 }, /* 50ms */
+        .it_value = { .tv_sec = 0, .tv_nsec = 500000000 }, /* 500ms */
         .it_interval = { 0, 0 }
     };
     timer_settime(ktimer, 0, &its, NULL);
@@ -1222,7 +1222,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
 
     /* If alarm fired, synthesize HLT exit */
     if (t_kvm_alarm_fired) {
-        fprintf(stderr, "[Slave] KVM_RUN timeout (50ms) -- synthesizing HLT exit\n");
+        fprintf(stderr, "[Slave] KVM_RUN timeout (500ms) -- synthesizing HLT exit\n");
         t_kvm_run->exit_reason = KVM_EXIT_HLT;
     }
 

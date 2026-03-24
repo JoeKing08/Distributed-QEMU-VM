@@ -10,8 +10,19 @@ int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write);
 extern int wvm_send_ipc_block_io(uint64_t lba, void *buf, uint32_t len, int is_write)
     __attribute__((weak));
 
+static int wvm_block_io_enabled = -1;
+
 int wavevm_blk_interceptor(uint64_t sector, QEMUIOVector *qiov, int is_write)
 {
+    /* Gate on WVM_BLOCK_IO=1 env var; when unset, fall through to QEMU local block layer */
+    if (wvm_block_io_enabled < 0) {
+        const char *env = getenv("WVM_BLOCK_IO");
+        wvm_block_io_enabled = (env && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+    if (!wvm_block_io_enabled) {
+        return -1;
+    }
+
     size_t total_len = qiov->size;
     uint8_t *linear_buf;
     int ret;
