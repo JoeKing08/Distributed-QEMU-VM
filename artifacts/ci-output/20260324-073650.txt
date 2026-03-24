@@ -1,0 +1,127 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   a77009953..3a717d7a4  main       -> origin/main
+Updating a77009953..3a717d7a4
+Fast-forward
+ artifacts/ci-output/20260324-073537.txt | 34 +++++++++++++++++++++++++++++++++
+ scripts/cs_deep_check.sh                | 15 +++++++++++++++
+ 2 files changed, 49 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-073537.txt
+ create mode 100755 scripts/cs_deep_check.sh
+=== master0 last 30 ===
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=2 epoch=0
+=== master1 last 30 ===
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+=== slave0 last 30 ===
+[Hybrid] NUMA: node 0  /wvm_fract_node0  2048 MB  GPA [0x0, 0x80000000)
+[Hybrid] NUMA: node 1  /wvm_fract_node1  1024 MB  GPA [0x100000000, 0x140000000)
+[Hybrid] NUMA: 2 nodes mapped, VA range 0x140000000
+[Slave BootVCPU] create fd=5 errno=0 vm=4 kvm=3 id=0
+[Slave BootVCPU] mmap_size=12288 errno=0
+[Slave] KVM_SET_CPUID2 OK (56 entries) on vcpu_fd=5
+[Hybrid] NUMA memslot: node 0 GPA [0x0, 0x80000000)
+[Hybrid] NUMA memslot: node 1 GPA [0x100000000, 0x140000000)
+[Hybrid] BIOS ROM slot: GPA [0xffff0000, 0x100000000)
+[SLAVE-BIND] port=19105 ok
+=== slave1 last 30 ===
+[Hybrid] NUMA: node 0  /wvm_fract_node0  2048 MB  GPA [0x0, 0x80000000)
+[Hybrid] NUMA: node 1  /wvm_fract_node1  1024 MB  GPA [0x100000000, 0x140000000)
+[Hybrid] NUMA: 2 nodes mapped, VA range 0x140000000
+[Slave BootVCPU] create fd=5 errno=0 vm=4 kvm=3 id=0
+[Slave BootVCPU] mmap_size=12288 errno=0
+[Slave] KVM_SET_CPUID2 OK (56 entries) on vcpu_fd=5
+[Hybrid] NUMA memslot: node 0 GPA [0x0, 0x80000000)
+[Hybrid] NUMA memslot: node 1 GPA [0x100000000, 0x140000000)
+[Hybrid] BIOS ROM slot: GPA [0xffff0000, 0x100000000)
+[SLAVE-BIND] port=19205 ok
+=== vm.log last 30 ===
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=19 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=20 mmio=0 other=0
+[KVM-MEM] region_del cb mr=ram0 gpa=0 size=0xc0000
+[KVM-MEM] set_user_memory slot=0 as_id=0 new=0 gpa=0 size=0 hva=0x7fba8ffff000 flags=0 old_flags=0x1
+[KVM-MEM] region_del cb mr=pc.rom gpa=0xc0000 size=0x20000
+[KVM-MEM] set_user_memory slot=3 as_id=0 new=0 gpa=0xc0000 size=0 hva=0x7fbb15000000 flags=0 old_flags=0x3
+[KVM-MEM] region_del cb mr=pc.bios gpa=0xe0000 size=0x20000
+[KVM-MEM] set_user_memory slot=4 as_id=0 new=0 gpa=0xe0000 size=0 hva=0x7fbb15220000 flags=0 old_flags=0x3
+[KVM-MEM] region_del cb mr=ram0 gpa=0x100000 size=0x7ff00000
+[KVM-MEM] set_user_memory slot=5 as_id=0 new=0 gpa=0x100000 size=0 hva=0x7fba900ff000 flags=0 old_flags=0x1
+[WaveVM] region_add gpa=0 size=0xd8000 count=6
+[WaveVM-User] ram_block hva=0x7fba8ffff000..0x7fba900d7000 gpa=0 size=0xd8000 blocks=6
+[KVM-MEM] region_add cb mr=ram0 gpa=0 size=0xd8000
+[KVM-MEM] region_add mr=ram0 gpa=0 size=0xd8000 offset_as=0 offset_mr=0
+[KVM-MEM] set_user_memory slot=0 as_id=0 new=1 gpa=0 size=0xd8000 hva=0x7fba8ffff000 flags=0x1 old_flags=0
+[KVM-MEM] region_add cb mr=pc.rom gpa=0xd8000 size=0x8000
+[KVM-MEM] region_add mr=pc.rom gpa=0xd8000 size=0x8000 offset_as=0xd8000 offset_mr=0x18000
+[KVM-MEM] set_user_memory slot=3 as_id=0 new=1 gpa=0xd8000 size=0x8000 hva=0x7fbb15018000 flags=0x3 old_flags=0
+[KVM-MEM] region_add cb mr=pc.bios gpa=0xe0000 size=0x10000
+[KVM-MEM] region_add mr=pc.bios gpa=0xe0000 size=0x10000 offset_as=0xe0000 offset_mr=0x20000
+[KVM-MEM] set_user_memory slot=4 as_id=0 new=1 gpa=0xe0000 size=0x10000 hva=0x7fbb15220000 flags=0x3 old_flags=0
+[WaveVM] region_add gpa=0xf0000 size=0x7ff10000 count=7
+[WaveVM-User] ram_block hva=0x7fba900ef000..0x7fbb0ffff000 gpa=0xf0000 size=0x7ff10000 blocks=7
+[KVM-MEM] region_add cb mr=ram0 gpa=0xf0000 size=0x7ff10000
+[KVM-MEM] region_add mr=ram0 gpa=0xf0000 size=0x7ff10000 offset_as=0xf0000 offset_mr=0xf0000
+[KVM-MEM] set_user_memory slot=5 as_id=0 new=1 gpa=0xf0000 size=0x7ff10000 hva=0x7fba900ef000 flags=0x1 old_flags=0
+[BSP-DBG] cpu=0 iter=1 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=2 halted=0 stop=0 exit_req=1 run->exit=8
+[BSP-DBG] cpu=0 iter=2 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=3 halted=0 stop=0 exit_req=0 run->exit=8
+=== qemu proc ===
+root       11676  1.9 12.9 6894792 2127128 ?     S<l  07:24   0:15 /workspaces/WaveVM_Frontier-X/wavevm-qemu/build-native/qemu-system-x86_64 -accel wavevm -machine q35,smm=off -m 3072 -smp 3 -object memory-backend-file,id=ram0,size=2048M,mem-path=/dev/shm/wvm_fract_node0,share=on -object memory-backend-file,id=ram1,size=1024M,mem-path=/dev/shm/wvm_fract_node1,share=on -numa node,memdev=ram0,cpus=0-1,nodeid=0 -numa node,memdev=ram1,cpus=2,nodeid=1 -drive file=/workspaces/WaveVM_Frontier-X/artifacts/images/cirros-0.6.2-x86_64-disk.img,if=virtio,format=qcow2,snapshot=on -netdev user,id=ne,hostfwd=tcp::2226-:22 -device e1000,netdev=ne -display none -vga none -debugcon file:/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/debugcon.log -global isa-debugcon.iobase=0x402 -serial file:/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/vm-serial.log -monitor none
+=== DONE ===
