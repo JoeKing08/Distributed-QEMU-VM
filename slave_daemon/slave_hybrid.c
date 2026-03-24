@@ -1171,7 +1171,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
             ioctl(t_vcpu_fd, KVM_GET_SREGS, &ks_d);
             uint64_t linear = ks_d.cs.base + kr_d.rip;
             uint8_t *hva = wvm_gpa_to_hva(linear);
-            char buf[256];
+            char buf[512];
             int n = snprintf(buf, sizeof(buf),
                 "[DBG-MEM] req=%llu GPA=0x%llx (cs_base=0x%llx+rip=0x%llx) hva=%p bytes=",
                 (unsigned long long)hdr->req_id,
@@ -1184,6 +1184,22 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                     n += snprintf(buf + n, sizeof(buf) - n, "%02x ", hva[bi]);
             } else {
                 n += snprintf(buf + n, sizeof(buf) - n, "(unmapped!)");
+            }
+            /* Also dump the JMP target if first bytes are EA (far jmp) */
+            if (hva && hva[0] == 0xEA) {
+                uint16_t off = hva[1] | (hva[2] << 8);
+                uint16_t seg = hva[3] | (hva[4] << 8);
+                uint64_t target = ((uint64_t)seg << 4) + off;
+                uint8_t *thva = wvm_gpa_to_hva(target);
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    " | JMP_TARGET=0x%llx hva=%p tgt_bytes=",
+                    (unsigned long long)target, (void*)thva);
+                if (thva) {
+                    for (int bi = 0; bi < 32 && n < (int)sizeof(buf) - 4; bi++)
+                        n += snprintf(buf + n, sizeof(buf) - n, "%02x ", thva[bi]);
+                } else {
+                    n += snprintf(buf + n, sizeof(buf) - n, "(unmapped!)");
+                }
             }
             snprintf(buf + n, sizeof(buf) - n, "\n");
             write(2, buf, strlen(buf));
