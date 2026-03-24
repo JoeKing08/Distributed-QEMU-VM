@@ -1,0 +1,44 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   9930585d2..a1aa646ef  main       -> origin/main
+Updating 9930585d2..a1aa646ef
+Fast-forward
+ artifacts/ci-output/20260324-074733.txt | 19 +++++++++++++++++++
+ scripts/cs_shm_check.sh                 | 20 ++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-074733.txt
+ create mode 100755 scripts/cs_shm_check.sh
+=== /dev/shm files ===
+-rw-r--r-- 1 root root 2147483648 Mar 24 07:24 /dev/shm/wvm_fract_node0
+-rw-r--r-- 1 root root 1073741824 Mar 24 07:23 /dev/shm/wvm_fract_node1
+total 2094936
+drwxrwxrwt  2 root root        100 Mar 24 07:00 .
+drwxr-xr-x 13 root root       3940 Mar 24 06:26 ..
+-rw-r--r--  1 root root 3221225472 Mar 24 07:24 wavevm_ram
+-rw-r--r--  1 root root 2147483648 Mar 24 07:24 wvm_fract_node0
+-rw-r--r--  1 root root 1073741824 Mar 24 07:23 wvm_fract_node1
+=== check QEMU RAM file ===
+  File: /dev/shm/wvm_fract_node0
+  Size: 2147483648	Blocks: 4189872    IO Block: 4096   regular file
+Device: 0,57	Inode: 3           Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-03-24 07:24:02.791252117 +0000
+Modify: 2026-03-24 07:24:15.983252781 +0000
+Change: 2026-03-24 07:24:15.983252781 +0000
+ Birth: 2026-03-24 07:00:31.815181054 +0000
+  File: /dev/shm/wvm_fract_node1
+  Size: 1073741824	Blocks: 0          IO Block: 4096   regular file
+Device: 0,57	Inode: 2           Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-03-24 07:24:02.792252117 +0000
+Modify: 2026-03-24 07:23:54.765251713 +0000
+Change: 2026-03-24 07:23:54.765251713 +0000
+ Birth: 2026-03-24 07:00:31.814181054 +0000
+=== first 16 bytes of node0 ===
+cannot read node0
+=== BIOS ROM region check (e0000-fffff in node0) ===
+cannot read
+=== Try reading from proc maps ===
+7fb980000000-7fba40000000 rw-s 00000000 00:39 4                          /dev/shm/wavevm_ram
+7fba4fffe000-7fba8fffe000 rw-s 00000000 00:39 2                          /dev/shm/wvm_fract_node1
+7fba8ffff000-7fbb0ffff000 rw-s 00000000 00:39 3                          /dev/shm/wvm_fract_node0
+=== DONE ===
