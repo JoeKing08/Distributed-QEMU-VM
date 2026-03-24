@@ -1,0 +1,2 @@
+bash: line 1: wavevm | grep -v grep; echo DONE: command not found
+shell closed: exit status 127
