@@ -1,0 +1,84 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   8c713a2ba..a366cd893  main       -> origin/main
+Updating 8c713a2ba..a366cd893
+Fast-forward
+ .github/workflows/cs-run.yml | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
++ cd /workspaces/WaveVM_Frontier-X
++ echo '=== Building slave ==='
+=== Building slave ===
++ cd slave_daemon
+++ nproc
++ make -j4
+make: Nothing to be done for 'all'.
+slave exit: 0
+=== Building master ===
++ echo 'slave exit: 0'
++ cd ..
++ echo '=== Building master ==='
++ cd master_core
++ gcc -O2 -I../common_include -pthread -o wavevm_node_master main_wrapper.c logic_core.c user_backend.c
+logic_core.c: In function ‘wvm_logic_process_packet’:
+logic_core.c:1694:91: warning: format ‘%llx’ expects argument of type ‘long long unsigned int’, but argument 2 has type ‘uint64_t’ {aka ‘long unsigned int’} [-Wformat=]
+ 1694 |                     if (g_ops->log) g_ops->log("[Logic] Fatal: Hash Table Full for GPA %llx", gpa);
+      |                                                                                        ~~~^   ~~~
+      |                                                                                           |   |
+      |                                                                                           |   uint64_t {aka long unsigned int}
+      |                                                                                           long long unsigned int
+      |                                                                                        %lx
+logic_core.c:1773:79: warning: format ‘%llx’ expects argument of type ‘long long unsigned int’, but argument 2 has type ‘uint64_t’ {aka ‘long unsigned int’} [-Wformat=]
+ 1773 |                 if (g_ops->log) g_ops->log("[Logic] Write on non-owner GPA %llx ignored", gpa);
+      |                                                                            ~~~^           ~~~
+      |                                                                               |           |
+      |                                                                               |           uint64_t {aka long unsigned int}
+      |                                                                               long long unsigned int
+      |                                                                            %lx
+user_backend.c: In function ‘user_backend_init’:
+user_backend.c:1119:83: warning: format ‘%d’ expects argument of type ‘int’, but argument 4 has type ‘long unsigned int’ [-Wformat=]
+ 1119 |         fprintf(stderr, "[WaveVM] user_backend_init: node_id %d out of range [0, %d)\n",
+      |                                                                                  ~^
+      |                                                                                   |
+      |                                                                                   int
+      |                                                                                  %ld
++ echo 'master exit: 0'
++ cd ..
+master exit: 0
++ ls -la gateway_service/wavevm_gateway
+-rwxrwxrwx 1 root root 41024 Mar 23 23:25 gateway_service/wavevm_gateway
+=== Starting SMP test ===
++ echo '=== Starting SMP test ==='
++ mount -o remount,size=8G /dev/shm
++ sleep 15
++ bash artifacts/fract-kvm-test/run_smp_numa.sh
+ALL STARTED ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212
+++ cat /tmp/fract-kvm-artdir.txt
+ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212
++ ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212
++ echo ART=/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212
++ ps aux
++ grep -E 'qemu|wavevm'
++ grep -v grep
++ head -20
+root        6943  0.8  0.0  88724  1792 ?        S<l  07:00   0:05 /workspaces/WaveVM_Frontier-X/gateway_service/wavevm_gateway 19520 127.0.0.1 19599 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/l2_routes.txt 19521
+root        6944  0.8  0.0  88724  1664 ?        S<l  07:00   0:05 /workspaces/WaveVM_Frontier-X/gateway_service/wavevm_gateway 19320 127.0.0.1 19520 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/l1a_routes.txt 19321
+root        6945  0.8  0.0  88724  1920 ?        S<l  07:00   0:05 /workspaces/WaveVM_Frontier-X/gateway_service/wavevm_gateway 19420 127.0.0.1 19520 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/l1b_routes.txt 19421
+root        6946  0.9  0.0  88724  1664 ?        S<l  07:00   0:06 /workspaces/WaveVM_Frontier-X/gateway_service/wavevm_gateway 19120 127.0.0.1 19320 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/sidecar_a_routes.txt 19121
+root        6947  0.8  0.0  88724  1792 ?        S<l  07:00   0:05 /workspaces/WaveVM_Frontier-X/gateway_service/wavevm_gateway 19220 127.0.0.1 19420 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/sidecar_b_routes.txt 19221
+root        6948  5.1  0.0 5393152 2176 ?        S<l  07:00   0:37 /workspaces/WaveVM_Frontier-X/slave_daemon/wavevm_node_slave 19105 2 3072 0 19121
+root        6949  5.2  0.0 5393152 1920 ?        S<l  07:00   0:37 /workspaces/WaveVM_Frontier-X/slave_daemon/wavevm_node_slave 19205 1 3072 1 19221
+root        6950 74.9  0.2 3546468 33664 ?       S<l  07:00   8:56 /workspaces/WaveVM_Frontier-X/master_core/wavevm_node_master 2048 19100 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/fract_2node.conf 0 19121 19105 1
+root        6951 74.3  0.0 2129232 14388 ?       S<l  07:00   8:51 /workspaces/WaveVM_Frontier-X/master_core/wavevm_node_master 1024 19200 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/fract_2node.conf 1 19221 19205 1
+root        7014  0.3  0.2 6894792 33912 ?       S<l  07:00   0:02 /workspaces/WaveVM_Frontier-X/wavevm-qemu/build-native/qemu-system-x86_64 -accel wavevm -machine q35,smm=off -m 3072 -smp 3 -object memory-backend-file,id=ram0,size=2048M,mem-path=/dev/shm/wvm_fract_node0,share=on -object memory-backend-file,id=ram1,size=1024M,mem-path=/dev/shm/wvm_fract_node1,share=on -numa node,memdev=ram0,cpus=0-1,nodeid=0 -numa node,memdev=ram1,cpus=2,nodeid=1 -drive file=/workspaces/WaveVM_Frontier-X/artifacts/images/cirros-0.6.2-x86_64-disk.img,if=virtio,format=qcow2,snapshot=on -netdev user,id=ne,hostfwd=tcp::2226-:22 -device e1000,netdev=ne -display none -vga none -debugcon file:/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/debugcon.log -global isa-debugcon.iobase=0x402 -serial file:/workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-070031/vm-serial.log -monitor none
+root        9286  4.0  0.0 5262080 1920 ?        S<l  07:12   0:00 /workspaces/WaveVM_Frontier-X/slave_daemon/wavevm_node_slave 19105 2 3072 0 19121
+root        9287  4.0  0.0 5262080 2048 ?        S<l  07:12   0:00 /workspaces/WaveVM_Frontier-X/slave_daemon/wavevm_node_slave 19205 1 3072 1 19221
+root        9288 49.7  0.0 3325272 13020 ?       S<l  07:12   0:07 /workspaces/WaveVM_Frontier-X/master_core/wavevm_node_master 2048 19100 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212/fract_2node.conf 0 19121 19105 1
+root        9289 49.8  0.0 2129232 12124 ?       S<l  07:12   0:07 /workspaces/WaveVM_Frontier-X/master_core/wavevm_node_master 1024 19200 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212/fract_2node.conf 1 19221 19205 1
+=== debugcon so far ===
++ echo '=== debugcon so far ==='
++ cat /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212/debugcon.log
++ tail -30
+=== serial bytes ===
+=== DONE initial check ===
++ echo '=== serial bytes ==='
++ wc -c /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-071212/vm-serial.log
++ echo '=== DONE initial check ==='
