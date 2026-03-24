@@ -30,10 +30,12 @@ jobs:
 
       - name: Run command on codespace
         run: |
-          gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee output.txt || true
+          gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee output.txt
+          exit 0
         timeout-minutes: 10
 
       - name: Push output to repo
+        if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
