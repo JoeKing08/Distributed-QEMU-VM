@@ -1,0 +1,124 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   1e8e94822..c606d1f80  main       -> origin/main
+Updating 1e8e94822..c606d1f80
+Fast-forward
+ artifacts/ci-output/20260324-074100.txt | 45 +++++++++++++++++++++++++++++++++
+ scripts/cs_diag2.sh                     | 28 ++++++++++++++++++++
+ 2 files changed, 73 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-074100.txt
+ create mode 100755 scripts/cs_diag2.sh
+=== vm.log KVM-IO lines ===
+[KVM-IO] cpu=0 port=0x71 dir=0 sz=1 cnt=1 total_io=1 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x92 dir=0 sz=1 cnt=1 total_io=2 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x92 dir=1 sz=1 cnt=1 total_io=3 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=4 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=5 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=6 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=7 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=8 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=9 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=10 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=11 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=12 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=13 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=14 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=15 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=16 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=17 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=18 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=19 mmio=0 other=0
+[KVM-IO] cpu=0 port=0x402 dir=1 sz=1 cnt=1 total_io=20 mmio=0 other=0
+=== vm.log WaveVM lines ===
+[KVM-MEM] region_add mr=ram0 gpa=0xfeda0000 size=0x20000 offset_as=0xfeda0000 offset_mr=0xa0000
+[KVM-MEM] region_del cb mr=ram0 gpa=0xfeda0000 size=0x20000
+[KVM-MEM] region_add cb mr=kvm-ioapic gpa=0xfec00000 size=0x1000
+[KVM-MEM] region_add cb mr=hpet gpa=0xfed00000 size=0x400
+[KVM-MEM] region_del cb mr=ram0 gpa=0 size=0x80000000
+[WaveVM] region_add gpa=0 size=0xc0000 count=4
+[WaveVM-User] ram_block hva=0x7fba8ffff000..0x7fba900bf000 gpa=0 size=0xc0000 blocks=4
+[KVM-MEM] region_add cb mr=ram0 gpa=0 size=0xc0000
+[KVM-MEM] region_add mr=ram0 gpa=0 size=0xc0000 offset_as=0 offset_mr=0
+[KVM-MEM] region_add cb mr=pc.rom gpa=0xc0000 size=0x20000
+[KVM-MEM] region_add mr=pc.rom gpa=0xc0000 size=0x20000 offset_as=0xc0000 offset_mr=0
+[KVM-MEM] region_add cb mr=pc.bios gpa=0xe0000 size=0x20000
+[KVM-MEM] region_add mr=pc.bios gpa=0xe0000 size=0x20000 offset_as=0xe0000 offset_mr=0x20000
+[WaveVM] region_add gpa=0x100000 size=0x7ff00000 count=5
+[WaveVM-User] ram_block hva=0x7fba900ff000..0x7fbb0ffff000 gpa=0x100000 size=0x7ff00000 blocks=5
+[KVM-MEM] region_add cb mr=ram0 gpa=0x100000 size=0x7ff00000
+[KVM-MEM] region_add mr=ram0 gpa=0x100000 size=0x7ff00000 offset_as=0x100000 offset_mr=0x100000
+[BSP-DBG] cpu=0 iter=0 halted=0 stop=0 exit_req=1 run->exit=0
+[BSP-DBG] cpu=0 iter=0 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=1 halted=0 stop=0 exit_req=0 run->exit=0
+[KVM-MEM] region_del cb mr=ram0 gpa=0 size=0xc0000
+[KVM-MEM] region_del cb mr=pc.rom gpa=0xc0000 size=0x20000
+[KVM-MEM] region_del cb mr=pc.bios gpa=0xe0000 size=0x20000
+[KVM-MEM] region_del cb mr=ram0 gpa=0x100000 size=0x7ff00000
+[WaveVM] region_add gpa=0 size=0xd8000 count=6
+[WaveVM-User] ram_block hva=0x7fba8ffff000..0x7fba900d7000 gpa=0 size=0xd8000 blocks=6
+[KVM-MEM] region_add cb mr=ram0 gpa=0 size=0xd8000
+[KVM-MEM] region_add mr=ram0 gpa=0 size=0xd8000 offset_as=0 offset_mr=0
+[KVM-MEM] region_add cb mr=pc.rom gpa=0xd8000 size=0x8000
+[KVM-MEM] region_add mr=pc.rom gpa=0xd8000 size=0x8000 offset_as=0xd8000 offset_mr=0x18000
+[KVM-MEM] region_add cb mr=pc.bios gpa=0xe0000 size=0x10000
+[KVM-MEM] region_add mr=pc.bios gpa=0xe0000 size=0x10000 offset_as=0xe0000 offset_mr=0x20000
+[WaveVM] region_add gpa=0xf0000 size=0x7ff10000 count=7
+[WaveVM-User] ram_block hva=0x7fba900ef000..0x7fbb0ffff000 gpa=0xf0000 size=0x7ff10000 blocks=7
+[KVM-MEM] region_add cb mr=ram0 gpa=0xf0000 size=0x7ff10000
+[KVM-MEM] region_add mr=ram0 gpa=0xf0000 size=0x7ff10000 offset_as=0xf0000 offset_mr=0xf0000
+[BSP-DBG] cpu=0 iter=1 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=2 halted=0 stop=0 exit_req=1 run->exit=8
+[BSP-DBG] cpu=0 iter=2 ret=65536 rip=0xfff0 cs=0xf000/0xffff0000 rfl=0x2 rax=0x0 halted=0
+[BSP-DBG] cpu=0 iter=3 halted=0 stop=0 exit_req=0 run->exit=8
+=== BSP thread stack (kvm_vcpu_block thread) ===
+TID=11684 wchan=kvm_vcpu_block
+[<0>] kvm_vcpu_block+0x3f/0x90 [kvm]
+[<0>] kvm_vcpu_halt+0x77/0x430 [kvm]
+[<0>] vcpu_run+0x232/0x2a0 [kvm]
+[<0>] kvm_arch_vcpu_ioctl_run+0x169/0x4e0 [kvm]
+[<0>] kvm_vcpu_ioctl+0x2ae/0x720 [kvm]
+[<0>] __x64_sys_ioctl+0x98/0xd0
+[<0>] x64_sys_call+0x11ed/0x20a0
+[<0>] do_syscall_64+0x7c/0x160
+[<0>] entry_SYSCALL_64_after_hwframe+0x78/0x80
+=== strace QEMU 1s ===
+strace: Process 11676 attached with 8 threads
+[pid 11684] ioctl(21, KVM_GET_REGS, {rax=0xe58fe0c3, ..., rsp=0xdc26, rbp=0xc1, ..., rip=0xfdeb, rflags=0x96}) = 0
+[pid 11684] ioctl(21, KVM_GET_SREGS, {cs={base=0x60, limit=65535, selector=6, type=11, present=1, dpl=0, db=0, s=1, l=0, g=0, avl=0}, ...}) = 0
+[pid 11684] ioctl(21, KVM_RUN <unfinished ...>
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60 <unfinished ...>
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60 <unfinished ...>
+[pid 11686] <... ioctl resumed>)        = 0
+[pid 11688] <... ioctl resumed>)        = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60 <unfinished ...>
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360 <unfinished ...>
+[pid 11688] <... ioctl resumed>)        = 0
+[pid 11686] <... ioctl resumed>)        = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16febb60) = 0
+[pid 11686] ioctl(23, KVM_GET_MP_STATE, 0x7fbb16fec360) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eab60) = 0
+[pid 11688] ioctl(25, KVM_GET_MP_STATE, 0x7fbb167eb360) = 0
+=== DONE ===
