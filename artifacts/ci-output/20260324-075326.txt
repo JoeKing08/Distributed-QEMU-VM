@@ -1,0 +1,94 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   3cae1775f..e8d01d2bd  main       -> origin/main
+Updating 3cae1775f..e8d01d2bd
+Fast-forward
+ artifacts/ci-output/20260324-075043.txt | 24 ++++++++++++++
+ scripts/cs_timing_check.sh              | 57 +++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-075043.txt
+ create mode 100755 scripts/cs_timing_check.sh
+=== master0 first 20 lines ===
+[Warning] Failed to open /dev/wavevm (Kernel Mode disabled?): No such file or directory
+[GW-FINAL] id=0 ip=127.0.0.1 port=9000
+[TX-SOCK] bound port=19100
+[GW-SET] id=0 ip=127.0.0.1 port=19120
+[GW-SET] id=1 ip=127.0.0.1 port=19220
+[Swarm] New neighbor discovered: 1
+[Lifecycle] Transition to WARMING
+[TX-HDR] msg=40 len=52 payload=16 target=1 slave=0 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=1 slave=0 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=1 slave=0 req=0
+[HB RX] src_port=19120 src_id=1 target_id=0 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=1 vm=0 state=1 epoch=0
+[IPC] client connected fd=5
+[IPC] fd=5 registered as async push client
+[IPC] client connected fd=6
+[IPC] fd=6 treated as sync RPC client only
+[IPC] client connected fd=7
+[IPC] fd=7 treated as sync RPC client only
+[IPC] client connected fd=8
+=== master1 first 20 lines ===
+[Warning] Failed to open /dev/wavevm (Kernel Mode disabled?): No such file or directory
+[GW-FINAL] id=1 ip=127.0.0.1 port=9000
+[TX-SOCK] bound port=19200
+[GW-SET] id=0 ip=127.0.0.1 port=19120
+[GW-SET] id=1 ip=127.0.0.1 port=19220
+[Swarm] New neighbor discovered: 0
+[Lifecycle] Transition to WARMING
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=1 epoch=0
+[Lifecycle] Transition to ACTIVE. Participating in Owner Set.
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[TX-HDR] msg=40 len=52 payload=16 target=0 slave=1 req=0
+[HB RX] src_port=19220 src_id=0 target_id=1 epoch=0 local=0
+[HB RX] rid=0
+[HB LOGIC] src=0 vm=0 state=2 epoch=0
+=== slave0 count ===
+10 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/slave0.log
+=== slave1 count ===
+10 /workspaces/WaveVM_Frontier-X/artifacts/tmp/fract-kvm-debug2-20260324-072354/slave1.log
+=== gw sidecar_a first 5 ===
+[Gateway] sockfd=4 reuseport=0
+[Gateway] bind ok port=19120 fd=4 local=0.0.0.0:19120
+[Gateway] rx len=52 magic=0x57564d58
+[GW-PUSH] node NOT FOUND sid=1
+[Gateway] rx len=52 magic=0x57564d58
+=== vm.log first 20 ===
+[KVM-MEM] listener_register kml=0x61d50a9710e0 as=0x61d4ded95dc0 as_id=0 nr_slots=32764
+[WaveVM] KVM bootstrap OK (mode=user), keep wavevm vCPU control (kvm_enabled=1)
+qemu-system-x86_64: -accel wavevm: WaveVM: defer user mem init until first RAM block is registered
+[KVM-MEM] region_add cb mr=kvm-apic-msi gpa=0xfee00000 size=0x100000
+[WaveVM] region_add gpa=0 size=0x80000000 count=1
+[WaveVM-User] ram_block hva=0x7fba8ffff000..0x7fbb0ffff000 gpa=0 size=0x80000000 blocks=1
+[WaveVM] dedup region_add gpa=0 size=0x80000000 count=1
+[KVM-MEM] region_add cb mr=ram0 gpa=0 size=0x80000000
+[KVM-MEM] region_add mr=ram0 gpa=0 size=0x80000000 offset_as=0 offset_mr=0
+[KVM-MEM] set_user_memory slot=0 as_id=0 new=1 gpa=0 size=0x80000000 hva=0x7fba8ffff000 flags=0x1 old_flags=0
+[WaveVM] KVM detected: PROT_NONE path bypassed, migration dirty log enabled.
+[KVM-MEM] region_add cb mr=ram0 gpa=0 size=0x80000000
+[KVM-MEM] region_add mr=ram0 gpa=0 size=0x80000000 offset_as=0 offset_mr=0
+[KVM-MEM] log_start mr=ram0 gpa=0 size=0x80000000 old=0 new=0x4
+[WaveVM] region_add gpa=0x100000000 size=0x40000000 count=2
+[WaveVM-User] ram_block hva=0x7fba4fffe000..0x7fba8fffe000 gpa=0x100000000 size=0x40000000 blocks=2
+[KVM-MEM] region_add cb mr=ram1 gpa=0x100000000 size=0x40000000
+[KVM-MEM] region_add mr=ram1 gpa=0x100000000 size=0x40000000 offset_as=0x100000000 offset_mr=0
+[KVM-MEM] set_user_memory slot=1 as_id=0 new=1 gpa=0x100000000 size=0x40000000 hva=0x7fba4fffe000 flags=0x1 old_flags=0
+[KVM-MEM] region_add cb mr=pc.bios gpa=0xfffc0000 size=0x40000
+=== master0 user_backend lines ===
+[IPC] client connected fd=5
+[IPC] client connected fd=6
+[IPC] client connected fd=7
+[IPC] client connected fd=8
+[IPC] client connected fd=9
+=== python3 more memory checks ===
+reset_vector 0xFFFF0: ea5b0000000000000000000000000000
+bios_entry 0xF0000: 068b0000000000000000000000000000
+nonzero at 0xea000
+F seg nonzero at 0xf0000
+=== DONE ===
