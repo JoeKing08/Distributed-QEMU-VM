@@ -41,6 +41,33 @@
 
 #include "../common_include/wavevm_protocol.h"
 
+/* --- CPUID setup for KVM vCPUs ---
+ * Without KVM_SET_CPUID2, the vCPU has no CPUID leaves and KVM cannot
+ * properly run real-mode code on Intel VT-x (causes triple fault). */
+static void wvm_setup_vcpu_cpuid(int kvm_fd, int vcpu_fd) {
+    /* Allocate space for up to 256 CPUID entries */
+    size_t sz = sizeof(struct kvm_cpuid2) + 256 * sizeof(struct kvm_cpuid_entry2);
+    struct kvm_cpuid2 *cpuid = calloc(1, sz);
+    if (!cpuid) return;
+    cpuid->nent = 256;
+
+    if (ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid) < 0) {
+        fprintf(stderr, "[Slave] KVM_GET_SUPPORTED_CPUID failed: %s\n", strerror(errno));
+        free(cpuid);
+        return;
+    }
+
+    if (ioctl(vcpu_fd, KVM_SET_CPUID2, cpuid) < 0) {
+        fprintf(stderr, "[Slave] KVM_SET_CPUID2 failed: %s\n", strerror(errno));
+    } else {
+        static int cpuid_dbg = 0;
+        if (cpuid_dbg++ < 2)
+            fprintf(stderr, "[Slave] KVM_SET_CPUID2 OK (%u entries) on vcpu_fd=%d\n",
+                    cpuid->nent, vcpu_fd);
+    }
+    free(cpuid);
+}
+
 // --- 全局配置变量 ---
 static int g_service_port = 9000;
 static int g_nonblock_recv = 0;
@@ -559,6 +586,7 @@ void init_kvm_global() {
                 g_boot_kvm_run = NULL;
             }
         }
+        wvm_setup_vcpu_cpuid(g_kvm_fd, g_boot_vcpu_fd);
     }
 
     ioctl(g_vm_fd, KVM_SET_TSS_ADDR, WVM_KVM_TSS_ADDR);
@@ -770,6 +798,7 @@ void init_thread_local_vcpu(int vcpu_id) {
         t_kvm_run = NULL;
         return;
     }
+    wvm_setup_vcpu_cpuid(g_kvm_fd, t_vcpu_fd);
 }
 
 // [FIX] Thread-Local 缓存，避免高频 malloc/free
