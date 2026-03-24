@@ -1,0 +1,24 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   ea740c786..eb4871ab8  main       -> origin/main
+Updating ea740c786..eb4871ab8
+Fast-forward
+ .github/workflows/cs-run.yml             | 44 ++++++++++++++++++
+ artifacts/ci-output/20260324-065745.txt  |  2 +
+ artifacts/fract-kvm-test/run_smp_numa.sh | 69 ++++++++++++++++++++++++++++
+ scripts/auto_smp_test.sh                 | 78 ++++++++++++++++++++++++++++++++
+ scripts/cs_check.sh                      | 10 ++++
+ 5 files changed, 203 insertions(+)
+ create mode 100644 .github/workflows/cs-run.yml
+ create mode 100644 artifacts/ci-output/20260324-065745.txt
+ create mode 100644 artifacts/fract-kvm-test/run_smp_numa.sh
+ create mode 100755 scripts/auto_smp_test.sh
+ create mode 100755 scripts/cs_check.sh
+=== whoami ===
+root
+=== artdir ===
+no artdir
+=== processes ===
+no wavevm/qemu processes
+=== /dev/kvm ===
+crw-rw---- 1 root 109 10, 232 Mar 24 06:26 /dev/kvm
+=== DONE ===
