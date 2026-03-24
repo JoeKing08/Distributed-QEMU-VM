@@ -1,0 +1,42 @@
+name: Codespace Remote Command
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run on codespace'
+        required: true
+        default: 'echo hello'
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup gh
+        run: gh auth login --with-token <<< "${{ secrets.GH_CS_PAT }}"
+        env:
+          GH_TOKEN: ${{ secrets.GH_CS_PAT }}
+
+      - name: Ensure codespace is running
+        run: |
+          STATE=$(gh api /user/codespaces/symmetrical-invention-g4g6pvp5gqgr2qv5 --jq '.state')
+          echo "Codespace state: $STATE"
+          if [ "$STATE" != "Available" ]; then
+            gh api -X POST /user/codespaces/symmetrical-invention-g4g6pvp5gqgr2qv5/start
+            for i in $(seq 1 30); do
+              sleep 10
+              STATE=$(gh api /user/codespaces/symmetrical-invention-g4g6pvp5gqgr2qv5 --jq '.state')
+              echo "[$i] $STATE"
+              if [ "$STATE" = "Available" ]; then break; fi
+            done
+          fi
+
+      - name: Run command on codespace
+        run: |
+          gh cs ssh -c symmetrical-invention-g4g6pvp5gqgr2qv5 -- "bash -lc '${{ inputs.command }}'" 2>&1 | tee /tmp/cs-output.txt
+        timeout-minutes: 10
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cs-output
+          path: /tmp/cs-output.txt
