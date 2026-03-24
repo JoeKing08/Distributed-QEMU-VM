@@ -1,0 +1,19 @@
+From https://github.com/jk0806/WaveVM_Frontier-X
+   c606d1f80..9930585d2  main       -> origin/main
+Updating c606d1f80..9930585d2
+Fast-forward
+ artifacts/ci-output/20260324-074247.txt | 124 ++++++++++++++++++++++++++++++++
+ scripts/cs_memdump.sh                   |  32 +++++++++
+ 2 files changed, 156 insertions(+)
+ create mode 100644 artifacts/ci-output/20260324-074247.txt
+ create mode 100755 scripts/cs_memdump.sh
+=== BSP linear address 0x1004b - 32 bytes ===
+=== BIOS entry area 0xFFFF0 (reset vector) ===
+=== 0xF0000+0xDEB area ===
+=== Search CLI+HLT near 0x10000 ===
+not found in 0x10000
+=== Search CLI+HLT near 0xF0000 ===
+not found in 0xF0D00
+=== BDA at 0x400 ===
+=== debugcon hexdump ===
+=== DONE ===
