@@ -299,7 +299,8 @@ static inline void gateway_process_packet(int local_fd,
         route_id = target_id;
     } else {
         // 无有效目标，直接交给 upstream 处理
-        sendto(local_fd, ptr, pkt_len, MSG_DONTWAIT,
+        int tx_fd = (g_upstream_tx_socket >= 0) ? g_upstream_tx_socket : local_fd;
+        sendto(tx_fd, ptr, pkt_len, MSG_DONTWAIT,
                (struct sockaddr*)&g_upstream_addr, sizeof(g_upstream_addr));
         return;
     }
@@ -331,7 +332,8 @@ static inline void gateway_process_packet(int local_fd,
         }
     }
     if (r < 0) {
-        ssize_t sret = sendto(local_fd, ptr, pkt_len, MSG_DONTWAIT,
+        int tx_fd = (g_upstream_tx_socket >= 0) ? g_upstream_tx_socket : local_fd;
+        ssize_t sret = sendto(tx_fd, ptr, pkt_len, MSG_DONTWAIT,
                               (struct sockaddr*)&g_upstream_addr, sizeof(g_upstream_addr));
         if (msg_type == MSG_VCPU_RUN || msg_type == MSG_VCPU_EXIT || sret < 0) {
             char src_ip[INET_ADDRSTRLEN] = {0};

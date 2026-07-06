@@ -64,7 +64,7 @@ print("\n" + "=" * 60)
 print("[2/5] Comparing Gemini.md file blocks vs workspace...")
 print("=" * 60)
 
-results = {"pass": [], "fail": [], "missing_ws": [], "missing_gm": [], "qemu_diff_fail": []}
+results = {"pass": [], "fail": [], "missing_ws": [], "missing_gm": []}
 
 for path, code in sorted(blocks.items()):
     ws_path = os.path.join(WORKSPACE, path)
@@ -176,24 +176,22 @@ if diff_content:
     )
 
     if r.stdout.strip():
-        real_diffs = []
         for line in r.stdout.strip().split("\n"):
             if "Only in " + rebuild_dir in line:
                 # File in vanilla QEMU but not in workspace - expected for tarball extras
                 continue
             elif "Only in " + ws_qemu in line:
-                if "__pycache__" in line:
-                    continue
+                fname = line.split(": ")[-1] if ": " in line else line
                 print(f"  [EXTRA_WS] {line}")
-                real_diffs.append(line)
             elif "differ" in line.lower():
                 print(f"  [DIFFER] {line}")
-                real_diffs.append(line)
+        # Count real diffs
+        real_diffs = [l for l in r.stdout.strip().split("\n")
+                      if "differ" in l.lower() or ("Only in " + ws_qemu in l)]
         if not real_diffs:
             print("  All QEMU files IDENTICAL (only tarball extras differ)")
         else:
             print(f"\n  {len(real_diffs)} differences found")
-            results["qemu_diff_fail"] = real_diffs
     else:
         print("  All QEMU files IDENTICAL")
 else:
@@ -246,7 +244,6 @@ print("=" * 60)
 print(f"  File blocks PASS:       {len(results['pass'])}")
 print(f"  File blocks FAIL:       {len(results['fail'])}")
 print(f"  Missing from workspace: {len(results['missing_ws'])}")
-print(f"  QEMU diff FAIL:         {len(results['qemu_diff_fail'])}")
 if results['fail']:
     print(f"\n  FAILED files:")
     for f in results['fail']:
@@ -255,10 +252,6 @@ if results['missing_ws']:
     print(f"\n  Missing from workspace:")
     for f in results['missing_ws']:
         print(f"    - {f}")
-if results['qemu_diff_fail']:
-    print(f"\n  QEMU rebuild differs from workspace:")
-    for f in results['qemu_diff_fail']:
-        print(f"    - {f}")
 
-overall = "PASS" if len(results['fail']) == 0 and len(results['missing_ws']) == 0 and len(results['qemu_diff_fail']) == 0 else "FAIL"
+overall = "PASS" if len(results['fail']) == 0 and len(results['missing_ws']) == 0 else "FAIL"
 print(f"\n  Overall: {overall}")

@@ -1,0 +1,108 @@
+version: 2.1
+
+jobs:
+  tcg-dual-node-test:
+    machine:
+      image: android:default
+    resource_class: large
+    steps:
+      - checkout
+
+      - run:
+          name: Check hardware
+          command: |
+            echo "=== /dev/kvm ==="
+            ls -la /dev/kvm 2>/dev/null && echo "KVM FOUND" || echo "NO KVM"
+            echo "=== CPU info ==="
+            nproc
+            free -m
+            cat /proc/cpuinfo | grep "model name" | head -1
+            uname -r
+
+      - run:
+          name: Install dependencies
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq build-essential ninja-build pkg-config \
+              libglib2.0-dev libpixman-1-dev python3 python3-venv qemu-utils \
+              libcap-ng-dev libattr1-dev python3-setuptools lz4 genisoimage \
+              linux-headers-$(uname -r)
+            pip3 install setuptools || python3 -m pip install setuptools || true
+
+      - run:
+          name: Build QEMU (WaveVM)
+          command: |
+            cd wavevm-qemu
+            mkdir -p build-native
+            cd build-native
+            ../configure --target-list=x86_64-softmmu --enable-kvm \
+              --disable-docs --disable-gtk --disable-sdl --disable-vnc \
+              --disable-spice --disable-usb-redir --disable-libusb \
+              --disable-smartcard --disable-guest-agent
+            make -j$(nproc)
+          no_output_timeout: 15m
+
+      - run:
+          name: Build slave daemon
+          command: |
+            cd slave_daemon
+            make -j$(nproc)
+
+      - run:
+          name: Build master core
+          command: |
+            cd master_core
+            make -j$(nproc) 2>&1 || \
+            gcc -O2 -I../common_include -pthread -o wavevm_node_master \
+              main_wrapper.c logic_core.c user_backend.c
+
+      - run:
+          name: Build gateway
+          command: |
+            cd gateway_service && make -j$(nproc)
+
+      - run:
+          name: Build kernel module (Mode A — compile only)
+          command: |
+            KVER=$(uname -r)
+            echo "Building wavevm.ko for kernel $KVER"
+            cd master_core
+            make -C /lib/modules/$KVER/build M=$(pwd) modules 2>&1
+            ls -la wavevm.ko
+            modinfo wavevm.ko
+
+      - run:
+          name: Load kernel module (Mode A)
+          command: |
+            echo "=== Mode A: loading wavevm.ko ==="
+            cd master_core
+            sudo insmod wavevm.ko service_port=19100 local_slave_port=19105
+            sudo chmod 666 /dev/wavevm
+            ls -la /dev/wavevm
+            sudo dmesg | tail -20
+
+      - run:
+          name: Download CirrosOS image
+          command: |
+            mkdir -p artifacts/images
+            if [ ! -f artifacts/images/cirros-0.6.2-x86_64-disk.img ]; then
+              wget -q https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img \
+                -O artifacts/images/cirros-0.6.2-x86_64-disk.img
+            fi
+            ls -la artifacts/images/
+
+      - run:
+          name: Run Dual-Node KVM Fractal Test (Node A) — Mode B regression
+          command: bash scripts/ci_dual_node.sh
+          environment:
+            TS_AUTHKEY: tskey-auth-k3o5TUoMea11CNTRL-oc9oXzqnHG5L1rMCq2SQF5am7EnzLAEm
+          no_output_timeout: 20m
+
+      - store_artifacts:
+          path: /tmp/wavevm-test-results
+          destination: test-results
+
+workflows:
+  kvm-dual-node-mode-a:
+    jobs:
+      - tcg-dual-node-test
