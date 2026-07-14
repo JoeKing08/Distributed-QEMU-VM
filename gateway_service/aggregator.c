@@ -745,7 +745,16 @@ static void learn_route(uint32_t slave_id, struct sockaddr_in *addr) {
         return;
     }
 
-    if (node) {        // [FIX-M10] static_pinned 路由只允许被 well-known 端口 (<32768) 覆写。        // sidecar 收到本地 master 心跳 (19100/19200) -> 更新; 中间网关收到转发包临时端口 (>=32768) -> 拦截        if (node->static_pinned && ntohs(addr->sin_port) >= 32768) {            pthread_rwlock_unlock(&g_map_lock);            return;        }
+    if (node) {
+        /*
+         * static_pinned routes may only be updated by well-known service ports.
+         * Local masters announce from 19100/19200; transit packets often arrive
+         * from ephemeral upstream sockets and must not overwrite static routes.
+         */
+        if (node->static_pinned && ntohs(addr->sin_port) >= 32768) {
+            pthread_rwlock_unlock(&g_map_lock);
+            return;
+        }
         // [FIX-M8] 同时持有 node->lock 保护 addr 写入，与读端保持一致
         pthread_mutex_lock(&node->lock);
         node->addr = *addr;

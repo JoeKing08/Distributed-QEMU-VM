@@ -92,6 +92,26 @@ typedef struct {
 static GVMRamBlock g_mem_blocks[MAX_RAM_BLOCKS];
 static int g_block_count = 0;
 
+#define MAX_VOLATILE_RANGES 16
+
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} WVMVolatileRange;
+
+static WVMVolatileRange g_volatile_ranges[MAX_VOLATILE_RANGES];
+static int g_volatile_range_count = 0;
+
+static bool wvm_is_volatile_gpa(uint64_t gpa)
+{
+    for (int i = 0; i < g_volatile_range_count; i++) {
+        if (gpa >= g_volatile_ranges[i].start && gpa < g_volatile_ranges[i].end) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* 
  * [物理意图] 在 QEMU 内部建立 Guest 物理地址(GPA)与宿主机虚拟地址(HVA)的“空间映射图”。
  * [关键逻辑] 将 RAM 块注册到私有映射表，并执行初始 mprotect(PROT_NONE) 以强制触发首次访问缺页。
@@ -100,7 +120,8 @@ static int g_block_count = 0;
 void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
     if (!g_fault_hook_checked) {
         const char *hook_env = getenv("WVM_ENABLE_FAULT_HOOK");
-        g_fault_hook_enabled = (!hook_env || atoi(hook_env) != 0);
+        bool is_slave = (getenv("WVM_SOCK_REQ") != NULL);
+        g_fault_hook_enabled = is_slave && (!hook_env || atoi(hook_env) != 0);
         g_fault_hook_checked = true;
     }
     for (int i = 0; i < g_block_count; i++) {
@@ -117,18 +138,17 @@ void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa) {
         }
     }
     if (g_block_count >= MAX_RAM_BLOCKS) exit(1);
-    if (!kvm_enabled()) {
-        /* V31b: Master TCG uses PROT_READ so BSP reads go directly to SHM
-         * without triggering SIGSEGV → IPC round-trip.  Only writes trigger
-         * SIGSEGV (PROT_READ page + write → handler → mprotect RW + snapshot).
-         * Slave child QEMUs still use PROT_NONE because their memory starts
-         * empty and every page must be fetched on first access.
-         *
-         * V31c-fix: g_is_slave is set in wavevm_user_mem_init() which runs
-         * AFTER this function.  Check env var directly instead. */
+    if (!kvm_enabled() && g_fault_hook_enabled) {
+        /*
+         * Only slave TCG uses host page protection.  The master owns the
+         * complete RAM image and tracks writes via QEMU dirty logging; using
+         * process-wide mprotect on the master also traps device DMA writes and
+         * breaks BIOS/bootloader disk reads.
+         */
         int is_slave = (getenv("WVM_SOCK_REQ") != NULL);
-        int prot = is_slave ? PROT_NONE : PROT_READ;
-        mprotect(hva, size, prot);
+        if (is_slave) {
+            mprotect(hva, size, PROT_NONE);
+        }
     }
     g_mem_blocks[g_block_count].hva_start = (uintptr_t)hva;
     g_mem_blocks[g_block_count].hva_end   = (uintptr_t)hva + size;
@@ -188,7 +208,10 @@ static __thread int t_lazy_count = 0;
 
 static void flush_lazy_ro_queue(void) {
     if (t_lazy_count == 0) return;
-    if (kvm_enabled()) { t_lazy_count = 0; return; } /* KVM guard: never downgrade under KVM */
+    if (kvm_enabled() || !g_fault_hook_enabled) {
+        t_lazy_count = 0;
+        return;
+    }
     for (int i = 0; i < t_lazy_count; i++) {
         uint64_t gpa = t_lazy_ro_queue[i];
         void *hva = gpa_to_hva_safe(gpa);
@@ -198,7 +221,7 @@ static void flush_lazy_ro_queue(void) {
 }
 
 static void defer_ro_protect(uint64_t gpa) {
-    if (kvm_enabled()) return; /* KVM 脏页由 dirty log 跟踪，绝不能 mprotect 降权，否则 EPT 违例 → exit=17 */
+    if (kvm_enabled() || !g_fault_hook_enabled) return; /* Dirty-log paths must never downgrade pages. */
     t_lazy_ro_queue[t_lazy_count++] = gpa;
     if (t_lazy_count >= LAZY_QUEUE_SIZE) flush_lazy_ro_queue();
 }
@@ -359,7 +382,7 @@ void wvm_apply_remote_push(uint16_t msg_type, void *payload) {
         else {
             // 此时内存状态已不可信，必须强制失效
             // 下次访问触发 sigsegv -> request_page_sync (V28 Pull) 拉取最新全量
-            if (!kvm_enabled()) {
+            if (!kvm_enabled() && g_fault_hook_enabled) {
                 void *inv_hva = gpa_to_hva_safe(gpa);
                 if (inv_hva) mprotect(inv_hva, 4096, PROT_NONE);
             }
@@ -628,7 +651,21 @@ void wvm_set_ttl_interval(int ms) {
 }
 
 void wvm_register_volatile_ram(uint64_t gpa, uint64_t size) {
-    // 留空：不再维护易失性区域链表
+    if (size == 0 || g_volatile_range_count >= MAX_VOLATILE_RANGES) {
+        return;
+    }
+
+    uint64_t end = gpa + size;
+    if (end < gpa) {
+        return;
+    }
+
+    g_volatile_ranges[g_volatile_range_count].start = gpa;
+    g_volatile_ranges[g_volatile_range_count].end = end;
+    g_volatile_range_count++;
+
+    fprintf(stderr, "[WaveVM-User] volatile RAM range registered [0x%llx, 0x%llx)\n",
+            (unsigned long long)gpa, (unsigned long long)end);
 }
 
 /* [FIX-F3] KVM 主动页面拉取：KVM 模式下 mprotect(PROT_NONE) 不可用的替代方案。
@@ -1191,13 +1228,13 @@ static void *diff_harvester_thread_fn(void *arg) {
          * subsequent write.  At 1ms the harvester re-protects pages so fast
          * that kernel boot triggers millions of SIGSEGVs (2.3M+ in V32g).
          * 50ms lets pages stay RW longer, cutting SIGSEGV ~50x. */
-        usleep(kvm_enabled() ? 1000 : 50000);
+        usleep((kvm_enabled() || !g_is_slave) ? 1000 : 50000);
 
-        // KVM 模式：基于脏页日志收割，不依赖 SIGSEGV/PROT_NONE。
+        // KVM and master TCG: harvest QEMU dirty logs, no SIGSEGV/PROT_NONE.
         // [FIX] 遍历 g_mem_blocks 而非 flat 0~g_ram_size，
         //       并用 qemu_ram_addr_from_host 将 HVA 转为正确的 ram_addr_t，
         //       修复 PCI hole (3G-4G) 导致的 gpa != ram_addr_t 问题。
-        if (kvm_enabled()) {
+        if (kvm_enabled() || !g_is_slave) {
             for (int bi = 0; bi < g_block_count; bi++) {
                 GVMRamBlock *blk = &g_mem_blocks[bi];
                 /* 将 block 起始 HVA 转为 ram_addr_t 基址（一次性，避免每页调用） */
@@ -1210,6 +1247,9 @@ static void *diff_harvester_thread_fn(void *arg) {
                         continue;
                     }
                     uint64_t gpa = blk->gpa_start + off;
+                    if (!kvm_enabled() && !g_is_slave && gpa < g_ram_size) {
+                        continue;
+                    }
                     void *hva = (void *)(blk->hva_start + off);
                     uint64_t ver = get_local_page_version(gpa);
                     add_to_aggregator(gpa, ver + 1, 0, 4096, hva, 0);
@@ -1239,8 +1279,14 @@ static void *diff_harvester_thread_fn(void *arg) {
             // [A] 上锁 (Freeze): 告诉 Signal Handler 暂停操作
             __atomic_store_n(&g_latches[idx].val, curr->gpa, __ATOMIC_RELEASE);
 
-            // [B] 冻结权限: 设为只读
-            mprotect(page_addr, 4096, PROT_READ);
+            bool is_volatile = wvm_is_volatile_gpa(curr->gpa);
+
+            // [B] 冻结权限: 设为只读。Volatile ranges stay writable after
+            // harvesting; otherwise BIOS/PAM shadow writes can livelock on
+            // periodic write-protect rearming during early boot.
+            if (!is_volatile) {
+                mprotect(page_addr, 4096, PROT_READ);
+            }
             __sync_synchronize();
 
             // [C] 快照 (Snapshot): 安全拷贝
@@ -1451,7 +1497,7 @@ static void *mem_push_listener_thread(void *arg) {
                     
                     // 触发强制同步
                     void* hva = gpa_to_hva_safe(stale_gpa);
-                    if (hva && !kvm_enabled()) {
+                    if (hva && !kvm_enabled() && g_fault_hook_enabled) {
                         mprotect(hva, 4096, PROT_NONE);
                     }
                     set_local_page_version(stale_gpa, 0);
@@ -1518,7 +1564,7 @@ static void *mem_push_listener_thread(void *arg) {
                         } else {
                             // 严重乱序：回退到 Pull 模式
                             // 这种情况下必须立即锁回，不能 Lazy，因为状态已重置
-                            if (!kvm_enabled()) {
+                            if (!kvm_enabled() && g_fault_hook_enabled) {
                                 void *inv_hva2 = gpa_to_hva_safe(gpa);
                                 if (inv_hva2) mprotect(inv_hva2, 4096, PROT_NONE);
                             }
@@ -1577,16 +1623,36 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
         enable_fault_hook = false;
     }
 
+    char *env_req = getenv("WVM_SOCK_REQ");
+    char *env_push = getenv("WVM_SOCK_PUSH");
+    char *env_id = getenv("WVM_SLAVE_ID");
+    g_is_slave = (env_req && env_push) ? 1 : 0;
+
+    /*
+     * Master TCG must not use host mprotect tracking: firmware and device DMA
+     * write guest RAM from QEMU threads, and trapping those writes can surface
+     * as BIOS/bootloader disk read failures.  Track master writes through
+     * QEMU's dirty log instead.  Slave TCG keeps fault-based demand paging.
+     */
+    g_fault_hook_enabled = enable_fault_hook && !kvm_enabled() && g_is_slave;
+    g_fault_hook_checked = true;
+
     // KVM + PROT_NONE 会导致 EPT violation，KVM 下：
     //   1. 启用 migration dirty log 替代 mprotect 追踪脏页
     //   2. 各调用点用 !kvm_enabled() 守卫跳过 mprotect(PROT_NONE)
     // 注意：fault hook（SIGSEGV 拦截器）仍然保留，它是分布式缺页请求的核心通道。
-    if (kvm_enabled()) {
+    if (kvm_enabled() || !g_is_slave) {
         memory_global_dirty_log_start();
-        fprintf(stderr, "[WaveVM] KVM detected: PROT_NONE path bypassed, migration dirty log enabled.\n");
+        fprintf(stderr, "[WaveVM] dirty log tracking enabled (kvm=%d slave=%d).\n",
+                kvm_enabled() ? 1 : 0, g_is_slave);
     }
-    g_fault_hook_enabled = enable_fault_hook;
-    g_fault_hook_checked = true;
+
+    if (!kvm_enabled() && !getenv("WVM_SOCK_REQ")) {
+        /* x86 BIOS/PAM shadow RAM is already copied into SHM by
+         * wavevm_sync_bios_shadow(). Keep it from becoming a high-frequency
+         * write-protect fault source during firmware shadowing. */
+        wvm_register_volatile_ram(0xC0000, 0x40000);
+    }
 
     init_latches();
     pthread_spin_init(&g_reorder_lock, 0); 
@@ -1597,12 +1663,7 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
 
     size_t num_pages = ram_size / 4096;
 
-    char *env_req = getenv("WVM_SOCK_REQ");
-    char *env_push = getenv("WVM_SOCK_PUSH");
-    char *env_id = getenv("WVM_SLAVE_ID");
-
     if (env_req && env_push) {
-        g_is_slave = 1;
         g_fd_req = atoi(env_req);
         g_fd_push = atoi(env_push);
         g_slave_id = env_id ? atoi(env_id) : 0;
@@ -1621,7 +1682,7 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
         pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
     }
 
-    if (!kvm_enabled()) {
+    if (!kvm_enabled() && g_fault_hook_enabled) {
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_flags = SA_SIGINFO; // [FIX-M6] 移除 SA_NODEFER，防止 handler 内递归 SIGSEGV 导致栈溢出
@@ -1632,4 +1693,3 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
         // Initial state is handled per RAM block in wavevm_register_ram_block().
     }
 }
-

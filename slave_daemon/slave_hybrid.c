@@ -1506,6 +1506,8 @@ skip_kvm_run:
     if (req->mode_tcg) {
         wvm_translate_kvm_to_tcg(&kregs, &ksregs, &ack->ctx.tcg);
         ack->ctx.tcg.exit_reason = t_kvm_run->exit_reason;
+        ack->ctx.tcg.halted = (t_kvm_run->exit_reason == KVM_EXIT_HLT) ? 1 : 0;
+        ack->ctx.tcg.interrupt_request = 0;
     } else {
         wvm_kvm_context_t *ack_kctx = &ack->ctx.kvm;
         ack_kctx->rax = kregs.rax; ack_kctx->rbx = kregs.rbx; ack_kctx->rcx = kregs.rcx; ack_kctx->rdx = kregs.rdx;
@@ -1961,7 +1963,13 @@ void spawn_tcg_processes(int base_id) {
     tcg_endpoints = malloc(sizeof(slave_endpoint_t) * g_num_cores);
     if (!tcg_endpoints) { perror("malloc endpoints"); exit(1); }
     
-    int internal_base = 20000 + (g_service_port % 1000) * 256;
+    /*
+     * Keep inherited TCG endpoint ports inside the 16-bit TCP/UDP range.
+     * The old 256-stride formula overflowed for ports like 19205 and could
+     * silently wrap through htons(), leaving the proxy sending to a port that
+     * the child failed to bind.
+     */
+    int internal_base = 20000 + (g_service_port % 512) * 64;
     char ram_str[32]; snprintf(ram_str, sizeof(ram_str), "%d", g_ram_mb);
 
     for (long i = 0; i < g_num_cores; i++) {
@@ -1984,15 +1992,24 @@ void spawn_tcg_processes(int base_id) {
         if (fork() == 0) {
             int sock_cmd = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in addr_cmd = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK), .sin_port=htons(port_cmd) };
-            bind(sock_cmd, (struct sockaddr*)&addr_cmd, sizeof(addr_cmd));
+            if (sock_cmd < 0 || bind(sock_cmd, (struct sockaddr*)&addr_cmd, sizeof(addr_cmd)) != 0) {
+                perror("[Hybrid] bind cmd socket");
+                _exit(127);
+            }
 
             int sock_req = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in addr_req = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK), .sin_port=htons(port_req) };
-            bind(sock_req, (struct sockaddr*)&addr_req, sizeof(addr_req));
+            if (sock_req < 0 || bind(sock_req, (struct sockaddr*)&addr_req, sizeof(addr_req)) != 0) {
+                perror("[Hybrid] bind req socket");
+                _exit(127);
+            }
 
             int sock_push = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in addr_push = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK), .sin_port=htons(port_push) };
-            bind(sock_push, (struct sockaddr*)&addr_push, sizeof(addr_push));
+            if (sock_push < 0 || bind(sock_push, (struct sockaddr*)&addr_push, sizeof(addr_push)) != 0) {
+                perror("[Hybrid] bind push socket");
+                _exit(127);
+            }
 
             struct sockaddr_in proxy = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK), .sin_port=htons(g_service_port) };
             connect(sock_cmd, (struct sockaddr*)&proxy, sizeof(proxy));

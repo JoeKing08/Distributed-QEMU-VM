@@ -136,6 +136,15 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 #define INITIAL_RETRY_DELAY_US 50000      // 50ms
 #define MAX_RETRY_DELAY_US     500000     // 500ms
 #define TOTAL_TIMEOUT_US      20000000    // 20s
+/*
+ * VCPU_RUN is not a short request/response operation. It represents remote
+ * execution until the next CPU exit, so a fixed small RPC timeout can falsely
+ * fail a healthy but long-running TCG/KVM run. Keep a long guardrail to avoid
+ * permanent hangs, and limit UDP retransmits to the initial delivery window.
+ */
+#define VCPU_RUN_TIMEOUT_US        (30ULL * 60ULL * 1000000ULL)
+#define VCPU_RUN_RETRY_WINDOW_US   5000000ULL
+#define VCPU_RUN_MAX_RETRIES       12
 
 // --- 目录表定义 ---
 #ifdef __KERNEL__
@@ -1408,6 +1417,25 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
     uint64_t start_total = g_ops->get_time_us();
     uint64_t last_send_time;
     uint64_t current_retry_delay = INITIAL_RETRY_DELAY_US;
+    bool retryable = true;
+    bool is_vcpu_run = (msg_type == MSG_VCPU_RUN);
+    uint64_t total_timeout_us = TOTAL_TIMEOUT_US;
+    uint32_t retry_count = 0;
+    uint32_t max_retries = UINT32_MAX;
+    uint64_t retry_window_us = UINT64_MAX;
+    if (is_vcpu_run) {
+        /*
+         * VCPU_RUN is a long-running transaction. It still needs retransmit for
+         * startup UDP readiness/loss, while the slave side provides
+         * single-flight execution for duplicate req_ids. Do not retransmit for
+         * the whole execution lifetime: duplicates amplify load and can arrive
+         * long after the original waiter timed out.
+         */
+        current_retry_delay = MAX_RETRY_DELAY_US;
+        total_timeout_us = VCPU_RUN_TIMEOUT_US;
+        max_retries = VCPU_RUN_MAX_RETRIES;
+        retry_window_us = VCPU_RUN_RETRY_WINDOW_US;
+    }
 
     // 首次发送
     g_ops->send_packet(buffer, pkt_len, target_id);
@@ -1418,7 +1446,7 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
         g_ops->touch_watchdog();
 
         // 检查总超时
-        if (g_ops->time_diff_us(start_total) > TOTAL_TIMEOUT_US) {
+        if (g_ops->time_diff_us(start_total) > total_timeout_us) {
             if (g_ops->log) {
                 g_ops->log("[RPC Timeout] Type: %d, Target: %d, RID: %llu", 
                            msg_type, target_id, (unsigned long long)rid);
@@ -1430,10 +1458,17 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
         }
 
         // 检查是否需要重试
-        if (g_ops->time_diff_us(last_send_time) > current_retry_delay) {
+        if (retryable && g_ops->time_diff_us(last_send_time) > current_retry_delay) {
+            if (retry_count >= max_retries ||
+                g_ops->time_diff_us(start_total) > retry_window_us) {
+                retryable = false;
+                continue;
+            }
+
             // 重发
             g_ops->send_packet(buffer, pkt_len, target_id);
             last_send_time = g_ops->get_time_us();
+            retry_count++;
 
             // 指数增加延迟
             current_retry_delay *= 2;

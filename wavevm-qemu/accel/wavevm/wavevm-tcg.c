@@ -6,6 +6,18 @@
 
 #if defined(TARGET_I386) || defined(TARGET_X86_64)
 
+/*
+ * Keep guest-visible/wakeup interrupt state in the remote TCG context.
+ * Local execution-control bits such as EXITTB/DEBUG are meaningful only
+ * to the current QEMU instance and are intentionally not serialized.
+ */
+#define WVM_TCG_INTERRUPT_SYNC_MASK \
+    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | CPU_INTERRUPT_RESET | \
+     CPU_INTERRUPT_TGT_EXT_0 | CPU_INTERRUPT_TGT_EXT_1 | \
+     CPU_INTERRUPT_TGT_EXT_2 | CPU_INTERRUPT_TGT_EXT_3 | \
+     CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
+     CPU_INTERRUPT_TGT_INT_1 | CPU_INTERRUPT_TGT_INT_2)
+
 // Export QEMU TCG state to network packet
 void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     X86CPU *x86_cpu = X86_CPU(cpu);
@@ -31,8 +43,11 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
         ctx->xmm_regs[i*2 + 1] = env->xmm_regs[i].ZMM_Q(1);
     }
     ctx->mxcsr = env->mxcsr;
-    
-    ctx->exit_reason = 0;
+
+    ctx->exit_reason = cpu->exception_index;
+    ctx->halted = cpu->halted ? 1 : 0;
+    ctx->interrupt_request = cpu->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK;
+    ctx->_pad0 = 0;
 
     ctx->fs_base = env->segs[R_FS].base;
     ctx->gs_base = env->segs[R_GS].base;
@@ -81,7 +96,13 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
         env->xmm_regs[i].ZMM_Q(1) = ctx->xmm_regs[i*2 + 1];
     }
     env->mxcsr = ctx->mxcsr;
-    
+
+    cpu->exception_index = ctx->exit_reason;
+    cpu->halted = ctx->halted ? 1 : 0;
+    cpu->interrupt_request =
+        (cpu->interrupt_request & ~WVM_TCG_INTERRUPT_SYNC_MASK) |
+        (ctx->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK);
+
     // Critical: Flush TB cache to force recompilation with new state
     tb_flush(cpu);
 

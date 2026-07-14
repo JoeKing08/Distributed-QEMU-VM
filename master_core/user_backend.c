@@ -1007,26 +1007,54 @@ static void* rx_thread_loop(void *arg) {
                                   (unsigned long long)g_u_req_ctx[idx].full_id,
                                   g_u_req_ctx[idx].rx_buffer ? 1 : 0);
                         }
-                        if (g_u_req_ctx[idx].rx_buffer && g_u_req_ctx[idx].full_id == rid) {
+                        if (g_u_req_ctx[idx].rx_buffer &&
+                            g_u_req_ctx[idx].full_id == rid &&
+                            g_u_req_ctx[idx].status == 0) {
 
-                            // MSG_MEM_ACK 必须保留完整 payload（含 version），
-                            // 由上层按各自语义解析，避免版本号在此层被静默丢弃。
-                            // [FIX-G3] 截断保护：防止恶意/错乱包溢出 rx_buffer
-                            uint32_t copy_len = p_len;
-                            if (copy_len > g_u_req_ctx[idx].max_len)
-                                copy_len = g_u_req_ctx[idx].max_len;
-                            memcpy(g_u_req_ctx[idx].rx_buffer, payload, copy_len);
+                            /*
+                             * VCPU_EXIT may carry either a full IPC ack or a
+                             * compact CPU context.  The local QEMU IPC always
+                             * expects struct wvm_ipc_cpu_run_ack.
+                             */
+                            if (msg_type == MSG_VCPU_EXIT &&
+                                g_u_req_ctx[idx].max_len >= sizeof(struct wvm_ipc_cpu_run_ack) &&
+                                (p_len == sizeof(wvm_tcg_context_t) ||
+                                 p_len == sizeof(wvm_kvm_context_t))) {
+                                struct wvm_ipc_cpu_run_ack *ack =
+                                    (struct wvm_ipc_cpu_run_ack *)g_u_req_ctx[idx].rx_buffer;
+                                memset(ack, 0, sizeof(*ack));
+                                ack->status = 0;
+                                ack->mode_tcg = hdr->mode_tcg ? 1 : 0;
+                                if (ack->mode_tcg && p_len == sizeof(wvm_tcg_context_t)) {
+                                    memcpy(&ack->ctx.tcg, payload, sizeof(wvm_tcg_context_t));
+                                } else if (!ack->mode_tcg && p_len == sizeof(wvm_kvm_context_t)) {
+                                    memcpy(&ack->ctx.kvm, payload, sizeof(wvm_kvm_context_t));
+                                } else {
+                                    ack->status = -EINVAL;
+                                }
+                            } else {
+                                // MSG_MEM_ACK 必须保留完整 payload（含 version），
+                                // 由上层按各自语义解析，避免版本号在此层被静默丢弃。
+                                // [FIX-G3] 截断保护：防止恶意/错乱包溢出 rx_buffer
+                                uint32_t copy_len = p_len;
+                                if (copy_len > g_u_req_ctx[idx].max_len)
+                                    copy_len = g_u_req_ctx[idx].max_len;
+                                memcpy(g_u_req_ctx[idx].rx_buffer, payload, copy_len);
+                            }
                             g_u_req_ctx[idx].status = 1;
                             if (msg_type == MSG_VCPU_EXIT) {
                                 u_log("[RX VCPU_EXIT] matched rid=%llu -> status=1",
                                       (unsigned long long)rid);
                             }
                         } else if (msg_type == MSG_VCPU_EXIT) {
-                            u_log("[RX VCPU_EXIT] unmatched rid=%llu idx=%u slot_full_id=%llu has_buf=%d",
-                                  (unsigned long long)rid,
-                                  (unsigned)idx,
-                                  (unsigned long long)g_u_req_ctx[idx].full_id,
-                                  g_u_req_ctx[idx].rx_buffer ? 1 : 0);
+                            bool late_dup = (g_u_req_ctx[idx].full_id == rid);
+                            if (!late_dup) {
+                                u_log("[RX VCPU_EXIT] unmatched rid=%llu idx=%u slot_full_id=%llu has_buf=%d",
+                                      (unsigned long long)rid,
+                                      (unsigned)idx,
+                                      (unsigned long long)g_u_req_ctx[idx].full_id,
+                                      g_u_req_ctx[idx].rx_buffer ? 1 : 0);
+                            }
                         }
                         pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
 

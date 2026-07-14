@@ -46,6 +46,13 @@ extern void wavevm_start_vcpu_thread(CPUState *cpu);
 extern void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
 static void wavevm_sync_topology(int dev_fd);
 
+#define WVM_TCG_INTERRUPT_SYNC_MASK \
+    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | CPU_INTERRUPT_RESET | \
+     CPU_INTERRUPT_TGT_EXT_0 | CPU_INTERRUPT_TGT_EXT_1 | \
+     CPU_INTERRUPT_TGT_EXT_2 | CPU_INTERRUPT_TGT_EXT_3 | \
+     CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
+     CPU_INTERRUPT_TGT_INT_1 | CPU_INTERRUPT_TGT_INT_2)
+
 int g_wvm_local_split = 0;
 static bool g_wvm_split_explicit = false;
 static bool g_wvm_mode_explicit = false;
@@ -96,9 +103,101 @@ typedef struct {
     struct wvm_ipc_cpu_run_req req;
     bool      compact_ctx;
     bool      mode_tcg;
+    uint32_t  resp_source_id;   /* network order: slave/responder */
+    uint32_t  resp_target_id;   /* network order: original requester */
+    uint64_t  resp_req_id;      /* network order */
 } WvmVcpuRunWorker;
 
 static WvmVcpuRunWorker g_vcpu_run_worker;
+
+#define WVM_VCPU_ACK_CACHE_SIZE 64
+typedef struct {
+    uint64_t req_id;
+    uint8_t data[sizeof(struct wvm_header) + sizeof(struct wvm_ipc_cpu_run_ack)];
+    int len;
+    bool valid;
+    bool in_flight;
+} WvmVcpuAckCacheEntry;
+
+static WvmVcpuAckCacheEntry g_vcpu_ack_cache[WVM_VCPU_ACK_CACHE_SIZE];
+static QemuMutex g_vcpu_ack_cache_lock;
+static pthread_once_t g_vcpu_ack_cache_once = PTHREAD_ONCE_INIT;
+
+static void wavevm_vcpu_ack_cache_init(void)
+{
+    qemu_mutex_init(&g_vcpu_ack_cache_lock);
+}
+
+/*
+ * MSG_VCPU_RUN is not idempotent: retrying the same req_id must not execute
+ * the guest CPU twice.  This helper implements single-flight semantics:
+ * - completed duplicate: replay cached MSG_VCPU_EXIT
+ * - in-flight duplicate: drop it and wait for the original execution
+ * - first arrival: mark in-flight and let caller execute it
+ */
+static bool wavevm_vcpu_run_cache_handle(int fd, uint64_t req_id)
+{
+    pthread_once(&g_vcpu_ack_cache_once, wavevm_vcpu_ack_cache_init);
+    qemu_mutex_lock(&g_vcpu_ack_cache_lock);
+
+    for (int i = 0; i < WVM_VCPU_ACK_CACHE_SIZE; i++) {
+        WvmVcpuAckCacheEntry *e = &g_vcpu_ack_cache[i];
+        if (e->req_id != req_id || (!e->valid && !e->in_flight)) {
+            continue;
+        }
+        if (e->valid && e->len > 0) {
+            send(fd, e->data, e->len, 0);
+        }
+        qemu_mutex_unlock(&g_vcpu_ack_cache_lock);
+        return true;
+    }
+
+    int slot = req_id % WVM_VCPU_ACK_CACHE_SIZE;
+    if (g_vcpu_ack_cache[slot].in_flight) {
+        for (int i = 0; i < WVM_VCPU_ACK_CACHE_SIZE; i++) {
+            if (!g_vcpu_ack_cache[i].in_flight) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    WvmVcpuAckCacheEntry *e = &g_vcpu_ack_cache[slot];
+    e->req_id = req_id;
+    e->len = 0;
+    e->valid = false;
+    e->in_flight = true;
+    qemu_mutex_unlock(&g_vcpu_ack_cache_lock);
+    return false;
+}
+
+static void wavevm_vcpu_ack_cache_store(uint64_t req_id, const void *data, int len)
+{
+    if (len <= 0 || len > (int)sizeof(g_vcpu_ack_cache[0].data)) {
+        return;
+    }
+    pthread_once(&g_vcpu_ack_cache_once, wavevm_vcpu_ack_cache_init);
+    qemu_mutex_lock(&g_vcpu_ack_cache_lock);
+    WvmVcpuAckCacheEntry *e = NULL;
+
+    for (int i = 0; i < WVM_VCPU_ACK_CACHE_SIZE; i++) {
+        if (g_vcpu_ack_cache[i].req_id == req_id &&
+            (g_vcpu_ack_cache[i].in_flight || g_vcpu_ack_cache[i].valid)) {
+            e = &g_vcpu_ack_cache[i];
+            break;
+        }
+    }
+    if (!e) {
+        e = &g_vcpu_ack_cache[req_id % WVM_VCPU_ACK_CACHE_SIZE];
+    }
+
+    memcpy(e->data, data, len);
+    e->len = len;
+    e->req_id = req_id;
+    e->valid = true;
+    e->in_flight = false;
+    qemu_mutex_unlock(&g_vcpu_ack_cache_lock);
+}
 
 static void wvm_sigusr2_handler(int sig) {
     /* no-op: sole purpose is to interrupt recvmmsg with EINTR */
@@ -201,6 +300,9 @@ static void wavevm_net_send_vcpu_exit(int master_sock, WvmVcpuRunWorker *w)
     rhdr->magic = htonl(WVM_MAGIC);
     rhdr->msg_type = htons(MSG_VCPU_EXIT);
     rhdr->mode_tcg = w->mode_tcg ? 1 : 0;
+    rhdr->slave_id = w->resp_source_id;
+    rhdr->target_id = w->resp_target_id;
+    rhdr->req_id = w->resp_req_id;
 
     if (w->compact_ctx) {
         if (w->mode_tcg) {
@@ -219,6 +321,7 @@ static void wavevm_net_send_vcpu_exit(int master_sock, WvmVcpuRunWorker *w)
     }
     rhdr->crc32 = 0;
     rhdr->crc32 = htonl(calculate_crc32(resp_buf, resp_len));
+    wavevm_vcpu_ack_cache_store(WVM_NTOHLL(rhdr->req_id), resp_buf, resp_len);
     {
         static int __worker_ack = 0;
         if (__worker_ack < 20) {
@@ -395,6 +498,9 @@ static void wavevm_slave_export_ctx(CPUState *cpu,
             if (local_is_tcg) {
                 wvm_tcg_get_state(cpu, &ack->ctx.tcg);
                 ack->ctx.tcg.exit_reason = cpu->exception_index;
+                ack->ctx.tcg.halted = cpu->halted ? 1 : 0;
+                ack->ctx.tcg.interrupt_request =
+                    cpu->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK;
             } else {
                 struct kvm_regs kregs;
                 struct kvm_sregs ksregs;
@@ -477,6 +583,8 @@ static void wavevm_slave_export_ctx(CPUState *cpu,
         kvm_vcpu_ioctl(cpu, KVM_GET_SREGS, &ksregs);
         wvm_translate_kvm_to_tcg(&kregs, &ksregs, &ack->ctx.tcg);
         ack->ctx.tcg.exit_reason = cpu->kvm_run->exit_reason;
+        ack->ctx.tcg.halted = (cpu->kvm_run->exit_reason == KVM_EXIT_HLT) ? 1 : 0;
+        ack->ctx.tcg.interrupt_request = 0;
     }
 }
 
@@ -1006,6 +1114,7 @@ static void *wavevm_slave_net_thread(void *arg) {
                     struct wvm_ipc_cpu_run_req local_req;
                     struct wvm_ipc_cpu_run_req *req = NULL;
                     bool compact_ctx_payload = false;
+                    uint64_t run_req_id = WVM_NTOHLL(hdr->req_id);
 
                     /* Backward compatibility: some senders put only context in payload. */
                     if (actual_payload >= (int)sizeof(struct wvm_ipc_cpu_run_req)) {
@@ -1030,6 +1139,10 @@ static void *wavevm_slave_net_thread(void *arg) {
                         compact_ctx_payload = true;
                     }
 
+                    if (wavevm_vcpu_run_cache_handle(s->master_sock, run_req_id)) {
+                        continue;
+                    }
+
                     if (local_kernel_mode) {
                         /* Mode A: async worker — net thread must stay free for
                          * MSG_MEM_WRITE while vCPU executes (kernel page_mkwrite path) */
@@ -1042,6 +1155,9 @@ static void *wavevm_slave_net_thread(void *arg) {
                         memcpy(&w->req, req, sizeof(w->req));
                         w->compact_ctx = compact_ctx_payload;
                         w->mode_tcg = hdr->mode_tcg ? 1 : 0;
+                        w->resp_source_id = hdr->target_id;
+                        w->resp_target_id = hdr->slave_id;
+                        w->resp_req_id = hdr->req_id;
                         w->pending = true;
                         qemu_cond_signal(&w->has_work);
                         qemu_mutex_unlock(&w->lock);
@@ -1069,8 +1185,15 @@ static void *wavevm_slave_net_thread(void *arg) {
                             msgs[i].msg_len = sizeof(struct wvm_header) + sizeof(full_ack);
                         }
                         hdr->msg_type = htons(MSG_VCPU_EXIT);
+                        {
+                            uint32_t req_source = hdr->slave_id;
+                            uint32_t req_target = hdr->target_id;
+                            hdr->slave_id = req_target;
+                            hdr->target_id = req_source;
+                        }
                         hdr->crc32 = 0;
                         hdr->crc32 = htonl(calculate_crc32(buf, msgs[i].msg_len));
+                        wavevm_vcpu_ack_cache_store(run_req_id, buf, msgs[i].msg_len);
                         if (send(s->master_sock, buf, msgs[i].msg_len, 0) < 0) {
                             perror("[WaveVM-Slave] send MSG_VCPU_EXIT");
                         }
@@ -1355,6 +1478,9 @@ static int wavevm_init_machine(MachineState *ms) {
 
     if (!kvm_enabled() && !g_wvm_tcg_bootstrap_done) {
         g_wvm_tcg_bootstrap_done = true;
+#ifdef CONFIG_TCG
+        tcg_allowed = true;
+#endif
         tcg_exec_init(0);
     }
 

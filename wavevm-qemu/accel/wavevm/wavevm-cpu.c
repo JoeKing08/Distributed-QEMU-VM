@@ -911,6 +911,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
 
         if (ack.mode_tcg) {
             wvm_tcg_set_state(cpu, &ack.ctx.tcg);
+            cpu->exception_index = ack.ctx.tcg.exit_reason;
+            cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
         } else {
             struct kvm_regs kregs;
             struct kvm_sregs ksregs;
@@ -1212,6 +1214,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
     // 4. 反序列化 CPU 状态
     if (ack.mode_tcg) {
         wvm_tcg_set_state(cpu, &ack.ctx.tcg);
+        cpu->exception_index = ack.ctx.tcg.exit_reason;
+        cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
     } else {
         struct kvm_regs kregs;
         struct kvm_sregs ksregs;
@@ -1822,10 +1826,12 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                         fprintf(stderr, "[WVM-WAKE] cpu=%d woken by interrupt (irq=0x%x)\n",
                                 cpu->cpu_index, cpu->interrupt_request);
                     } else {
-                        /* No interrupt: stay halted, yield CPU */
-                        qemu_mutex_unlock_iothread();
-                        g_usleep(50000);  /* 50ms poll */
-                        qemu_mutex_lock_iothread();
+                        /*
+                         * No interrupt: stay halted, but still enter QEMU's
+                         * normal wait path so queued run_on_cpu work and
+                         * kicks are processed while the AP is parked.
+                         */
+                        qemu_wait_io_event(cpu);
                         continue;
                     }
                     }

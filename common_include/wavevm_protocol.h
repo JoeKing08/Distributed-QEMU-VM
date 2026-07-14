@@ -281,6 +281,9 @@ typedef struct {
     uint64_t xmm_regs[32];
     uint32_t mxcsr;
     uint32_t exit_reason;
+    uint32_t halted;
+    uint32_t interrupt_request;
+    uint32_t _pad0;
     uint64_t fs_base, gs_base;
     uint64_t gdt_base, gdt_limit;
     uint64_t idt_base, idt_limit;
@@ -432,6 +435,10 @@ static __attribute__((unused)) void wvm_translate_kvm_to_tcg(struct kvm_regs *k,
     wvm_kvm_to_seg(&s->tr,  &t->tr);
     // 保持 legacy 兼容
     t->fs_base = s->fs.base; t->gs_base = s->gs.base;
+    t->exit_reason = 0;
+    t->halted = 0;
+    t->interrupt_request = 0;
+    t->_pad0 = 0;
 }
 
 #endif // WAVEVM_PROTOCOL_H
