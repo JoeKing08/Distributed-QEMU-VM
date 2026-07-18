@@ -58,6 +58,9 @@ cleanup() {
   pkill -f wavevm_node_slave 2>/dev/null || true
   pkill -f wavevm_gateway 2>/dev/null || true
   sudo rmmod wavevm 2>/dev/null || true
+  if [ -e /dev/kvm.off ] && [ ! -e /dev/kvm ]; then
+    sudo mv /dev/kvm.off /dev/kvm 2>/dev/null || true
+  fi
   rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -187,8 +190,11 @@ start_gateway() {
 
 prepare_mode() {
   if [ "$ACCEL" = "tcg" ]; then
-    log "TCG Mode B/B: do not load wavevm.ko; force QEMU user-mode TCG path"
+    log "TCG Mode B/B: do not load wavevm.ko; temporarily hide /dev/kvm for pure TCG"
     sudo rmmod wavevm 2>/dev/null || true
+    if [ -e /dev/kvm ] && [ ! -e /dev/kvm.off ]; then
+      sudo mv /dev/kvm /dev/kvm.off 2>/dev/null || true
+    fi
     return
   fi
 
@@ -268,13 +274,8 @@ EOF_A_L2
 
   local -a mem_args
   mapfile -t mem_args < <(qemu_memory_args)
-  local -a mode_env=(WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0)
-  if [ "$ACCEL" = "tcg" ]; then
-    mode_env+=(WVM_DISABLE_AUTO_KVM=1)
-  fi
-
   log "start QEMU accel=$ACCEL"
-  env "${mode_env[@]}" stdbuf -oL -eL \
+  env WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL \
     "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
     -accel wavevm -machine q35 -m 3072 -smp 3 \
     "${mem_args[@]}" \
