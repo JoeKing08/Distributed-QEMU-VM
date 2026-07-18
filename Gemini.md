@@ -8627,7 +8627,7 @@ int main(int argc, char **argv) {
 }
 ```
 
-**文件**: `master_core/Makefile_User`
+**文件**: `master_core/Makefile`
 
 ```makefile
 CC = gcc
@@ -16714,7 +16714,7 @@ clean:
     ```bash
     cd master_core
     # 编译逻辑：链接 LogicCore 与 UserBackend 分流逻辑
-    make -f Makefile_User
+    make
     # 产出：wavevm_node_master (指挥守护进程)
     ```
 

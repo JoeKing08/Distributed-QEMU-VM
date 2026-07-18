@@ -15,6 +15,7 @@
 #include "qemu/main-loop.h"
 #include "exec/address-spaces.h"
 #include "exec/cpu-all.h"
+#include "hw/i386/apic.h"
 #include "../kvm/kvm-cpus.h"
 #include "../../../common_include/wavevm_protocol.h" 
 #include "../../../common_include/wavevm_config.h"
@@ -55,6 +56,63 @@ static gint64 ap_halt_probe_us[MAX_VCPUS] = {0};
  * re-entry so the pending event can be consumed instead of being replayed
  * as the same HLT loop again. */
 static int ap_hlt_pending_irq[MAX_VCPUS] = {0};
+static uint64_t ap_tcg_wake_kick_generation[MAX_VCPUS] = {0};
+
+typedef struct {
+    CPUState *cpu;
+    unsigned int delay_us;
+    uint64_t generation;
+    int cpu_index;
+} WaveVMTcgWakeKickCtx;
+
+static void *wavevm_tcg_wake_kick_thread(void *opaque)
+{
+    WaveVMTcgWakeKickCtx *ctx = opaque;
+
+    g_usleep(ctx->delay_us);
+    if (ctx->cpu_index >= 0 && ctx->cpu_index < MAX_VCPUS &&
+        qatomic_read(&ap_tcg_wake_kick_generation[ctx->cpu_index]) ==
+        ctx->generation) {
+        cpu_exit(ctx->cpu);
+        qemu_cpu_kick(ctx->cpu);
+    }
+    g_free(ctx);
+    return NULL;
+}
+
+static uint64_t wavevm_tcg_start_wake_kick(CPUState *cpu, int ci)
+{
+    WaveVMTcgWakeKickCtx *kick;
+    QemuThread kick_thread;
+    uint64_t generation;
+
+    if (ci < 0 || ci >= MAX_VCPUS) {
+        return 0;
+    }
+
+    generation = qatomic_read(&ap_tcg_wake_kick_generation[ci]) + 1;
+    qatomic_set(&ap_tcg_wake_kick_generation[ci], generation);
+
+    kick = g_new0(WaveVMTcgWakeKickCtx, 1);
+    kick->cpu = cpu;
+    kick->delay_us = 50000;
+    kick->generation = generation;
+    kick->cpu_index = ci;
+    qemu_thread_create(&kick_thread, "wvm-tcg-wake-kick",
+                       wavevm_tcg_wake_kick_thread, kick,
+                       QEMU_THREAD_DETACHED);
+    return generation;
+}
+
+static void wavevm_tcg_finish_wake_kick(int ci, uint64_t generation)
+{
+    if (ci < 0 || ci >= MAX_VCPUS || generation == 0) {
+        return;
+    }
+    if (qatomic_read(&ap_tcg_wake_kick_generation[ci]) == generation) {
+        qatomic_set(&ap_tcg_wake_kick_generation[ci], generation + 1);
+    }
+}
 
 static void wavevm_try_import_split_from_peer(int sock)
 {
@@ -288,6 +346,101 @@ static void wavevm_handle_mmio(CPUState *cpu) {
     address_space_rw(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
                      data, run->mmio.len,
                      run->mmio.is_write);
+}
+
+static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
+{
+    CPUState *cs = CPU(x86cpu);
+    static int local_wake_dbg[MAX_VCPUS] = {0};
+    int tr = -1;
+    int wake_iters = 0;
+    int wake_interrupts = 0;
+    const int max_wake_iters = 500;
+    const int max_wake_interrupts = 5000;
+    bool log_wake = local_wake_dbg[ci] < 20;
+
+    if (log_wake) {
+        fprintf(stderr,
+                "[WVM-TCG-WAKE] cpu=%d local wake exec intreq=0x%x\n",
+                cpu->cpu_index, (unsigned)cs->interrupt_request);
+        local_wake_dbg[ci]++;
+    }
+
+    qemu_mutex_lock_iothread();
+    /*
+     * This is a local master-side TCG re-entry for LAPIC/PIC-owned wakeups.
+     * Let QEMU's native TCG interrupt path poll APIC, honor IF/GIF/inhibit
+     * state, and clear HARD/VIRQ together.  The bounded kick prevents a wake
+     * burst from monopolizing the vCPU thread if it does not reach HLT.
+     */
+    cpu->exception_index = -1;
+    qatomic_mb_set(&cpu->exit_request, 0);
+    while (wake_iters < max_wake_iters) {
+        uint64_t kick_generation = wavevm_tcg_start_wake_kick(cpu, ci);
+
+        qemu_mutex_unlock_iothread();
+        cpu_exec_start(cpu);
+        tr = cpu_exec(cpu);
+        cpu_exec_end(cpu);
+        qemu_mutex_lock_iothread();
+        wavevm_tcg_finish_wake_kick(ci, kick_generation);
+
+        if (tr == EXCP_INTERRUPT) {
+            if (++wake_interrupts >= max_wake_interrupts) {
+                break;
+            }
+            continue;
+        }
+        if (tr == EXCP_ATOMIC) {
+            qemu_mutex_unlock_iothread();
+            cpu_exec_step_atomic(cpu);
+            qemu_mutex_lock_iothread();
+            continue;
+        }
+
+        wake_iters++;
+        if (tr == EXCP_HLT || tr == EXCP_HALTED || cpu->halted) {
+            cpu->halted = 1;
+            cpu->exception_index = -1;
+            break;
+        }
+    }
+    if (log_wake) {
+        CPUX86State *denv = &x86cpu->env;
+        uint32_t eflags = cpu_compute_eflags(denv);
+        fprintf(stderr,
+                "[WVM-TCG-WAKE] cpu=%d local wake ret=%d iters=%d "
+                "interrupts=%d rip=0x%lx cs=0x%x eflags=0x%x "
+                "hflags=0x%x hflags2=0x%x halted=%d intreq=0x%x\n",
+                cpu->cpu_index, tr, wake_iters, wake_interrupts,
+                (unsigned long)denv->eip,
+                (unsigned)denv->segs[R_CS].selector,
+                (unsigned)eflags,
+                (unsigned)denv->hflags,
+                (unsigned)denv->hflags2,
+                cpu->halted, (unsigned)cs->interrupt_request);
+    }
+    qemu_mutex_unlock_iothread();
+}
+
+static void wavevm_tcg_deliver_init_sipi(CPUState *cpu, X86CPU *x86cpu)
+{
+    CPUState *cs = CPU(x86cpu);
+    bool had_init = cs->interrupt_request & CPU_INTERRUPT_INIT;
+
+    /*
+     * do_cpu_init() enters QEMU's resettable API and must be serialized by
+     * the iothread mutex.  wavevm_remote_exec() is intentionally called with
+     * that mutex unlocked, so the custom TCG SIPI lifecycle has to take it
+     * around the INIT+SIPI pair.
+     */
+    qemu_mutex_lock_iothread();
+    if (had_init) {
+        do_cpu_init(x86cpu);
+    }
+    do_cpu_sipi(x86cpu);  /* sets CS:IP, clears CPU_INTERRUPT_SIPI */
+    cpu->exception_index = -1;
+    qemu_mutex_unlock_iothread();
 }
 
 /* 
@@ -602,18 +755,14 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 return;
             }
 
-            /* SIPI pending — process it to initialise CS:IP */
+            /*
+             * Deliver INIT before SIPI, matching QEMU's normal interrupt
+             * ordering.  INIT restores the APIC wait-for-SIPI state and
+             * preserves a simultaneously pending SIPI for the next step.
+             */
             fprintf(stderr, "[WVM-TCG-SIPI] cpu=%d SIPI pending, calling do_cpu_sipi "
                     "(sipi_vector from APIC)\n", cpu->cpu_index);
-            do_cpu_sipi(x86cpu);  /* sets CS:IP, clears CPU_INTERRUPT_SIPI */
-
-            /* CRITICAL: Clear pending INIT interrupt.  The SIPI sequence is
-             * INIT → SIPI.  do_cpu_sipi() processed the SIPI and set CS:IP.
-             * But CPU_INTERRUPT_INIT is still pending.  If we enter cpu_exec()
-             * with INIT still set, cpu_exec() processes INIT first (higher
-             * priority) → do_cpu_init() → resets CPU → halted=1 → returns
-             * EXCP_HALTED without ever running the trampoline code. */
-            cs->interrupt_request &= ~CPU_INTERRUPT_INIT;
+            wavevm_tcg_deliver_init_sipi(cpu, x86cpu);
 
             {
                 CPUX86State *env = &x86cpu->env;
@@ -731,8 +880,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
             /* Check for OS-level SIPI (Linux sends INIT+SIPI to APs) */
             if (cs->interrupt_request & CPU_INTERRUPT_SIPI) {
                 fprintf(stderr, "[WVM-TCG-SIPI] cpu=%d OS SIPI pending\n", cpu->cpu_index);
-                do_cpu_sipi(x86cpu);
-                cs->interrupt_request &= ~CPU_INTERRUPT_INIT;  /* same INIT fix */
+                wavevm_tcg_deliver_init_sipi(cpu, x86cpu);
 
                 /* Run OS trampoline locally (Linux SMP init) */
                 fprintf(stderr, "[WVM-TCG-SIPI] cpu=%d running OS trampoline locally\n",
@@ -763,9 +911,22 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     tramp_iters++;
 
                     if (cpu->halted || tr == EXCP_HLT) {
+                        CPUX86State *denv = &x86cpu->env;
                         cpu->halted = 1;
-                        fprintf(stderr, "[WVM-TCG-SIPI] cpu=%d OS trampoline done after %d iters\n",
-                                cpu->cpu_index, tramp_iters);
+                        fprintf(stderr,
+                                "[WVM-TCG-SIPI] cpu=%d OS trampoline done after %d iters "
+                                "tr=%d rip=0x%lx cs=0x%x cr0=0x%lx efer=0x%lx "
+                                "rsp=0x%lx intreq=0x%x hflags=0x%x hflags2=0x%x mp=%d\n",
+                                cpu->cpu_index, tramp_iters, tr,
+                                (unsigned long)denv->eip,
+                                (unsigned)denv->segs[R_CS].selector,
+                                (unsigned long)denv->cr[0],
+                                (unsigned long)denv->efer,
+                                (unsigned long)denv->regs[R_ESP],
+                                (unsigned)cs->interrupt_request,
+                                (unsigned)denv->hflags,
+                                (unsigned)denv->hflags2,
+                                denv->mp_state);
                         break;
                     }
                     if (tr != EXCP_HALTED && tr != EXCP_HLT) {
@@ -774,8 +935,21 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     }
                 }
                 if (tramp_iters >= max_tramp_iters) {
-                    fprintf(stderr, "[WVM-TCG-SIPI] cpu=%d OS trampoline timeout after %d iters\n",
-                            cpu->cpu_index, max_tramp_iters);
+                    CPUX86State *denv = &x86cpu->env;
+                    fprintf(stderr,
+                            "[WVM-TCG-SIPI] cpu=%d OS trampoline timeout after %d iters "
+                            "rip=0x%lx cs=0x%x cr0=0x%lx efer=0x%lx "
+                            "rsp=0x%lx intreq=0x%x hflags=0x%x hflags2=0x%x mp=%d\n",
+                            cpu->cpu_index, max_tramp_iters,
+                            (unsigned long)denv->eip,
+                            (unsigned)denv->segs[R_CS].selector,
+                            (unsigned long)denv->cr[0],
+                            (unsigned long)denv->efer,
+                            (unsigned long)denv->regs[R_ESP],
+                            (unsigned)cs->interrupt_request,
+                            (unsigned)denv->hflags,
+                            (unsigned)denv->hflags2,
+                            denv->mp_state);
                     cpu->halted = 1;
                 }
 
@@ -799,7 +973,57 @@ static void wavevm_remote_exec(CPUState *cpu) {
             return;
         }
 
-        /* 3. Both SIPIs done — fall through to remote dispatch */
+        /* 3. Both SIPIs done.  Match QEMU's TCG halt handling before deciding
+         * whether to send the context remote.  POLL is a local APIC polling
+         * hint; it must be consumed on the master-side LAPIC first so it can
+         * turn into a real interrupt_request bit if an IRQ is pending. */
+        if (cpu->halted) {
+            X86CPU *x86cpu = X86_CPU(cpu);
+            CPUState *cs = CPU(x86cpu);
+
+            if (cs->interrupt_request & CPU_INTERRUPT_POLL) {
+                qemu_mutex_lock_iothread();
+                apic_poll_irq(x86cpu->apic_state);
+                cs->interrupt_request &= ~CPU_INTERRUPT_POLL;
+                qemu_mutex_unlock_iothread();
+            }
+
+            if (!cpu_has_work(cpu)) {
+                return;
+            }
+
+            /*
+             * HARD/POLL wakeups depend on the master-side LAPIC/PIC device
+             * state to pick the actual interrupt vector.  The remote TCG
+             * context only carries CPU architectural state, so dispatching a
+             * freshly-woken halted AP directly to a slave loses that vector and
+             * replays the same HLT.  Consume the wake locally, then let later
+             * runnable compute bursts go remote.
+             */
+            wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
+            return;
+        }
+
+        /*
+         * A runnable TCG AP may also carry a pending master-side HARD/POLL.
+         * Do not serialize those bits to a slave; the slave cannot derive the
+         * interrupt vector without the master's local APIC/PIC device state.
+         */
+        {
+            X86CPU *x86cpu = X86_CPU(cpu);
+            CPUState *cs = CPU(x86cpu);
+
+            if (cs->interrupt_request & CPU_INTERRUPT_POLL) {
+                qemu_mutex_lock_iothread();
+                apic_poll_irq(x86cpu->apic_state);
+                cs->interrupt_request &= ~CPU_INTERRUPT_POLL;
+                qemu_mutex_unlock_iothread();
+            }
+            if (cs->interrupt_request & CPU_INTERRUPT_HARD) {
+                wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
+                return;
+            }
+        }
     }
 
     /* Log first remote dispatches after SIPI wake */
@@ -911,7 +1135,6 @@ static void wavevm_remote_exec(CPUState *cpu) {
 
         if (ack.mode_tcg) {
             wvm_tcg_set_state(cpu, &ack.ctx.tcg);
-            cpu->exception_index = ack.ctx.tcg.exit_reason;
             cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
         } else {
             struct kvm_regs kregs;
@@ -1214,7 +1437,6 @@ static void wavevm_remote_exec(CPUState *cpu) {
     // 4. 反序列化 CPU 状态
     if (ack.mode_tcg) {
         wvm_tcg_set_state(cpu, &ack.ctx.tcg);
-        cpu->exception_index = ack.ctx.tcg.exit_reason;
         cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
     } else {
         struct kvm_regs kregs;

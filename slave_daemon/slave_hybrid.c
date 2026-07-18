@@ -47,6 +47,20 @@ static int g_nonblock_recv = 0;
 static long g_num_cores = 0;
 static int g_ram_mb = 1024;
 static uint64_t g_slave_ram_size = 1024UL * 1024 * 1024;
+#define VCPU_EXIT_CACHE_SIZE 4096
+#define VCPU_EXIT_CACHE_MAX_PACKET (sizeof(struct wvm_header) + sizeof(struct wvm_ipc_cpu_run_ack))
+
+typedef struct {
+    uint64_t req_id;
+    uint32_t requester;
+    int in_flight;
+    int valid;
+    size_t len;
+    uint8_t data[VCPU_EXIT_CACHE_MAX_PACKET];
+} vcpu_exit_cache_entry_t;
+
+static vcpu_exit_cache_entry_t g_vcpu_exit_cache[VCPU_EXIT_CACHE_SIZE];
+static pthread_mutex_t g_vcpu_exit_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     int slot;
@@ -192,6 +206,56 @@ static int robust_sendto(int fd, const void *buf, size_t len, struct sockaddr_in
         }
     }
     return -ETIMEDOUT;
+}
+
+static uint32_t vcpu_exit_cache_idx(uint64_t req_id, uint32_t requester) {
+    return (uint32_t)(((req_id * 11400714819323198485ull) ^ requester) %
+                      VCPU_EXIT_CACHE_SIZE);
+}
+
+static int vcpu_exit_cache_begin(int fd, struct sockaddr_in *client,
+                                 uint64_t req_id, uint32_t requester) {
+    uint32_t idx = vcpu_exit_cache_idx(req_id, requester);
+
+    pthread_mutex_lock(&g_vcpu_exit_cache_lock);
+    vcpu_exit_cache_entry_t *e = &g_vcpu_exit_cache[idx];
+    if ((e->valid || e->in_flight) &&
+        e->req_id == req_id &&
+        e->requester == requester) {
+        if (e->valid && e->len > 0) {
+            uint8_t replay[VCPU_EXIT_CACHE_MAX_PACKET];
+            size_t len = e->len;
+            memcpy(replay, e->data, len);
+            pthread_mutex_unlock(&g_vcpu_exit_cache_lock);
+            robust_sendto(fd, replay, len, client);
+            return 1;
+        }
+        pthread_mutex_unlock(&g_vcpu_exit_cache_lock);
+        return 1; /* duplicate while original execution is still running */
+    }
+
+    memset(e, 0, sizeof(*e));
+    e->req_id = req_id;
+    e->requester = requester;
+    e->in_flight = 1;
+    pthread_mutex_unlock(&g_vcpu_exit_cache_lock);
+    return 0;
+}
+
+static void vcpu_exit_cache_complete(uint64_t req_id, uint32_t requester,
+                                     const void *packet, size_t len) {
+    if (!packet || len == 0 || len > VCPU_EXIT_CACHE_MAX_PACKET) return;
+
+    uint32_t idx = vcpu_exit_cache_idx(req_id, requester);
+    pthread_mutex_lock(&g_vcpu_exit_cache_lock);
+    vcpu_exit_cache_entry_t *e = &g_vcpu_exit_cache[idx];
+    if (e->in_flight && e->req_id == req_id && e->requester == requester) {
+        memcpy(e->data, packet, len);
+        e->len = len;
+        e->valid = 1;
+        e->in_flight = 0;
+    }
+    pthread_mutex_unlock(&g_vcpu_exit_cache_lock);
 }
 
 /* 
@@ -901,6 +965,11 @@ void* dirty_sync_sender_thread(void* arg) {
 void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm_header *hdr, void *payload, int vcpu_id) {
     struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)payload;
     if (!req) return;
+    uint64_t run_req_id = hdr->req_id;
+    uint32_t requester = hdr->slave_id;
+    if (vcpu_exit_cache_begin(sockfd, client, run_req_id, requester)) {
+        return;
+    }
     { static int __run=0;
       if (__run < 10) {
           fprintf(stderr, "[VCPU-RUN] mode=%u vcpu=%d req=%llu src=%s:%u target=%u slave=%u\n",
@@ -943,6 +1012,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         struct wvm_header *tx_hdr = (struct wvm_header *)tx;
         tx_hdr->crc32 = 0;
         tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
+        vcpu_exit_cache_complete(run_req_id, requester, tx, sizeof(tx));
         ssize_t sret = sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
         fprintf(stderr, "[Slave FastAck] ret=%zd errno=%d mode=%u req=%llu dst=%s:%u\n",
                 sret, (sret < 0) ? errno : 0, req->mode_tcg,
@@ -980,6 +1050,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         struct wvm_header *tx_hdr = (struct wvm_header *)tx;
         tx_hdr->crc32 = 0;
         tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
+        vcpu_exit_cache_complete(run_req_id, requester, tx, sizeof(tx));
         ssize_t sret = sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
         fprintf(stderr, "[Slave ErrorAck] vcpu init failed ret=%zd errno=%d req=%llu dst=%s:%u\n",
                 sret, (sret < 0) ? errno : 0,
@@ -1565,6 +1636,7 @@ skip_kvm_run:
     struct wvm_header *tx_hdr = (struct wvm_header *)tx;
     tx_hdr->crc32 = 0;
     tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
+    vcpu_exit_cache_complete(run_req_id, requester, tx, sizeof(tx));
     ssize_t sret = sendto(sockfd, tx, sizeof(tx), 0, (struct sockaddr*)client, sizeof(*client));
     fprintf(stderr, "[Slave Ack] ret=%zd errno=%d req=%llu dst=%s:%u exit=%u port=0x%x dir=%u sz=%u\n",
             sret, (sret < 0) ? errno : 0, (unsigned long long)hdr->req_id,
@@ -1820,11 +1892,17 @@ void* kvm_worker_thread(void *arg) {
         wvm_vfio_init(g_vfio_config_path);
     }
     
-    struct mmsghdr msgs[BATCH_SIZE]; struct iovec iov[BATCH_SIZE]; uint8_t bufs[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in c[BATCH_SIZE];
+    struct mmsghdr msgs[BATCH_SIZE] = {0}; struct iovec iov[BATCH_SIZE] = {0}; uint8_t bufs[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in c[BATCH_SIZE] = {0};
     for(int i=0;i<BATCH_SIZE;i++) { iov[i].iov_base=bufs[i]; iov[i].iov_len=POOL_ITEM_SIZE; msgs[i].msg_hdr.msg_iov=&iov[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&c[i]; msgs[i].msg_hdr.msg_namelen=sizeof(c[i]); }
 
     while(1) {
-        int n = recvmmsg(s, msgs, BATCH_SIZE, g_nonblock_recv ? MSG_DONTWAIT : 0, NULL);
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            msgs[i].msg_hdr.msg_namelen = sizeof(c[i]);
+            msgs[i].msg_hdr.msg_flags = 0;
+            msgs[i].msg_len = 0;
+        }
+        int recv_flags = g_nonblock_recv ? MSG_DONTWAIT : MSG_WAITFORONE;
+        int n = recvmmsg(s, msgs, BATCH_SIZE, recv_flags, NULL);
         if (n<=0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
         for(int i=0;i<n;i++) {
             struct wvm_header *h = (struct wvm_header*)bufs[i];
@@ -1877,38 +1955,32 @@ void* kvm_worker_thread(void *arg) {
             }
 
             if (type == MSG_VCPU_RUN) {
-                // [FIX] 必须重建 IPC 请求结构体，不能直接强转 payload
-                // 因为 payload 里只有 Context 数据，没有 IPC 头部的 slave_id 等字段
                 struct wvm_ipc_cpu_run_req local_req;
-    
-                // 清空结构体，防止垃圾数据影响逻辑
+                struct wvm_ipc_cpu_run_req *run_req = NULL;
+                void *net_payload_ptr = bufs[i] + sizeof(struct wvm_header);
+
                 memset(&local_req, 0, sizeof(local_req));
 
-                // 1. 从网络包头提取元数据
-                // QEMU 发送端将这些信息放在了 wvm_header 中
-                local_req.mode_tcg = h->mode_tcg; 
-                // slave_id 和 vcpu_index 在 stateless 模式下通常由调度器指定
-                // 这里我们直接透传包头里的 source id 作为请求方
-                local_req.slave_id = h->slave_id; 
-
-                // 2. 从 Payload 提取 Context
-                // 指针 arithmetic: bufs[i] 是包头起始，+sizeof(*h) 是 payload 起始
-                void *net_payload_ptr = bufs[i] + sizeof(struct wvm_header);
-    
-                if (local_req.mode_tcg) {
-                    // 安全检查：防止 payload 长度不足导致越界
-                    if (h->payload_len >= sizeof(wvm_tcg_context_t)) {
-                        memcpy(&local_req.ctx.tcg, net_payload_ptr, sizeof(wvm_tcg_context_t));
-                    }
+                if (h->payload_len >= sizeof(struct wvm_ipc_cpu_run_req)) {
+                    memcpy(&local_req, net_payload_ptr, sizeof(local_req));
+                    run_req = &local_req;
                 } else {
-                    if (h->payload_len >= sizeof(wvm_kvm_context_t)) {
-                        memcpy(&local_req.ctx.kvm, net_payload_ptr, sizeof(wvm_kvm_context_t));
+                    local_req.mode_tcg = h->mode_tcg ? 1 : 0;
+                    local_req.slave_id = h->slave_id;
+
+                    if (local_req.mode_tcg) {
+                        if (h->payload_len >= sizeof(wvm_tcg_context_t)) {
+                            memcpy(&local_req.ctx.tcg, net_payload_ptr, sizeof(wvm_tcg_context_t));
+                        }
+                    } else {
+                        if (h->payload_len >= sizeof(wvm_kvm_context_t)) {
+                            memcpy(&local_req.ctx.kvm, net_payload_ptr, sizeof(wvm_kvm_context_t));
+                        }
                     }
+                    run_req = &local_req;
                 }
 
-                // 3. 调用核心执行函数
-                // 传递栈上构造的 local_req 指针
-                handle_kvm_run_stateless(s, &c[i], h, &local_req, (int)core);
+                handle_kvm_run_stateless(s, &c[i], h, run_req, (int)core);
             }
             else if (type == MSG_BLOCK_WRITE || type == MSG_BLOCK_READ || type == MSG_BLOCK_FLUSH) {
                 // 存储入口
@@ -2067,14 +2139,19 @@ void* tcg_proxy_thread(void *arg) {
         fprintf(stderr, "[SLAVE-BIND] port=%d ok\n", g_service_port);
     }
 
-    struct mmsghdr msgs[BATCH_SIZE]; struct iovec iovecs[BATCH_SIZE]; uint8_t buffers[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in src_addrs[BATCH_SIZE];
-    memset(msgs, 0, sizeof(msgs));
+    struct mmsghdr msgs[BATCH_SIZE] = {0}; struct iovec iovecs[BATCH_SIZE] = {0}; uint8_t buffers[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in src_addrs[BATCH_SIZE] = {0};
     for(int i=0;i<BATCH_SIZE;i++) { iovecs[i].iov_base=buffers[i]; iovecs[i].iov_len=POOL_ITEM_SIZE; msgs[i].msg_hdr.msg_iov=&iovecs[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&src_addrs[i]; msgs[i].msg_hdr.msg_namelen=sizeof(src_addrs[i]); }
 
     printf("[Proxy] Tri-Channel NAT Active (CMD/REQ/PUSH) + MESI Support.\n");
 
     while(1) {
-        int n = recvmmsg(sockfd, msgs, BATCH_SIZE, g_nonblock_recv ? MSG_DONTWAIT : 0, NULL);
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            msgs[i].msg_hdr.msg_namelen = sizeof(src_addrs[i]);
+            msgs[i].msg_hdr.msg_flags = 0;
+            msgs[i].msg_len = 0;
+        }
+        int recv_flags = g_nonblock_recv ? MSG_DONTWAIT : MSG_WAITFORONE;
+        int n = recvmmsg(sockfd, msgs, BATCH_SIZE, recv_flags, NULL);
         if (n <= 0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
 
         for (int i=0; i<n; i++) {

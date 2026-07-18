@@ -283,9 +283,13 @@ static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
     if (!WVM_IS_VALID_TARGET(req->slave_id)) {
         ack.status = -ENODEV;
     } else if (req->mode_tcg) {
-        /* [FIX] TCG: rx_buffer = &ack (完整结构体)，统一 8 字节偏移修复。 */
-        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, &req->ctx,
-            sizeof(req->ctx.tcg),
+        /*
+         * TCG remote execution needs the request metadata too.  Sending only
+         * ctx.tcg drops vcpu_index, so the slave TCG process cannot align its
+         * guest-visible CPU/APIC identity with the vCPU being executed.
+         */
+        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, req,
+            sizeof(*req),
             req->slave_id, &ack, sizeof(ack));
         if (rpc_ret < 0) ack.status = rpc_ret;
         ack.mode_tcg = req->mode_tcg;

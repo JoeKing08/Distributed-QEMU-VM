@@ -43,6 +43,7 @@
 #define POOL_CAP (POOL_SHARDS * ITEMS_PER_SHARD)
 #define BATCH_SIZE 64
 #define RX_THREAD_COUNT 4
+#define LOCAL_SLAVE_REQS 4096
 
 // --- 全局状态 ---
 static int g_my_node_id = 0;
@@ -114,6 +115,15 @@ struct u_req_ctx_t {
     pthread_mutex_t lock;
 };
 static struct u_req_ctx_t g_u_req_ctx[MAX_INFLIGHT_REQS];
+
+struct local_slave_req_t {
+    uint64_t req_id;
+    uint32_t slave_target;
+    int valid;
+};
+static struct local_slave_req_t g_local_slave_reqs[LOCAL_SLAVE_REQS];
+static pthread_mutex_t g_local_slave_req_locks[LOCAL_SLAVE_REQS];
+
 static int g_nonblock_recv = 0;
 static int g_poll_timeout_ms = 100;   /* [V30 FIX] 默认 100ms，不再是 -1 (无限阻塞) */
 static int g_rx_thread_count = 4;
@@ -136,7 +146,76 @@ static void *g_free_list[POOL_CAP];
 static int g_pool_top = -1;
 
 static int u_send_packet(void *data, int len, uint32_t target_id);
+static void u_log(const char *fmt, ...);
 static pthread_spinlock_t g_pool_lock;
+
+static uint32_t local_slave_req_idx(uint64_t req_id) {
+    return (uint32_t)((req_id >> 12) % LOCAL_SLAVE_REQS);
+}
+
+static void local_slave_req_track(uint64_t req_id, uint32_t slave_target) {
+    if (!WVM_IS_VALID_TARGET(slave_target)) return;
+
+    uint32_t idx = local_slave_req_idx(req_id);
+    pthread_mutex_lock(&g_local_slave_req_locks[idx]);
+    g_local_slave_reqs[idx].req_id = req_id;
+    g_local_slave_reqs[idx].slave_target = slave_target;
+    g_local_slave_reqs[idx].valid = 1;
+    pthread_mutex_unlock(&g_local_slave_req_locks[idx]);
+}
+
+static int local_slave_req_consume(uint64_t req_id, uint32_t slave_target) {
+    if (!WVM_IS_VALID_TARGET(slave_target)) return 0;
+
+    int matched = 0;
+    uint32_t idx = local_slave_req_idx(req_id);
+    pthread_mutex_lock(&g_local_slave_req_locks[idx]);
+    if (g_local_slave_reqs[idx].valid &&
+        g_local_slave_reqs[idx].req_id == req_id &&
+        g_local_slave_reqs[idx].slave_target == slave_target) {
+        g_local_slave_reqs[idx].valid = 0;
+        matched = 1;
+    }
+    pthread_mutex_unlock(&g_local_slave_req_locks[idx]);
+    return matched;
+}
+
+static int maybe_forward_local_slave_mem_ack(int sockfd, uint8_t *packet, int packet_len,
+                                             struct wvm_header *hdr, void *payload,
+                                             uint16_t payload_len, uint64_t req_id) {
+    if (g_slave_forward_port <= 0 || payload_len < sizeof(struct wvm_mem_ack_payload)) {
+        return 0;
+    }
+
+    struct wvm_mem_ack_payload *ack_pl = (struct wvm_mem_ack_payload *)payload;
+    if (WVM_NTOHLL(ack_pl->gpa) != req_id) {
+        return 0;
+    }
+
+    uint32_t target = ntohl(hdr->target_id);
+    if (!local_slave_req_consume(req_id, target)) {
+        return 0;
+    }
+
+    struct sockaddr_in slave_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(g_slave_forward_port)
+    };
+    ssize_t fw = sendto(sockfd, packet, packet_len, 0,
+                       (struct sockaddr *)&slave_addr, sizeof(slave_addr));
+    if (fw < 0) {
+        u_log("[Slave MEM_ACK] forward failed: rid=%llu target=%u dst_port=%d err=%d",
+              (unsigned long long)req_id, (unsigned)target,
+              g_slave_forward_port, errno);
+        return 0;
+    }
+
+    u_log("[Slave MEM_ACK] forwarded rid=%llu target=%u dst_port=%d len=%d",
+          (unsigned long long)req_id, (unsigned)target,
+          g_slave_forward_port, packet_len);
+    return 1;
+}
 
 // --- QoS 发送队列结构 ---
 typedef struct tx_node {
@@ -801,9 +880,9 @@ static void* rx_thread_loop(void *arg) {
     }
 
     // recvmmsg 缓冲区
-    struct mmsghdr msgs[BATCH_SIZE];
-    struct iovec iovecs[BATCH_SIZE];
-    struct sockaddr_in src_addrs[BATCH_SIZE];
+    struct mmsghdr msgs[BATCH_SIZE] = {0};
+    struct iovec iovecs[BATCH_SIZE] = {0};
+    struct sockaddr_in src_addrs[BATCH_SIZE] = {0};
     uint8_t *buffer_pool = malloc(BATCH_SIZE * WVM_MAX_PACKET_SIZE);
 
     if (!buffer_pool) {
@@ -827,6 +906,11 @@ static void* rx_thread_loop(void *arg) {
     while (1) {
         if (poll(&pfd, 1, g_poll_timeout_ms) <= 0) continue;
 
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            msgs[i].msg_hdr.msg_namelen = sizeof(src_addrs[i]);
+            msgs[i].msg_hdr.msg_flags = 0;
+            msgs[i].msg_len = 0;
+        }
         int n = recvmmsg(sockfd, msgs, BATCH_SIZE, MSG_DONTWAIT, NULL);
         if (n <= 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) continue; usleep(100); continue; }
 
@@ -936,6 +1020,10 @@ static void* rx_thread_loop(void *arg) {
                         }
                     }
 
+                    if (from_local_slave && msg_type == MSG_MEM_READ && p_len >= sizeof(uint64_t)) {
+                        local_slave_req_track(rid, ntohl(hdr->slave_id));
+                    }
+
                     // 本地 Slave 的执行结果需要回传给真正发起方（跨节点请求场景）。
                     // 新协议下回包目标在 hdr->target_id；旧包可回退到 hdr->slave_id。
                     if (from_local_slave &&
@@ -990,9 +1078,11 @@ static void* rx_thread_loop(void *arg) {
                          msg_type == MSG_VCPU_EXIT ||
                          msg_type == MSG_BLOCK_ACK);
 
-                    if (is_response_msg && rid != 0 && rid != (uint64_t)-1) {
+                    if (is_response_msg && rid != (uint64_t)-1 &&
+                        (rid != 0 || msg_type == MSG_MEM_ACK)) {
                         // 请求-响应模式 (ACK / EXIT / BLOCK_ACK)
                         uint32_t idx = rid % MAX_INFLIGHT_REQS;
+                        bool matched_req_ctx = false;
                         if (msg_type == MSG_VCPU_EXIT) {
                             u_log("[RX VCPU_EXIT] src_port=%u rid=%llu idx=%u p_len=%u",
                                   (unsigned)ntohs(src_addrs[i].sin_port),
@@ -1042,6 +1132,7 @@ static void* rx_thread_loop(void *arg) {
                                 memcpy(g_u_req_ctx[idx].rx_buffer, payload, copy_len);
                             }
                             g_u_req_ctx[idx].status = 1;
+                            matched_req_ctx = true;
                             if (msg_type == MSG_VCPU_EXIT) {
                                 u_log("[RX VCPU_EXIT] matched rid=%llu -> status=1",
                                       (unsigned long long)rid);
@@ -1057,6 +1148,14 @@ static void* rx_thread_loop(void *arg) {
                             }
                         }
                         pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+
+                        if (!matched_req_ctx && msg_type == MSG_MEM_ACK &&
+                            maybe_forward_local_slave_mem_ack(sockfd, base_ptr + offset,
+                                                              current_pkt_len, hdr, payload,
+                                                              p_len, rid)) {
+                            offset += current_pkt_len;
+                            continue;
+                        }
 
                     } else {
                         // [V29 FINAL FIX] 客户端推送处理逻辑
@@ -1204,6 +1303,9 @@ int user_backend_init(int my_node_id, int port) {
     // 初始化请求上下文锁
     for (int i=0; i<MAX_INFLIGHT_REQS; i++) {
         pthread_mutex_init(&g_u_req_ctx[i].lock, NULL);
+    }
+    for (int i=0; i<LOCAL_SLAVE_REQS; i++) {
+        pthread_mutex_init(&g_local_slave_req_locks[i], NULL);
     }
     
     // 初始化内存池和队列

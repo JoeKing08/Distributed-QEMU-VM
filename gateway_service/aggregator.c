@@ -825,9 +825,9 @@ static void* gateway_worker(void *arg) {
         g_primary_socket = local_fd;
     }
 
-    struct mmsghdr msgs[BATCH_SIZE];
-    struct iovec iovecs[BATCH_SIZE];
-    struct sockaddr_in src_addrs[BATCH_SIZE];
+    struct mmsghdr msgs[BATCH_SIZE] = {0};
+    struct iovec iovecs[BATCH_SIZE] = {0};
+    struct sockaddr_in src_addrs[BATCH_SIZE] = {0};
     uint8_t *buffer_pool = malloc(BATCH_SIZE * WVM_MAX_PACKET_SIZE);
     if (!buffer_pool) {
         perror("[Gateway] Worker buffer_pool alloc failed");
@@ -899,7 +899,14 @@ static void* gateway_worker(void *arg) {
             continue;
         }
 
-        int n = recvmmsg(local_fd, msgs, BATCH_SIZE, g_nonblock_recv ? MSG_DONTWAIT : 0, NULL);
+        /* recvmsg writes these fields; restore their input values per batch. */
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+            msgs[i].msg_hdr.msg_flags = 0;
+            msgs[i].msg_len = 0;
+        }
+        int recv_flags = g_nonblock_recv ? MSG_DONTWAIT : MSG_WAITFORONE;
+        int n = recvmmsg(local_fd, msgs, BATCH_SIZE, recv_flags, NULL);
         if (n <= 0) {
             if (errno == EINTR) continue;
                 if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) { usleep(100); continue; }

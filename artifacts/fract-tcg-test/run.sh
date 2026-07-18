@@ -93,7 +93,7 @@ echo "=== Waiting 8s for convergence ==="
 sleep 8
 
 echo "=== Starting QEMU (TCG mode, no KVM) ==="
-(env PATH="$QPATH" WVM_INSTANCE_ID=0 stdbuf -oL -eL "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
+(env PATH="$QPATH" WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
   -accel wavevm -machine q35 -m 3072 -smp 3 \
   -object memory-backend-ram,id=ram0,size=2048M \
   -object memory-backend-ram,id=ram1,size=1024M \

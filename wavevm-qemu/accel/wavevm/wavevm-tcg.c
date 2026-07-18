@@ -12,7 +12,7 @@
  * to the current QEMU instance and are intentionally not serialized.
  */
 #define WVM_TCG_INTERRUPT_SYNC_MASK \
-    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | CPU_INTERRUPT_RESET | \
+    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | \
      CPU_INTERRUPT_TGT_EXT_0 | CPU_INTERRUPT_TGT_EXT_1 | \
      CPU_INTERRUPT_TGT_EXT_2 | CPU_INTERRUPT_TGT_EXT_3 | \
      CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
@@ -26,7 +26,7 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     // 1. General Registers
     memcpy(ctx->regs, env->regs, sizeof(ctx->regs));
     ctx->eip = env->eip;
-    ctx->eflags = env->eflags;
+    ctx->eflags = cpu_compute_eflags(env);
 
     // 2. Control Registers
     ctx->cr[0] = env->cr[0];
@@ -72,6 +72,39 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->tr.selector  = env->tr.selector;
     ctx->tr.flags     = env->tr.flags;
     ctx->efer         = env->efer;
+    ctx->star         = env->star;
+    ctx->sysenter_cs  = env->sysenter_cs;
+    ctx->sysenter_esp = env->sysenter_esp;
+    ctx->sysenter_eip = env->sysenter_eip;
+#ifdef TARGET_X86_64
+    ctx->lstar        = env->lstar;
+    ctx->cstar        = env->cstar;
+    ctx->fmask        = env->fmask;
+    ctx->kernelgsbase = env->kernelgsbase;
+#else
+    ctx->lstar = ctx->cstar = ctx->fmask = ctx->kernelgsbase = 0;
+#endif
+    ctx->pat           = env->pat;
+    ctx->hflags2       = env->hflags2;
+    ctx->a20_mask      = env->a20_mask;
+    ctx->mp_state      = env->mp_state;
+    ctx->old_exception = env->old_exception;
+    ctx->smbase        = env->smbase;
+    ctx->tsc           = env->tsc;
+    ctx->tsc_adjust    = env->tsc_adjust;
+    ctx->tsc_deadline  = env->tsc_deadline;
+    ctx->tsc_aux       = env->tsc_aux;
+    ctx->xcr0          = env->xcr0;
+    ctx->msr_ia32_misc_enable = env->msr_ia32_misc_enable;
+    ctx->msr_ia32_feature_control = env->msr_ia32_feature_control;
+    ctx->spec_ctrl     = env->spec_ctrl;
+    ctx->virt_ssbd     = env->virt_ssbd;
+    ctx->exception_next_eip = env->exception_next_eip;
+    ctx->pkru          = env->pkru;
+    ctx->tsx_ctrl      = env->tsx_ctrl;
+    ctx->df            = env->df;
+    ctx->error_code    = env->error_code;
+    ctx->exception_is_int = env->exception_is_int;
 }
 
 // Import state from network packet to QEMU TCG
@@ -83,6 +116,10 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     memcpy(env->regs, ctx->regs, sizeof(env->regs));
     env->eip = ctx->eip;
     env->eflags = ctx->eflags;
+    env->cc_op = CC_OP_EFLAGS;
+    env->cc_src = 0;
+    env->cc_src2 = 0;
+    env->cc_dst = 0;
 
     // 2. Control Registers
     env->cr[0] = ctx->cr[0];
@@ -97,11 +134,21 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     }
     env->mxcsr = ctx->mxcsr;
 
-    cpu->exception_index = ctx->exit_reason;
+    /*
+     * exit_reason is the previous cpu_exec() return value, not a pending
+     * architectural exception.  Re-importing EXCP_HLT/EXCP_INTERRUPT here
+     * makes the next cpu_exec() return before it can consume newly pending
+     * LAPIC/timer work.
+     */
+    cpu->exception_index = -1;
     cpu->halted = ctx->halted ? 1 : 0;
     cpu->interrupt_request =
         (cpu->interrupt_request & ~WVM_TCG_INTERRUPT_SYNC_MASK) |
         (ctx->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK);
+    cpu->interrupt_request &= ~(CPU_INTERRUPT_RESET |
+                                CPU_INTERRUPT_INIT |
+                                CPU_INTERRUPT_SIPI |
+                                CPU_INTERRUPT_POLL);
 
     // Critical: Flush TB cache to force recompilation with new state
     tb_flush(cpu);
@@ -122,46 +169,42 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->tr.selector  = ctx->tr.selector;
     env->tr.flags     = ctx->tr.flags;
     env->efer         = ctx->efer;
+    env->star         = ctx->star;
+    env->sysenter_cs  = ctx->sysenter_cs;
+    env->sysenter_esp = ctx->sysenter_esp;
+    env->sysenter_eip = ctx->sysenter_eip;
+#ifdef TARGET_X86_64
+    env->lstar        = ctx->lstar;
+    env->cstar        = ctx->cstar;
+    env->fmask        = ctx->fmask;
+    env->kernelgsbase = ctx->kernelgsbase;
+#endif
+    env->pat           = ctx->pat;
+    env->hflags2       = ctx->hflags2;
+    env->a20_mask      = ctx->a20_mask;
+    env->mp_state      = ctx->mp_state;
+    env->old_exception = ctx->old_exception;
+    env->smbase        = ctx->smbase;
+    env->tsc           = ctx->tsc;
+    env->tsc_adjust    = ctx->tsc_adjust;
+    env->tsc_deadline  = ctx->tsc_deadline;
+    env->tsc_aux       = ctx->tsc_aux;
+    env->xcr0          = ctx->xcr0;
+    env->msr_ia32_misc_enable = ctx->msr_ia32_misc_enable;
+    env->msr_ia32_feature_control = ctx->msr_ia32_feature_control;
+    env->spec_ctrl     = ctx->spec_ctrl;
+    env->virt_ssbd     = ctx->virt_ssbd;
+    env->exception_next_eip = ctx->exception_next_eip;
+    env->pkru          = ctx->pkru;
+    env->tsx_ctrl      = ctx->tsx_ctrl;
+    env->df            = ctx->df;
+    env->error_code    = ctx->error_code;
+    env->exception_is_int = ctx->exception_is_int;
 
-    /* Recompute hflags from the restored segment/CR state so TCG
-     * generates correct code for the current CPU mode (real/prot/long). */
-    env->hflags = 0;
-    if (env->cr[0] & 1) {  /* CR0.PE */
-        env->hflags |= HF_PE_MASK;
-        if (env->eflags & VM_MASK) {
-            env->hflags |= HF_VM_MASK;
-        }
-        if (env->cr[4] & CR4_PAE_MASK) {
-            env->hflags |= HF_LMA_MASK * !!(env->efer & MSR_EFER_LMA);
-        }
-        if (env->efer & MSR_EFER_LMA) {
-            if (env->segs[R_CS].flags & DESC_L_MASK) {
-                env->hflags |= HF_CS64_MASK | HF_CS32_MASK;
-            } else if (env->segs[R_CS].flags & DESC_B_MASK) {
-                env->hflags |= HF_CS32_MASK;
-            }
-            env->hflags |= HF_LMA_MASK;
-        } else {
-            if (env->segs[R_CS].flags & DESC_B_MASK) {
-                env->hflags |= HF_CS32_MASK;
-            }
-            if (env->segs[R_SS].flags & DESC_B_MASK) {
-                env->hflags |= HF_SS32_MASK;
-            }
-        }
-    }
-    if (env->cr[0] & CR0_TS_MASK) {
-        env->hflags |= HF_TS_MASK;
-    }
-    if (env->cr[0] & CR0_EM_MASK) {
-        env->hflags |= HF_EM_MASK;
-    }
-    if (env->cr[0] & CR0_MP_MASK) {
-        env->hflags |= HF_MP_MASK;
-    }
-    if (env->cr[4] & CR4_OSFXSR_MASK) {
-        env->hflags |= HF_OSFXSR_MASK;
-    }
+    /* Recompute QEMU's hidden execution flags using the native x86 helper.
+     * Hand-rolled reconstruction missed CPL/TF/IOPL and can leave imported
+     * TCG contexts apparently valid but unable to make guest progress. */
+    x86_update_hflags(env);
 
     /* Keep the legacy base fields in sync for backward compatibility */
     env->segs[R_FS].base = ctx->fs_base;
@@ -185,4 +228,3 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
 }
 
 #endif
-

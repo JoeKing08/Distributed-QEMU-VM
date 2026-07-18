@@ -27,6 +27,9 @@
 #include "exec/cpu-common.h"
 #include "exec/address-spaces.h"
 #include "exec/exec-all.h"
+#include "cpu.h"
+#include "hw/i386/apic.h"
+#include "hw/i386/apic_internal.h"
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
@@ -47,7 +50,7 @@ extern void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
 static void wavevm_sync_topology(int dev_fd);
 
 #define WVM_TCG_INTERRUPT_SYNC_MASK \
-    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | CPU_INTERRUPT_RESET | \
+    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_HALT | \
      CPU_INTERRUPT_TGT_EXT_0 | CPU_INTERRUPT_TGT_EXT_1 | \
      CPU_INTERRUPT_TGT_EXT_2 | CPU_INTERRUPT_TGT_EXT_3 | \
      CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
@@ -67,16 +70,44 @@ static bool g_wvm_tcg_bootstrap_done = false;
 typedef struct {
     CPUState *cpu;
     unsigned int delay_us;
+    uint64_t generation;
 } WaveVMTcgKickCtx;
 
 static pthread_once_t g_slave_exec_once = PTHREAD_ONCE_INIT;
 static QemuMutex g_slave_exec_lock;
 static QemuCond g_slave_exec_req_cond;
 static QemuCond g_slave_exec_done_cond;
+static QemuMutex g_tcg_kick_lock;
+static uint64_t g_tcg_kick_generation;
 static bool g_slave_exec_pending;
 static bool g_slave_exec_done;
 static struct wvm_ipc_cpu_run_req g_slave_exec_req;
 static struct wvm_ipc_cpu_run_ack g_slave_exec_ack;
+
+static void wavevm_slave_apply_tcg_identity(CPUState *cpu, uint32_t vcpu_index)
+{
+#if defined(TARGET_I386) || defined(TARGET_X86_64)
+    X86CPU *x86_cpu = X86_CPU(cpu);
+
+    x86_cpu->apic_id = vcpu_index;
+    if (x86_cpu->apic_state) {
+        APICCommonState *apic = APIC_COMMON(x86_cpu->apic_state);
+        uint64_t apicbase = cpu_get_apic_base(x86_cpu->apic_state);
+
+        apic->initial_apic_id = vcpu_index;
+        apic->id = (uint8_t)vcpu_index;
+        if (vcpu_index == 0) {
+            apicbase |= MSR_IA32_APICBASE_BSP;
+        } else {
+            apicbase &= ~MSR_IA32_APICBASE_BSP;
+        }
+        cpu_set_apic_base(x86_cpu->apic_state, apicbase);
+    }
+#else
+    (void)cpu;
+    (void)vcpu_index;
+#endif
+}
 
 /* ---- Async vCPU-run worker (V33g fix: unblock net thread) ----
  * V33n fix: worker no longer writes to socket directly.
@@ -213,6 +244,8 @@ static void wavevm_slave_exec_sync_init(void)
     qemu_mutex_init(&g_slave_exec_lock);
     qemu_cond_init(&g_slave_exec_req_cond);
     qemu_cond_init(&g_slave_exec_done_cond);
+    qemu_mutex_init(&g_tcg_kick_lock);
+    g_tcg_kick_generation = 0;
     g_slave_exec_pending = false;
     g_slave_exec_done = false;
     memset(&g_slave_exec_req, 0, sizeof(g_slave_exec_req));
@@ -342,8 +375,12 @@ static void *wavevm_tcg_kick_thread(void *opaque)
 {
     WaveVMTcgKickCtx *ctx = opaque;
     g_usleep(ctx->delay_us);
-    cpu_exit(ctx->cpu);
-    qemu_cpu_kick(ctx->cpu);
+    qemu_mutex_lock(&g_tcg_kick_lock);
+    if (ctx->generation == g_tcg_kick_generation) {
+        cpu_exit(ctx->cpu);
+        qemu_cpu_kick(ctx->cpu);
+    }
+    qemu_mutex_unlock(&g_tcg_kick_lock);
     g_free(ctx);
     return NULL;
 }
@@ -360,8 +397,14 @@ static void wavevm_kick_vcpu_thread(CPUState *cpu)
 
 static void wavevm_handle_interrupt(CPUState *cpu, int mask)
 {
-    g_assert(qemu_mutex_iothread_locked());
+    bool need_lock = !qemu_mutex_iothread_locked();
+    int old_mask;
 
+    if (need_lock) {
+        qemu_mutex_lock_iothread();
+    }
+
+    old_mask = cpu->interrupt_request;
     cpu->interrupt_request |= mask;
 
     /*
@@ -370,6 +413,16 @@ static void wavevm_handle_interrupt(CPUState *cpu, int mask)
      */
     if (!qemu_cpu_is_self(cpu)) {
         qemu_cpu_kick(cpu);
+    } else {
+        qatomic_set(&cpu_neg(cpu)->icount_decr.u16.high, -1);
+        if (icount_enabled() && !cpu->can_do_io &&
+            (mask & ~old_mask) != 0) {
+            cpu_abort(cpu, "Raised interrupt while not in I/O function");
+        }
+    }
+
+    if (need_lock) {
+        qemu_mutex_unlock_iothread();
     }
 }
 
@@ -622,6 +675,7 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
         struct wvm_ipc_cpu_run_req req;
         struct wvm_ipc_cpu_run_ack ack;
         bool local_is_tcg = !kvm_enabled();
+        int exec_ret = -1;
 
         qemu_mutex_lock(&g_slave_exec_lock);
         while (!g_slave_exec_pending && !cpu->unplug) {
@@ -633,8 +687,23 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
         }
         memcpy(&req, &g_slave_exec_req, sizeof(req));
         qemu_mutex_unlock(&g_slave_exec_lock);
-        fprintf(stderr, "[WaveVM-Slave] vCPU got req mode_tcg=%u cpu=%d\n",
-                (unsigned)req.mode_tcg, cpu->cpu_index);
+        static unsigned int run_log_count;
+        bool log_run = run_log_count++ < 20;
+        if (log_run) {
+            fprintf(stderr, "[WaveVM-Slave] vCPU got req mode_tcg=%u cpu=%d guest_vcpu=%u\n",
+                    (unsigned)req.mode_tcg, cpu->cpu_index,
+                    (unsigned)req.vcpu_index);
+            if (req.mode_tcg) {
+                fprintf(stderr,
+                        "[WaveVM-Slave] TCG req eip=0x%llx cs=0x%x cr0=0x%llx efer=0x%llx int=0x%x halted=%u\n",
+                        (unsigned long long)req.ctx.tcg.eip,
+                        (unsigned)req.ctx.tcg.segs[R_CS].selector,
+                        (unsigned long long)req.ctx.tcg.cr[0],
+                        (unsigned long long)req.ctx.tcg.efer,
+                        (unsigned)req.ctx.tcg.interrupt_request,
+                        (unsigned)req.ctx.tcg.halted);
+            }
+        }
 
         while (!cpu_get_address_space(cpu, 0) && !cpu->unplug) {
             fprintf(stderr, "[WaveVM-Slave] waiting for address space cpu=%d\n", cpu->cpu_index);
@@ -649,26 +718,50 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             cpu_exec_start(cpu);
         }
 
+        if (local_is_tcg && req.mode_tcg) {
+            wavevm_slave_apply_tcg_identity(cpu, req.vcpu_index);
+        }
         wavevm_slave_import_ctx(cpu, &req, local_is_tcg);
         cpu->stop = false;
-        cpu->halted = 0;
         cpu->exception_index = -1;
+        if (!(local_is_tcg && req.mode_tcg && req.ctx.tcg.halted)) {
+            cpu->halted = 0;
+        }
 
         if (local_is_tcg) {
             WaveVMTcgKickCtx *kick = g_new0(WaveVMTcgKickCtx, 1);
             QemuThread kick_thread;
+            uint64_t kick_generation;
             kick->cpu = cpu;
             kick->delay_us = 50000;  /* V31b: 50ms per burst (was 5ms), gives slave
                                        * enough time to fetch pages via UDP before
                                        * being kicked out of cpu_exec */
+            /* Match the standard CPU loop: a previous host-side kick must not
+             * make this burst return before executing any guest instruction. */
+            qatomic_mb_set(&cpu->exit_request, 0);
+            qemu_mutex_lock(&g_tcg_kick_lock);
+            kick_generation = ++g_tcg_kick_generation;
+            kick->generation = kick_generation;
+            qemu_mutex_unlock(&g_tcg_kick_lock);
+
             qemu_thread_create(&kick_thread, "wvm-tcg-kick",
                                wavevm_tcg_kick_thread, kick,
                                QEMU_THREAD_DETACHED);
             qemu_mutex_unlock_iothread();
-            fprintf(stderr, "[WaveVM-Slave] cpu_exec enter cpu=%d\n", cpu->cpu_index);
-            cpu_exec(cpu);
-            fprintf(stderr, "[WaveVM-Slave] cpu_exec leave cpu=%d ex=%d\n",
-                    cpu->cpu_index, cpu->exception_index);
+            if (log_run) {
+                fprintf(stderr, "[WaveVM-Slave] cpu_exec enter cpu=%d\n", cpu->cpu_index);
+            }
+            exec_ret = cpu_exec(cpu);
+            qemu_mutex_lock(&g_tcg_kick_lock);
+            if (kick_generation == g_tcg_kick_generation) {
+                g_tcg_kick_generation++;
+            }
+            qemu_mutex_unlock(&g_tcg_kick_lock);
+            if (log_run) {
+                fprintf(stderr,
+                        "[WaveVM-Slave] cpu_exec leave cpu=%d ret=%d ex=%d halted=%d\n",
+                        cpu->cpu_index, exec_ret, cpu->exception_index, cpu->halted);
+            }
             qemu_mutex_lock_iothread();
             cpu_exec_end(cpu);
         } else {
@@ -701,8 +794,24 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             cpu_exec_end(cpu);
         }
 
+        if (local_is_tcg && (exec_ret == EXCP_HLT || exec_ret == EXCP_HALTED)) {
+            cpu->halted = 1;
+            cpu->exception_index = exec_ret;
+        }
+
         memset(&ack, 0, sizeof(ack));
         wavevm_slave_export_ctx(cpu, &req, &ack, local_is_tcg);
+        if (log_run && ack.mode_tcg) {
+            fprintf(stderr,
+                    "[WaveVM-Slave] TCG ack eip=0x%llx cs=0x%x cr0=0x%llx efer=0x%llx int=0x%x halted=%u exit=%u\n",
+                    (unsigned long long)ack.ctx.tcg.eip,
+                    (unsigned)ack.ctx.tcg.segs[R_CS].selector,
+                    (unsigned long long)ack.ctx.tcg.cr[0],
+                    (unsigned long long)ack.ctx.tcg.efer,
+                    (unsigned)ack.ctx.tcg.interrupt_request,
+                    (unsigned)ack.ctx.tcg.halted,
+                    (unsigned)ack.ctx.tcg.exit_reason);
+        }
         qemu_mutex_unlock_iothread();
 
         qemu_mutex_lock(&g_slave_exec_lock);
@@ -993,12 +1102,11 @@ static void *wavevm_slave_net_thread(void *arg) {
     #define BATCH_SIZE 64
     #define MAX_PKT_SIZE 8192
 
-    struct mmsghdr msgs[BATCH_SIZE];
-    struct iovec iovecs[BATCH_SIZE];
+    struct mmsghdr msgs[BATCH_SIZE] = {0};
+    struct iovec iovecs[BATCH_SIZE] = {0};
     uint8_t *buffers = g_malloc(BATCH_SIZE * MAX_PKT_SIZE);
-    struct sockaddr_in addrs[BATCH_SIZE];
+    struct sockaddr_in addrs[BATCH_SIZE] = {0};
 
-    memset(msgs, 0, sizeof(msgs));
     for (int i = 0; i < BATCH_SIZE; i++) {
         iovecs[i].iov_base = buffers + i * MAX_PKT_SIZE;
         iovecs[i].iov_len = MAX_PKT_SIZE;
@@ -1026,7 +1134,13 @@ static void *wavevm_slave_net_thread(void *arg) {
             __atomic_store_n(&w->done, 0, __ATOMIC_RELEASE);
         }
 
-        int retval = recvmmsg(s->master_sock, msgs, BATCH_SIZE, 0, NULL);
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            msgs[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+            msgs[i].msg_hdr.msg_flags = 0;
+            msgs[i].msg_len = 0;
+        }
+        int retval = recvmmsg(s->master_sock, msgs, BATCH_SIZE,
+                              MSG_WAITFORONE, NULL);
         if (retval < 0) {
             if (errno == EINTR) continue;  /* loops back to done-check above */
             perror("recvmmsg");

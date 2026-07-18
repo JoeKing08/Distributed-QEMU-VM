@@ -3,7 +3,13 @@ set -euo pipefail
 
 ROOT="${ROOT:-$PWD}"
 RESULTS="${RESULTS:-/tmp/wavevm-test-results}"
-ART_DIR="$RESULTS/dual-node-$(date +%Y%m%d-%H%M%S)"
+ACCEL="${WAVEVM_CI_ACCEL:-tcg}"
+case "$ACCEL" in
+  tcg|kvm) ;;
+  *) echo "ERROR: WAVEVM_CI_ACCEL must be tcg or kvm, got '$ACCEL'" >&2; exit 2 ;;
+esac
+
+ART_DIR="$RESULTS/dual-node-$ACCEL-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$ART_DIR"
 
 PROJECT_USER="${CIRCLE_PROJECT_USERNAME:-${WAVEVM_CI_ROLE:-}}"
@@ -36,12 +42,13 @@ export PATH="$QPATH"
 export WVM_GATEWAY_SINGLE_RX="${WVM_GATEWAY_SINGLE_RX:-1}"
 export WVM_GATEWAY_DISABLE_REUSEPORT="${WVM_GATEWAY_DISABLE_REUSEPORT:-1}"
 export WVM_GATEWAY_USE_RECVFROM="${WVM_GATEWAY_USE_RECVFROM:-1}"
+export WVM_GATEWAY_DISABLE_LEARN_ROUTE="${WVM_GATEWAY_DISABLE_LEARN_ROUTE:-1}"
 export WVM_NONBLOCK_RECV="${WVM_NONBLOCK_RECV:-1}"
 export WVM_POLL_TIMEOUT_MS="${WVM_POLL_TIMEOUT_MS:-100}"
 export WVM_RX_THREAD_COUNT="${WVM_RX_THREAD_COUNT:-1}"
 export WVM_DISABLE_REUSEPORT="${WVM_DISABLE_REUSEPORT:-1}"
 
-log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+log() { printf '[%s] [%s/%s] %s\n' "$(date +%H:%M:%S)" "$ACCEL" "$ROLE" "$*"; }
 
 cleanup() {
   set +e
@@ -50,6 +57,7 @@ cleanup() {
   pkill -f wavevm_node_master 2>/dev/null || true
   pkill -f wavevm_node_slave 2>/dev/null || true
   pkill -f wavevm_gateway 2>/dev/null || true
+  sudo rmmod wavevm 2>/dev/null || true
   rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -84,19 +92,54 @@ start_tailscale() {
     exit 1
   fi
   echo "$TAIL_IP" >"$ART_DIR/tailscale_ip.txt"
-  log "tailscale up role=$ROLE host=$THIS_HOST ip=$TAIL_IP peer=$PEER_HOST"
+  log "tailscale up host=$THIS_HOST ip=$TAIL_IP peer=$PEER_HOST"
+}
+
+peer_candidates() {
+  local host="$1"
+  local status_file="$ART_DIR/tailscale_status.json"
+  sudo tailscale --socket=/tmp/tailscaled.sock status --json >"$status_file" 2>/dev/null || true
+  python3 - "$status_file" "$host" <<'PY' || true
+import json
+import sys
+
+path, target = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+
+matches = []
+for peer in (data.get("Peer") or {}).values():
+    host = peer.get("HostName") or ""
+    dns = (peer.get("DNSName") or "").rstrip(".")
+    names = {host, dns, dns.split(".", 1)[0] if dns else ""}
+    if target not in names:
+        continue
+    ips = peer.get("TailscaleIPs") or []
+    if not ips:
+        continue
+    matches.append((not bool(peer.get("Online")), ips[0]))
+
+seen = set()
+for _, ip in sorted(matches):
+    if ip and ip not in seen:
+        print(ip)
+        seen.add(ip)
+PY
+  sudo tailscale --socket=/tmp/tailscaled.sock ip -4 "$host" 2>/dev/null | head -n5 || true
 }
 
 wait_peer_ip() {
   local ip=""
   for i in $(seq 1 180); do
-    ip=$(sudo tailscale --socket=/tmp/tailscaled.sock ip -4 "$PEER_HOST" 2>/dev/null | head -n1 || true)
+    ip=$(peer_candidates "$PEER_HOST" | head -n1 || true)
     if [ -n "$ip" ]; then
       echo "$ip"
       return 0
     fi
     if [ $((i % 10)) -eq 0 ]; then
-      log "waiting for peer $PEER_HOST in tailnet (${i}s)"
+      log "waiting for peer $PEER_HOST in tailnet (${i}s)" >&2
     fi
     sleep 1
   done
@@ -104,19 +147,25 @@ wait_peer_ip() {
   return 1
 }
 
-wait_tcp() {
-  local host="$1" port="$2" name="$3" max="${4:-180}"
+wait_peer_services() {
+  local host="$1" max="${2:-240}" ip="" candidates=""
   for i in $(seq 1 "$max"); do
-    if timeout 2 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1; then
-      log "$name ready at $host:$port"
-      return 0
-    fi
+    candidates=$(peer_candidates "$host" | awk 'NF && !seen[$0]++')
+    for ip in $candidates; do
+      if sudo tailscale --socket=/tmp/tailscaled.sock ping -c 1 "$ip" >/dev/null 2>&1; then
+        log "peer $host selected at $ip" >&2
+        echo "$ip"
+        return 0
+      fi
+    done
     if [ $((i % 15)) -eq 0 ]; then
-      log "waiting for $name at $host:$port (${i}s)"
+      log "waiting for $host services; candidates=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//') (${i}s)" >&2
+      sudo tailscale --socket=/tmp/tailscaled.sock status | sed -n '1,12p' >&2 || true
     fi
     sleep 1
   done
-  echo "ERROR: timeout waiting for $name at $host:$port" >&2
+  echo "ERROR: peer $host services did not become reachable" >&2
+  sudo tailscale --socket=/tmp/tailscaled.sock status >&2 || true
   return 1
 }
 
@@ -134,6 +183,58 @@ start_gateway() {
   env stdbuf -oL -eL "$ROOT/gateway_service/wavevm_gateway" \
     "$listen" "$upstream_ip" "$upstream_port" "$routes" "$ctrl" \
     >"$ART_DIR/$name.log" 2>&1 &
+}
+
+prepare_mode() {
+  if [ "$ACCEL" = "tcg" ]; then
+    log "TCG Mode B/B: do not load wavevm.ko; force QEMU user-mode TCG path"
+    sudo rmmod wavevm 2>/dev/null || true
+    return
+  fi
+
+  if [ "$ROLE" = "B" ]; then
+    log "KVM mixed mode node B: keep slave/master in Mode B; do not load wavevm.ko"
+    sudo rmmod wavevm 2>/dev/null || true
+    return
+  fi
+
+  log "KVM mixed mode node A: build/load wavevm.ko for Mode A"
+  if [ ! -e /dev/kvm ]; then
+    echo "ERROR: /dev/kvm missing on node A; cannot run KVM mixed-mode test" >&2
+    exit 1
+  fi
+  sudo chmod 666 /dev/kvm 2>/dev/null || true
+  sudo rmmod wavevm 2>/dev/null || true
+  make -C "/lib/modules/$(uname -r)/build" M="$ROOT/master_core" modules
+  sudo insmod "$ROOT/master_core/wavevm.ko"
+  for _ in $(seq 1 20); do
+    [ -e /dev/wavevm ] && break
+    sleep 1
+  done
+  if [ ! -e /dev/wavevm ]; then
+    echo "ERROR: /dev/wavevm did not appear after insmod" >&2
+    exit 1
+  fi
+  sudo chmod 666 /dev/wavevm /dev/kvm 2>/dev/null || true
+  ls -la /dev/wavevm /dev/kvm | tee "$ART_DIR/kvm_devices.txt"
+}
+
+qemu_memory_args() {
+  if [ "$ACCEL" = "kvm" ]; then
+    cat <<'EOF_ARGS'
+-object
+memory-backend-file,id=ram0,size=2048M,mem-path=/dev/shm/wvm_fract_node0,share=on
+-object
+memory-backend-file,id=ram1,size=1024M,mem-path=/dev/shm/wvm_fract_node1,share=on
+EOF_ARGS
+  else
+    cat <<'EOF_ARGS'
+-object
+memory-backend-ram,id=ram0,size=2048M
+-object
+memory-backend-ram,id=ram1,size=1024M
+EOF_ARGS
+  fi
 }
 
 start_node_a() {
@@ -162,16 +263,21 @@ EOF_A_L2
     "$ROOT/master_core/wavevm_node_master" 2048 19100 "$CFG" 0 19121 19105 1 \
     >"$ART_DIR/master0.log" 2>&1 &
 
-  wait_tcp "$node_b_ip" 19220 "node-b sidecar" 180
-  wait_tcp "$node_b_ip" 19200 "node-b master" 180
+  log "node-b tailscale peer selected at $node_b_ip; WaveVM ports are UDP, so QEMU/RPC logs are the readiness check"
   sleep 8
 
-  log "start QEMU forced TCG"
-  env WVM_INSTANCE_ID=0 WVM_DISABLE_AUTO_KVM=1 stdbuf -oL -eL \
+  local -a mem_args
+  mapfile -t mem_args < <(qemu_memory_args)
+  local -a mode_env=(WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0)
+  if [ "$ACCEL" = "tcg" ]; then
+    mode_env+=(WVM_DISABLE_AUTO_KVM=1)
+  fi
+
+  log "start QEMU accel=$ACCEL"
+  env "${mode_env[@]}" stdbuf -oL -eL \
     "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
     -accel wavevm -machine q35 -m 3072 -smp 3 \
-    -object memory-backend-ram,id=ram0,size=2048M \
-    -object memory-backend-ram,id=ram1,size=1024M \
+    "${mem_args[@]}" \
     -numa node,memdev=ram0,cpus=0-1,nodeid=0 \
     -numa node,memdev=ram1,cpus=2,nodeid=1 \
     -drive file="$ROOT/artifacts/images/cirros-0.6.2-x86_64-disk.img",if=virtio,format=qcow2,snapshot=on \
@@ -181,11 +287,12 @@ EOF_A_L2
     >"$ART_DIR/vm.log" 2>&1 &
   QPID=$!
 
-  for i in $(seq 1 10); do
+  for i in $(seq 1 30); do
     sleep 60
     if kill -0 "$QPID" 2>/dev/null; then q_alive=yes; else q_alive=NO; fi
     m0_to=$(grep -ci 'RPC Timeout' "$ART_DIR/master0.log" 2>/dev/null || true)
-    log "${i}m elapsed Q=$q_alive master0_timeouts=$m0_to"
+    m1_to=$(grep -ci 'RPC Timeout' "$ART_DIR/master1.log" 2>/dev/null || true)
+    log "${i}m elapsed Q=$q_alive master0_timeouts=$m0_to master1_timeouts=$m1_to"
     if [ -f "$ART_DIR/vm-serial.log" ] && grep -q 'cirros login:' "$ART_DIR/vm-serial.log"; then
       log "guest reached cirros login"
       break
@@ -240,9 +347,11 @@ EOF_B_L1
     >"$ART_DIR/master1.log" 2>&1 &
 
   log "node B ready; holding for node A test"
-  for i in $(seq 1 15); do
+  ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
+  for i in $(seq 1 30); do
     sleep 60
     summarize_light
+    ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
     log "node B hold ${i}m"
   done
 }
@@ -276,11 +385,16 @@ main() {
   cd "$ROOT"
   cleanup
   mount -o remount,size=8G /dev/shm 2>/dev/null || true
-  chmod 666 /dev/kvm 2>/dev/null || true
   rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock /dev/shm/wvm_fract_* 2>/dev/null || true
+  log "ART_DIR=$ART_DIR"
 
+  prepare_mode
   start_tailscale
-  PEER_IP=$(wait_peer_ip)
+  if [ "$ROLE" = "A" ]; then
+    PEER_IP=$(wait_peer_services "$PEER_HOST") || exit 1
+  else
+    PEER_IP=$(wait_peer_ip) || exit 1
+  fi
   echo "$PEER_IP" >"$ART_DIR/peer_ip.txt"
   log "peer ip $PEER_IP"
 

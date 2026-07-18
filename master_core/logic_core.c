@@ -1406,7 +1406,13 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
     hdr->req_id = WVM_HTONLL(rid);
     hdr->qos_level = 1; // Control messages are fast lane
     if (msg_type == MSG_VCPU_RUN) {
-        hdr->mode_tcg = (len == (int)sizeof(wvm_tcg_context_t)) ? 1 : 0;
+        if (len == (int)sizeof(wvm_tcg_context_t)) {
+            hdr->mode_tcg = 1;
+        } else if (len >= (int)sizeof(struct wvm_ipc_cpu_run_req)) {
+            const struct wvm_ipc_cpu_run_req *run_req =
+                (const struct wvm_ipc_cpu_run_req *)payload;
+            hdr->mode_tcg = run_req->mode_tcg ? 1 : 0;
+        }
     }
     
     if (payload && len > 0) {

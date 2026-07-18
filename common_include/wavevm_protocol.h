@@ -292,6 +292,29 @@ typedef struct {
     wvm_seg_reg_t ldt;
     wvm_seg_reg_t tr;
     uint64_t efer;
+    /*
+     * TCG x86 state that is not covered by KVM regs/sregs but is required
+     * once APs leave the trampoline and execute kernel long-mode code.
+     */
+    uint64_t star, lstar, cstar, fmask, kernelgsbase;
+    uint64_t sysenter_esp, sysenter_eip;
+    uint64_t pat;
+    uint32_t sysenter_cs;
+    uint32_t hflags2;
+    uint32_t a20_mask;
+    uint32_t mp_state;
+    int32_t old_exception;
+    uint64_t smbase;
+    uint64_t tsc, tsc_adjust, tsc_deadline, tsc_aux;
+    uint64_t xcr0;
+    uint64_t msr_ia32_misc_enable, msr_ia32_feature_control;
+    uint64_t spec_ctrl, virt_ssbd;
+    uint64_t exception_next_eip;
+    uint32_t pkru;
+    uint32_t tsx_ctrl;
+    int32_t df;
+    int32_t error_code;
+    int32_t exception_is_int;
 } wvm_tcg_context_t;
 
 struct wvm_ipc_cpu_run_req {
@@ -414,6 +437,7 @@ static __attribute__((unused)) void wvm_translate_tcg_to_kvm(wvm_tcg_context_t *
 }
 
 static __attribute__((unused)) void wvm_translate_kvm_to_tcg(struct kvm_regs *k, struct kvm_sregs *s, wvm_tcg_context_t *t) {
+    memset(t, 0, sizeof(*t));
     t->regs[0] = k->rax; t->regs[1] = k->rcx; t->regs[2] = k->rdx; t->regs[3] = k->rbx;
     t->regs[4] = k->rsp; t->regs[5] = k->rbp; t->regs[6] = k->rsi; t->regs[7] = k->rdi;
     t->regs[8] = k->r8;  t->regs[9] = k->r9;  t->regs[10]= k->r10; t->regs[11]= k->r11;
