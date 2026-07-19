@@ -393,6 +393,7 @@ static void *wavevm_tcg_kick_thread(void *opaque)
 static void wavevm_kick_vcpu_thread(CPUState *cpu)
 {
     cpu_exit(cpu);
+    cpus_kick_thread(cpu);
 }
 
 static void wavevm_handle_interrupt(CPUState *cpu, int mask)
