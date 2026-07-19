@@ -1001,7 +1001,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
              * runnable compute bursts go remote.
              */
             wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
-            return;
+            if (cpu->halted || (cs->interrupt_request &
+                                (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+                return;
+            }
         }
 
         /*
@@ -1021,7 +1024,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
             }
             if (cs->interrupt_request & CPU_INTERRUPT_HARD) {
                 wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
-                return;
+                if (cpu->halted || (cs->interrupt_request &
+                                    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+                    return;
+                }
             }
         }
     }
