@@ -22,6 +22,13 @@
     #include <linux/delay.h>
     #include <linux/string.h>
     #include <linux/printk.h>
+
+    #ifndef UINT32_MAX
+    #define UINT32_MAX ((uint32_t)~0U)
+    #endif
+    #ifndef UINT64_MAX
+    #define UINT64_MAX ((uint64_t)~0ULL)
+    #endif
     
     typedef spinlock_t pthread_mutex_t;
     #define pthread_mutex_init(l, a) spin_lock_init(l)
