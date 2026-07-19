@@ -9,7 +9,7 @@ mount -o remount,size=8G /dev/shm
 # === NODE config (for masters — g_gateways[] points to local sidecars) ===
 CFG="$ART_DIR/fract_2node.conf"
 cat > "$CFG" <<'EOCFG'
-NODE 0 127.0.0.1 19120 1 1
+NODE 0 127.0.0.1 19120 2 1
 NODE 1 127.0.0.1 19220 1 1
 EOCFG
 

@@ -190,7 +190,7 @@ wait_peer_services() {
 write_common_config() {
   CFG="$ART_DIR/fract_2node.conf"
   cat >"$CFG" <<'EOCFG'
-NODE 0 127.0.0.1 19120 1 1
+NODE 0 127.0.0.1 19120 2 1
 NODE 1 127.0.0.1 19220 1 1
 EOCFG
 }
