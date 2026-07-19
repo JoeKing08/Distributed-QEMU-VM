@@ -49,10 +49,14 @@ export WVM_RX_THREAD_COUNT="${WVM_RX_THREAD_COUNT:-1}"
 export WVM_DISABLE_REUSEPORT="${WVM_DISABLE_REUSEPORT:-1}"
 
 log() { printf '[%s] [%s/%s] %s\n' "$(date +%H:%M:%S)" "$ACCEL" "$ROLE" "$*"; }
+HEARTBEAT_PID=""
 
 cleanup() {
   set +e
   log "cleanup"
+  if [ -n "$HEARTBEAT_PID" ]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
   pkill -f qemu-system-x86_64 2>/dev/null || true
   pkill -f wavevm_node_master 2>/dev/null || true
   pkill -f wavevm_node_slave 2>/dev/null || true
@@ -64,6 +68,17 @@ cleanup() {
   rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock 2>/dev/null || true
 }
 trap cleanup EXIT
+
+start_ci_heartbeat() {
+  (
+    while true; do
+      sleep 60
+      log "ci heartbeat"
+      summarize_light || true
+    done
+  ) &
+  HEARTBEAT_PID=$!
+}
 
 install_tailscale() {
   if command -v tailscale >/dev/null 2>&1 && command -v tailscaled >/dev/null 2>&1; then
@@ -291,8 +306,10 @@ EOF_A_L2
   for i in $(seq 1 30); do
     sleep 60
     if kill -0 "$QPID" 2>/dev/null; then q_alive=yes; else q_alive=NO; fi
-    m0_to=$(grep -ci 'RPC Timeout' "$ART_DIR/master0.log" 2>/dev/null || true)
-    m1_to=$(grep -ci 'RPC Timeout' "$ART_DIR/master1.log" 2>/dev/null || true)
+    m0_to=$(timeout 5 grep -ci 'RPC Timeout' "$ART_DIR/master0.log" 2>/dev/null || true)
+    m1_to=$(timeout 5 grep -ci 'RPC Timeout' "$ART_DIR/master1.log" 2>/dev/null || true)
+    m0_to="${m0_to:-0}"
+    m1_to="${m1_to:-0}"
     log "${i}m elapsed Q=$q_alive master0_timeouts=$m0_to master1_timeouts=$m1_to"
     if [ -f "$ART_DIR/vm-serial.log" ] && grep -q 'cirros login:' "$ART_DIR/vm-serial.log"; then
       log "guest reached cirros login"
@@ -390,6 +407,7 @@ main() {
   log "ART_DIR=$ART_DIR"
 
   prepare_mode
+  start_ci_heartbeat
   start_tailscale
   if [ "$ROLE" = "A" ]; then
     PEER_IP=$(wait_peer_services "$PEER_HOST") || exit 1
