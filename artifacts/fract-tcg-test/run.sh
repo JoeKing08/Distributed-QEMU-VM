@@ -52,6 +52,56 @@ sleep 1
 mv /dev/kvm /dev/kvm.off 2>/dev/null || true
 trap 'mv /dev/kvm.off /dev/kvm 2>/dev/null || true; pkill -f wavevm_node_master 2>/dev/null || true; pkill -f wavevm_node_slave 2>/dev/null || true; pkill -f wavevm_gateway 2>/dev/null || true; pkill -f qemu-system-x86_64 2>/dev/null || true' EXIT
 
+wait_for_ssh_login() {
+  for _ in $(seq 1 40); do
+    if timeout 10s sshpass -p "gocubsgo" ssh \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ConnectTimeout=5 \
+      -p 2226 cirros@127.0.0.1 'echo ok' >/dev/null 2>&1; then
+      echo "=== guest SSH login ready ==="
+      return 0
+    fi
+    sleep 3
+  done
+  echo "ERROR: guest SSH login did not become ready" >&2
+  return 1
+}
+
+run_guest_cpu_smoke() {
+  local smoke_log="$ART_DIR/guest_cpu_smoke.txt"
+  echo "=== guest CPU smoke: start 3-way busy loop ==="
+  timeout 30s sshpass -p "gocubsgo" ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ConnectTimeout=5 \
+    -p 2226 cirros@127.0.0.1 \
+    'sh -c "yes >/dev/null & yes >/dev/null & yes >/dev/null & sleep 12"' \
+    >"$smoke_log" 2>&1
+  cat "$smoke_log" || true
+}
+
+wait_for_remote_tcg() {
+  local i rem req ack
+  for i in $(seq 1 24); do
+    rem=$(grep -c 'WVM-REMOTE.*cpu=2' "$ART_DIR/vm.log" 2>/dev/null || true)
+    req=$(grep -c 'guest_vcpu=2' "$ART_DIR/slave0.log" 2>/dev/null || true)
+    ack=$(grep -c 'TCG ack' "$ART_DIR/slave0.log" 2>/dev/null || true)
+    rem="${rem:-0}"
+    req="${req:-0}"
+    ack="${ack:-0}"
+    echo "=== remote smoke poll ${i}: remote=$rem guest_vcpu2=$req ack=$ack ==="
+    if [ "$rem" -gt 0 ] && [ "$req" -gt 0 ] && [ "$ack" -gt 0 ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "ERROR: remote TCG evidence not observed" >&2
+  return 1
+}
+
 QPATH="$ROOT/wavevm-qemu/build-native:$PATH"
 
 # === Start 5 gateways (top-down: L2 → L1a/L1b → sidecar_a/sidecar_b) ===
@@ -139,6 +189,10 @@ echo "master1: $(grep -c 'RPC timeout' "$ART_DIR/master1.log" 2>/dev/null || ech
 echo ""
 echo "=== SSH banner check ==="
 timeout 5 bash -c 'echo "" | nc 127.0.0.1 2226' 2>/dev/null || echo "  (no banner / timeout)"
+
+wait_for_ssh_login
+run_guest_cpu_smoke
+wait_for_remote_tcg
 
 echo ""
 echo "=== Checking for crashes ==="

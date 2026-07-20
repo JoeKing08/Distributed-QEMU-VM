@@ -38,7 +38,8 @@ jobs:
             sudo apt-get install -y -qq build-essential ninja-build pkg-config \
               libglib2.0-dev libpixman-1-dev python3 python3-venv qemu-utils \
               libcap-ng-dev libattr1-dev python3-setuptools lz4 genisoimage \
-              linux-headers-$(uname -r) curl wget netcat-openbsd iproute2
+              linux-headers-$(uname -r) curl wget netcat-openbsd iproute2 \
+              sshpass
             pip3 install setuptools || python3 -m pip install setuptools || true
 
       - run:

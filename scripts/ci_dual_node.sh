@@ -341,6 +341,9 @@ EOF_A_L2
     echo "ERROR: SSH banner missing" >&2
     return 1
   fi
+  wait_for_ssh_login
+  run_guest_cpu_smoke
+  wait_for_remote_tcg
 }
 
 start_node_b() {
@@ -366,7 +369,7 @@ EOF_B_L1
 
   log "node B ready; holding for node A test"
   ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
-  for i in $(seq 1 30); do
+  for i in $(seq 1 20); do
     sleep 60
     summarize_light
     ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
@@ -382,9 +385,70 @@ summarize_light() {
     "$(pgrep -cf qemu-system-x86_64 || true)"
 }
 
+wait_for_ssh_login() {
+  local user="${1:-cirros}"
+  local pass="${2:-gocubsgo}"
+  for _ in $(seq 1 40); do
+    if timeout 10s sshpass -p "$pass" ssh \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      -o ConnectTimeout=5 \
+      -p 2226 "$user@127.0.0.1" 'echo ok' >/dev/null 2>&1; then
+      log "guest SSH login ready"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "ERROR: guest SSH login did not become ready" >&2
+  return 1
+}
+
+run_guest_cpu_smoke() {
+  local smoke_log="$ART_DIR/guest_cpu_smoke.txt"
+  log "guest CPU smoke: start 3-way busy loop"
+  timeout 30s sshpass -p "gocubsgo" ssh \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ConnectTimeout=5 \
+    -p 2226 cirros@127.0.0.1 \
+    'sh -c "yes >/dev/null & yes >/dev/null & yes >/dev/null & sleep 12"' \
+    >"$smoke_log" 2>&1
+  local rc=$?
+  cat "$smoke_log" || true
+  return "$rc"
+}
+
+wait_for_remote_tcg() {
+  local i rem req ack
+  for i in $(seq 1 24); do
+    rem=$(grep -c 'WVM-REMOTE.*cpu=2' "$ART_DIR/vm.log" 2>/dev/null || true)
+    req=$(grep -c 'guest_vcpu=2' "$ART_DIR/slave0.log" 2>/dev/null || true)
+    ack=$(grep -c 'TCG ack' "$ART_DIR/slave0.log" 2>/dev/null || true)
+    rem="${rem:-0}"
+    req="${req:-0}"
+    ack="${ack:-0}"
+    log "remote smoke poll ${i}: remote=$rem guest_vcpu2=$req ack=$ack"
+    if [ "$rem" -gt 0 ] && [ "$req" -gt 0 ] && [ "$ack" -gt 0 ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "ERROR: remote TCG evidence not observed" >&2
+  return 1
+}
+
+summarize_tcg_signals() {
+  printf 'WVM-REMOTE(cpu2)=%s\n' "$(grep -c 'WVM-REMOTE.*cpu=2' "$ART_DIR/vm.log" 2>/dev/null || true)"
+  printf 'guest_vcpu=2=%s\n' "$(grep -c 'guest_vcpu=2' "$ART_DIR/slave0.log" 2>/dev/null || true)"
+  printf 'TCG ack=%s\n' "$(grep -c 'TCG ack' "$ART_DIR/slave0.log" 2>/dev/null || true)"
+}
+
 summarize() {
   log "summary ART_DIR=$ART_DIR"
   summarize_light
+  summarize_tcg_signals
   for f in gw_l2 gw_l1a gw_l1b gw_sidecar_a gw_sidecar_b slave0 slave1 master0 master1 vm; do
     if [ -f "$ART_DIR/$f.log" ]; then
       echo "--- $f.log tail ---"
