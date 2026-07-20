@@ -390,6 +390,14 @@ EOF_B_L1
     ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
     log "node B hold ${i}m"
   done
+
+  if [ "$ACCEL" = "tcg" ]; then
+    if ! grep -q 'guest_vcpu=2' "$ART_DIR/slave1.log" ||
+       ! grep -q 'TCG ack' "$ART_DIR/slave1.log"; then
+      echo "ERROR: node B did not execute and acknowledge remote guest vCPU 2" >&2
+      return 1
+    fi
+  fi
 }
 
 summarize_light() {
@@ -436,16 +444,16 @@ run_guest_cpu_smoke() {
 }
 
 wait_for_remote_tcg() {
-  local i rem req ack
+  local i rem sent ack
   for i in $(seq 1 24); do
     rem=$(grep -c 'WVM-REMOTE.*cpu=2' "$ART_DIR/vm.log" 2>/dev/null || true)
-    req=$(grep -c 'guest_vcpu=2' "$ART_DIR/slave0.log" 2>/dev/null || true)
-    ack=$(grep -c 'TCG ack' "$ART_DIR/slave0.log" 2>/dev/null || true)
+    sent=$(grep -c 'IPC VCPU_RUN] vcpu=2 ' "$ART_DIR/master0.log" 2>/dev/null || true)
+    ack=$(grep -c 'IPC VCPU_RUN RET] vcpu=2.*target=1 rpc_ret=0 ack_status=0 ack_mode=1' "$ART_DIR/master0.log" 2>/dev/null || true)
     rem="${rem:-0}"
-    req="${req:-0}"
+    sent="${sent:-0}"
     ack="${ack:-0}"
-    log "remote smoke poll ${i}: remote=$rem guest_vcpu2=$req ack=$ack"
-    if [ "$rem" -gt 0 ] && [ "$req" -gt 0 ] && [ "$ack" -gt 0 ]; then
+    log "remote smoke poll ${i}: remote=$rem sent=$sent returned=$ack"
+    if [ "$rem" -gt 0 ] && [ "$sent" -gt 0 ] && [ "$ack" -gt 0 ]; then
       return 0
     fi
     sleep 5
@@ -456,8 +464,8 @@ wait_for_remote_tcg() {
 
 summarize_tcg_signals() {
   printf 'WVM-REMOTE(cpu2)=%s\n' "$(grep -c 'WVM-REMOTE.*cpu=2' "$ART_DIR/vm.log" 2>/dev/null || true)"
-  printf 'guest_vcpu=2=%s\n' "$(grep -c 'guest_vcpu=2' "$ART_DIR/slave0.log" 2>/dev/null || true)"
-  printf 'TCG ack=%s\n' "$(grep -c 'TCG ack' "$ART_DIR/slave0.log" 2>/dev/null || true)"
+  printf 'VCPU_RUN(cpu2)=%s\n' "$(grep -c 'IPC VCPU_RUN] vcpu=2 ' "$ART_DIR/master0.log" 2>/dev/null || true)"
+  printf 'VCPU_RETURN(cpu2,node1)=%s\n' "$(grep -c 'IPC VCPU_RUN RET] vcpu=2.*target=1 rpc_ret=0 ack_status=0 ack_mode=1' "$ART_DIR/master0.log" 2>/dev/null || true)"
 }
 
 summarize() {
