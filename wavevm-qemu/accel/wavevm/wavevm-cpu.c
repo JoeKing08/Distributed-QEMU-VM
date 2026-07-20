@@ -56,63 +56,6 @@ static gint64 ap_halt_probe_us[MAX_VCPUS] = {0};
  * re-entry so the pending event can be consumed instead of being replayed
  * as the same HLT loop again. */
 static int ap_hlt_pending_irq[MAX_VCPUS] = {0};
-static uint64_t ap_tcg_wake_kick_generation[MAX_VCPUS] = {0};
-
-typedef struct {
-    CPUState *cpu;
-    unsigned int delay_us;
-    uint64_t generation;
-    int cpu_index;
-} WaveVMTcgWakeKickCtx;
-
-static void *wavevm_tcg_wake_kick_thread(void *opaque)
-{
-    WaveVMTcgWakeKickCtx *ctx = opaque;
-
-    g_usleep(ctx->delay_us);
-    if (ctx->cpu_index >= 0 && ctx->cpu_index < MAX_VCPUS &&
-        qatomic_read(&ap_tcg_wake_kick_generation[ctx->cpu_index]) ==
-        ctx->generation) {
-        cpu_exit(ctx->cpu);
-        qemu_cpu_kick(ctx->cpu);
-    }
-    g_free(ctx);
-    return NULL;
-}
-
-static uint64_t wavevm_tcg_start_wake_kick(CPUState *cpu, int ci)
-{
-    WaveVMTcgWakeKickCtx *kick;
-    QemuThread kick_thread;
-    uint64_t generation;
-
-    if (ci < 0 || ci >= MAX_VCPUS) {
-        return 0;
-    }
-
-    generation = qatomic_read(&ap_tcg_wake_kick_generation[ci]) + 1;
-    qatomic_set(&ap_tcg_wake_kick_generation[ci], generation);
-
-    kick = g_new0(WaveVMTcgWakeKickCtx, 1);
-    kick->cpu = cpu;
-    kick->delay_us = 50000;
-    kick->generation = generation;
-    kick->cpu_index = ci;
-    qemu_thread_create(&kick_thread, "wvm-tcg-wake-kick",
-                       wavevm_tcg_wake_kick_thread, kick,
-                       QEMU_THREAD_DETACHED);
-    return generation;
-}
-
-static void wavevm_tcg_finish_wake_kick(int ci, uint64_t generation)
-{
-    if (ci < 0 || ci >= MAX_VCPUS || generation == 0) {
-        return;
-    }
-    if (qatomic_read(&ap_tcg_wake_kick_generation[ci]) == generation) {
-        qatomic_set(&ap_tcg_wake_kick_generation[ci], generation + 1);
-    }
-}
 
 static void wavevm_try_import_split_from_peer(int sock)
 {
@@ -353,10 +296,6 @@ static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
     CPUState *cs = CPU(x86cpu);
     static int local_wake_dbg[MAX_VCPUS] = {0};
     int tr = -1;
-    int wake_iters = 0;
-    int wake_interrupts = 0;
-    const int max_wake_iters = 500;
-    const int max_wake_interrupts = 5000;
     bool log_wake = local_wake_dbg[ci] < 20;
 
     if (log_wake) {
@@ -368,42 +307,26 @@ static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
 
     qemu_mutex_lock_iothread();
     /*
-     * This is a local master-side TCG re-entry for LAPIC/PIC-owned wakeups.
-     * Let QEMU's native TCG interrupt path poll APIC, honor IF/GIF/inhibit
-     * state, and clear HARD/VIRQ together.  The bounded kick prevents a wake
-     * burst from monopolizing the vCPU thread if it does not reach HLT.
+     * This is a single native-TCG-style local entry for a master-owned
+     * LAPIC/PIC wakeup.  Execution boundaries must come from QEMU events,
+     * not a wall-clock kick: a fixed delay races guest timing and changes
+     * whether the following slice is routed remotely.
      */
     cpu->exception_index = -1;
     qatomic_mb_set(&cpu->exit_request, 0);
-    while (wake_iters < max_wake_iters) {
-        uint64_t kick_generation = wavevm_tcg_start_wake_kick(cpu, ci);
+    qemu_mutex_unlock_iothread();
+    cpu_exec_start(cpu);
+    tr = cpu_exec(cpu);
+    cpu_exec_end(cpu);
+    qemu_mutex_lock_iothread();
 
+    if (tr == EXCP_ATOMIC) {
         qemu_mutex_unlock_iothread();
-        cpu_exec_start(cpu);
-        tr = cpu_exec(cpu);
-        cpu_exec_end(cpu);
+        cpu_exec_step_atomic(cpu);
         qemu_mutex_lock_iothread();
-        wavevm_tcg_finish_wake_kick(ci, kick_generation);
-
-        if (tr == EXCP_INTERRUPT) {
-            if (++wake_interrupts >= max_wake_interrupts) {
-                break;
-            }
-            continue;
-        }
-        if (tr == EXCP_ATOMIC) {
-            qemu_mutex_unlock_iothread();
-            cpu_exec_step_atomic(cpu);
-            qemu_mutex_lock_iothread();
-            continue;
-        }
-
-        wake_iters++;
-        if (tr == EXCP_HLT || tr == EXCP_HALTED || cpu->halted) {
-            cpu->halted = 1;
-            cpu->exception_index = -1;
-            break;
-        }
+    } else if (tr == EXCP_HLT || tr == EXCP_HALTED || cpu->halted) {
+        cpu->halted = 1;
+        cpu->exception_index = -1;
     }
     if (log_wake) {
         CPUX86State *denv = &x86cpu->env;
@@ -412,7 +335,7 @@ static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
                 "[WVM-TCG-WAKE] cpu=%d local wake ret=%d iters=%d "
                 "interrupts=%d rip=0x%lx cs=0x%x eflags=0x%x "
                 "hflags=0x%x hflags2=0x%x halted=%d intreq=0x%x\n",
-                cpu->cpu_index, tr, wake_iters, wake_interrupts,
+                cpu->cpu_index, tr, 1, tr == EXCP_INTERRUPT,
                 (unsigned long)denv->eip,
                 (unsigned)denv->segs[R_CS].selector,
                 (unsigned)eflags,
@@ -1001,8 +924,11 @@ static void wavevm_remote_exec(CPUState *cpu) {
              * runnable compute bursts go remote.
              */
             wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
-            if (cpu->halted || (cs->interrupt_request &
-                                (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+            /* The bounded local re-entry can finish at HLT after consuming
+             * the APIC event.  That is a valid clean handoff point, not a
+             * reason to suppress the following remote execution slice. */
+            if (cs->interrupt_request &
+                (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL)) {
                 return;
             }
         }
@@ -1024,8 +950,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
             }
             if (cs->interrupt_request & CPU_INTERRUPT_HARD) {
                 wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
-                if (cpu->halted || (cs->interrupt_request &
-                                    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+                if (cs->interrupt_request &
+                    (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL)) {
                     return;
                 }
             }
