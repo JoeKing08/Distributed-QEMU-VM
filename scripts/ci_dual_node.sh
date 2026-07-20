@@ -287,12 +287,25 @@ EOF_A_L2
   log "node-b tailscale peer selected at $node_b_ip; WaveVM ports are UDP, so QEMU/RPC logs are the readiness check"
   sleep 8
 
+  local node_a_cores
+  node_a_cores=$(awk '$1 == "NODE" && $2 == 0 { print $5; exit }' "$CFG")
+  case "$node_a_cores" in
+    ''|*[!0-9]*)
+      echo "ERROR: node 0 core count missing from $CFG" >&2
+      return 1
+      ;;
+    0)
+      echo "ERROR: node 0 core count must be positive in $CFG" >&2
+      return 1
+      ;;
+  esac
+
   local -a mem_args
   mapfile -t mem_args < <(qemu_memory_args)
-  log "start QEMU accel=$ACCEL"
+  log "start QEMU accel=$ACCEL local_split=$node_a_cores"
   env WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL \
     "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
-    -accel wavevm -machine q35 -m 3072 -smp 3 \
+    -accel "wavevm,split=$node_a_cores" -machine q35 -m 3072 -smp 3 \
     "${mem_args[@]}" \
     -numa node,memdev=ram0,cpus=0-1,nodeid=0 \
     -numa node,memdev=ram1,cpus=2,nodeid=1 \
@@ -369,7 +382,9 @@ EOF_B_L1
 
   log "node B ready; holding for node A test"
   ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
-  for i in $(seq 1 20); do
+  # Node A may wait 30 minutes for guest boot, then run SSH and remote-TCG
+  # checks.  Keep this peer alive for that full window plus diagnostic margin.
+  for i in $(seq 1 36); do
     sleep 60
     summarize_light
     ss -tlnp 2>/dev/null | grep -E '19220|19200|19205|19420|19421|19221' || true
