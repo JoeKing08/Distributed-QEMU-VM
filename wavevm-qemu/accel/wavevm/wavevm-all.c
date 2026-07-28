@@ -44,6 +44,7 @@ extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_set_ttl_interval(int ms);
 extern void wvm_register_volatile_ram(uint64_t gpa, uint64_t size);
+extern int wavevm_user_mem_flush_slave_dirty_sync(void);
 extern void wvm_apply_remote_push(uint16_t msg_type, void *payload);
 extern void wavevm_start_vcpu_thread(CPUState *cpu);
 extern void wavevm_register_ram_block(void *hva, uint64_t size, uint64_t gpa);
@@ -107,6 +108,42 @@ static void wavevm_slave_apply_tcg_identity(CPUState *cpu, uint32_t vcpu_index)
     (void)cpu;
     (void)vcpu_index;
 #endif
+}
+
+static void wavevm_slave_prepare_tcg_slice(CPUState *cpu,
+                                           const struct wvm_ipc_cpu_run_req *req)
+{
+    /*
+     * A slave TCG vCPU is a remote compute slice, not the authority for the
+     * guest's device model.  Lifecycle and interrupt bits queued on the slave's
+     * local QEMU CPU object are therefore host-local noise; importing or
+     * consuming them can reset a valid remote AP context back to the slave's
+     * own firmware path.  The master keeps device/APIC ownership and replays
+     * pending wake sources after the ACK is imported.
+     */
+    cpu->stop = false;
+    cpu->exception_index = -1;
+    cpu->interrupt_request = 0;
+    qatomic_mb_set(&cpu->exit_request, 0);
+    if (!req->ctx.tcg.halted) {
+        cpu->halted = 0;
+    }
+}
+
+static bool wavevm_tcg_ctx_is_reset_vector(const wvm_tcg_context_t *ctx)
+{
+    return ctx->eip == 0xfff0 &&
+           ctx->segs[R_CS].selector == 0xf000 &&
+           ctx->cr[0] == 0x60000010 &&
+           ctx->cr[3] == 0 &&
+           ctx->efer == 0;
+}
+
+static bool wavevm_tcg_ack_regressed_to_reset(const wvm_tcg_context_t *req,
+                                              const wvm_tcg_context_t *ack)
+{
+    return !wavevm_tcg_ctx_is_reset_vector(req) &&
+           wavevm_tcg_ctx_is_reset_vector(ack);
 }
 
 /* ---- Async vCPU-run worker (V33g fix: unblock net thread) ----
@@ -553,8 +590,12 @@ static void wavevm_slave_export_ctx(CPUState *cpu,
                 wvm_tcg_get_state(cpu, &ack->ctx.tcg);
                 ack->ctx.tcg.exit_reason = cpu->exception_index;
                 ack->ctx.tcg.halted = cpu->halted ? 1 : 0;
-                ack->ctx.tcg.interrupt_request =
-                    cpu->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK;
+                if (req->mode_tcg) {
+                    ack->ctx.tcg.interrupt_request = 0;
+                } else {
+                    ack->ctx.tcg.interrupt_request =
+                        cpu->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK;
+                }
             } else {
                 struct kvm_regs kregs;
                 struct kvm_sregs ksregs;
@@ -677,6 +718,7 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
         struct wvm_ipc_cpu_run_ack ack;
         bool local_is_tcg = !kvm_enabled();
         int exec_ret = -1;
+        int dirty_flush_ret = 0;
 
         qemu_mutex_lock(&g_slave_exec_lock);
         while (!g_slave_exec_pending && !cpu->unplug) {
@@ -696,11 +738,15 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
                     (unsigned)req.vcpu_index);
             if (req.mode_tcg) {
                 fprintf(stderr,
-                        "[WaveVM-Slave] TCG req eip=0x%llx cs=0x%x cr0=0x%llx efer=0x%llx int=0x%x halted=%u\n",
+                        "[WaveVM-Slave] TCG req eip=0x%llx cs=0x%x "
+                        "cr0=0x%llx cr3=0x%llx efer=0x%llx "
+                        "oldex=%d int=0x%x halted=%u\n",
                         (unsigned long long)req.ctx.tcg.eip,
                         (unsigned)req.ctx.tcg.segs[R_CS].selector,
                         (unsigned long long)req.ctx.tcg.cr[0],
+                        (unsigned long long)req.ctx.tcg.cr[3],
                         (unsigned long long)req.ctx.tcg.efer,
+                        (int)req.ctx.tcg.old_exception,
                         (unsigned)req.ctx.tcg.interrupt_request,
                         (unsigned)req.ctx.tcg.halted);
             }
@@ -715,18 +761,18 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
         }
 
         qemu_mutex_lock_iothread();
-        if (local_is_tcg) {
-            cpu_exec_start(cpu);
-        }
-
         if (local_is_tcg && req.mode_tcg) {
             wavevm_slave_apply_tcg_identity(cpu, req.vcpu_index);
         }
         wavevm_slave_import_ctx(cpu, &req, local_is_tcg);
-        cpu->stop = false;
-        cpu->exception_index = -1;
-        if (!(local_is_tcg && req.mode_tcg && req.ctx.tcg.halted)) {
-            cpu->halted = 0;
+        if (local_is_tcg && req.mode_tcg) {
+            wavevm_slave_prepare_tcg_slice(cpu, &req);
+        } else {
+            cpu->stop = false;
+            cpu->exception_index = -1;
+            if (!(local_is_tcg && req.mode_tcg && req.ctx.tcg.halted)) {
+                cpu->halted = 0;
+            }
         }
 
         if (local_is_tcg) {
@@ -737,9 +783,11 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             kick->delay_us = 50000;  /* V31b: 50ms per burst (was 5ms), gives slave
                                        * enough time to fetch pages via UDP before
                                        * being kicked out of cpu_exec */
-            /* Match the standard CPU loop: a previous host-side kick must not
-             * make this burst return before executing any guest instruction. */
+            /* The imported TCG state must be visible before cpu_exec_start().
+             * Otherwise a freshly spawned slave can enter the run boundary with
+             * its reset-vector state and overwrite the remote AP context. */
             qatomic_mb_set(&cpu->exit_request, 0);
+            cpu_exec_start(cpu);
             qemu_mutex_lock(&g_tcg_kick_lock);
             kick_generation = ++g_tcg_kick_generation;
             kick->generation = kick_generation;
@@ -765,6 +813,9 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             }
             qemu_mutex_lock_iothread();
             cpu_exec_end(cpu);
+            qemu_mutex_unlock_iothread();
+            dirty_flush_ret = wavevm_user_mem_flush_slave_dirty_sync();
+            qemu_mutex_lock_iothread();
         } else {
             /* KVM Slave 执行：复用 QEMU 原生 pre_run/post_run 钩子
              * 保证中断注入、APIC 同步、寄存器推送等不被遗漏。
@@ -802,13 +853,30 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
 
         memset(&ack, 0, sizeof(ack));
         wavevm_slave_export_ctx(cpu, &req, &ack, local_is_tcg);
+        if (local_is_tcg && req.mode_tcg && dirty_flush_ret < 0) {
+            ack.status = dirty_flush_ret;
+        }
+        if (local_is_tcg && req.mode_tcg &&
+            wavevm_tcg_ack_regressed_to_reset(&req.ctx.tcg, &ack.ctx.tcg)) {
+            fprintf(stderr,
+                    "[WaveVM-Slave] TCG ack rejected: helper reset-vector "
+                    "regression req_eip=0x%llx req_cr3=0x%llx\n",
+                    (unsigned long long)req.ctx.tcg.eip,
+                    (unsigned long long)req.ctx.tcg.cr[3]);
+            ack.status = -EFAULT;
+            ack.ctx.tcg = req.ctx.tcg;
+        }
         if (log_run && ack.mode_tcg) {
             fprintf(stderr,
-                    "[WaveVM-Slave] TCG ack eip=0x%llx cs=0x%x cr0=0x%llx efer=0x%llx int=0x%x halted=%u exit=%u\n",
+                    "[WaveVM-Slave] TCG ack eip=0x%llx cs=0x%x "
+                    "cr0=0x%llx cr3=0x%llx efer=0x%llx "
+                    "oldex=%d int=0x%x halted=%u exit=%u\n",
                     (unsigned long long)ack.ctx.tcg.eip,
                     (unsigned)ack.ctx.tcg.segs[R_CS].selector,
                     (unsigned long long)ack.ctx.tcg.cr[0],
+                    (unsigned long long)ack.ctx.tcg.cr[3],
                     (unsigned long long)ack.ctx.tcg.efer,
+                    (int)ack.ctx.tcg.old_exception,
                     (unsigned)ack.ctx.tcg.interrupt_request,
                     (unsigned)ack.ctx.tcg.halted,
                     (unsigned)ack.ctx.tcg.exit_reason);

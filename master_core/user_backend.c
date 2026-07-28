@@ -104,7 +104,9 @@ extern uint32_t g_curr_epoch;
 extern uint8_t g_my_node_state;
 extern void broadcast_irq_to_qemu(void);
 extern void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t source_node_id);
+extern uint32_t wvm_get_directory_node_id(uint64_t gpa);
 extern void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len);
+extern void broadcast_raw_packet_to_qemu(const void *packet, size_t len);
 
 // --- 请求ID管理结构 ---
 struct u_req_ctx_t {
@@ -178,6 +180,38 @@ static int local_slave_req_consume(uint64_t req_id, uint32_t slave_target) {
     }
     pthread_mutex_unlock(&g_local_slave_req_locks[idx]);
     return matched;
+}
+
+static int maybe_forward_local_slave_mem_read(uint8_t *packet, int packet_len,
+                                              struct wvm_header *hdr,
+                                              void *payload, uint16_t payload_len,
+                                              uint64_t req_id) {
+    if (payload_len < sizeof(uint64_t)) {
+        return 0;
+    }
+
+    uint64_t gpa = wvm_get_u64_unaligned(payload);
+    uint32_t dir_node = wvm_get_directory_node_id(gpa);
+    if (WVM_GET_NODEID(dir_node) == (uint32_t)g_my_node_id) {
+        return 0;
+    }
+
+    uint32_t slave_target = ntohl(hdr->slave_id);
+    local_slave_req_track(req_id, slave_target);
+
+    int ret = u_send_packet(packet, packet_len, dir_node);
+    {
+        static int fwd_log;
+        if (__sync_fetch_and_add(&fwd_log, 1) < 40) {
+            u_log("[Slave MEM_READ] forward rid=%llu gpa=%#llx owner=%u slave=%u ret=%d",
+                  (unsigned long long)req_id,
+                  (unsigned long long)gpa,
+                  (unsigned)dir_node,
+                  (unsigned)slave_target,
+                  ret);
+        }
+    }
+    return 1;
 }
 
 static int maybe_forward_local_slave_mem_ack(int sockfd, uint8_t *packet, int packet_len,
@@ -463,6 +497,7 @@ static void u_send_packet_async(uint16_t msg_type, void* payload, int len, uint3
 
     struct wvm_header *hdr = (struct wvm_header *)buffer;
     extern int g_my_node_id;
+    memset(hdr, 0, sizeof(*hdr));
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
@@ -1021,6 +1056,13 @@ static void* rx_thread_loop(void *arg) {
                     }
 
                     if (from_local_slave && msg_type == MSG_MEM_READ && p_len >= sizeof(uint64_t)) {
+                        if (maybe_forward_local_slave_mem_read(base_ptr + offset,
+                                                               current_pkt_len,
+                                                               hdr, payload, p_len,
+                                                               rid)) {
+                            offset += current_pkt_len;
+                            continue;
+                        }
                         local_slave_req_track(rid, ntohl(hdr->slave_id));
                     }
 
@@ -1148,6 +1190,15 @@ static void* rx_thread_loop(void *arg) {
                             }
                         }
                         pthread_mutex_unlock(&g_u_req_ctx[idx].lock);
+
+                        if (!matched_req_ctx &&
+                            msg_type == MSG_MEM_ACK &&
+                            rid == SYNC_MAGIC) {
+                            broadcast_raw_packet_to_qemu(base_ptr + offset,
+                                                         (size_t)current_pkt_len);
+                            offset += current_pkt_len;
+                            continue;
+                        }
 
                         if (!matched_req_ctx && msg_type == MSG_MEM_ACK &&
                             maybe_forward_local_slave_mem_ack(sockfd, base_ptr + offset,

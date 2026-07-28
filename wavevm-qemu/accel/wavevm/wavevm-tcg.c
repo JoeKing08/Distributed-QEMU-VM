@@ -85,10 +85,17 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->lstar = ctx->cstar = ctx->fmask = ctx->kernelgsbase = 0;
 #endif
     ctx->pat           = env->pat;
+    ctx->hflags        = env->hflags;
     ctx->hflags2       = env->hflags2;
     ctx->a20_mask      = env->a20_mask;
     ctx->mp_state      = env->mp_state;
-    ctx->old_exception = env->old_exception;
+    /*
+     * old_exception/error_code/exception_is_int/exception_next_eip are QEMU
+     * exception-delivery scratch state, not persistent architectural state.
+     * Serializing an in-flight double-fault marker makes the receiving TCG
+     * instance treat the next normal page fault as a triple fault.
+     */
+    ctx->old_exception = -1;
     ctx->smbase        = env->smbase;
     ctx->tsc           = env->tsc;
     ctx->tsc_adjust    = env->tsc_adjust;
@@ -99,12 +106,12 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->msr_ia32_feature_control = env->msr_ia32_feature_control;
     ctx->spec_ctrl     = env->spec_ctrl;
     ctx->virt_ssbd     = env->virt_ssbd;
-    ctx->exception_next_eip = env->exception_next_eip;
+    ctx->exception_next_eip = 0;
     ctx->pkru          = env->pkru;
     ctx->tsx_ctrl      = env->tsx_ctrl;
     ctx->df            = env->df;
-    ctx->error_code    = env->error_code;
-    ctx->exception_is_int = env->exception_is_int;
+    ctx->error_code    = 0;
+    ctx->exception_is_int = 0;
 }
 
 // Import state from network packet to QEMU TCG
@@ -180,10 +187,16 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->kernelgsbase = ctx->kernelgsbase;
 #endif
     env->pat           = ctx->pat;
+    env->hflags        = ctx->hflags;
     env->hflags2       = ctx->hflags2;
     env->a20_mask      = ctx->a20_mask;
     env->mp_state      = ctx->mp_state;
-    env->old_exception = ctx->old_exception;
+    /*
+     * Do not import transient exception-delivery state across a remote TCG
+     * slice boundary.  cpu->exception_index was already cleared above, so
+     * these fields must be neutral as well.
+     */
+    env->old_exception = -1;
     env->smbase        = ctx->smbase;
     env->tsc           = ctx->tsc;
     env->tsc_adjust    = ctx->tsc_adjust;
@@ -194,12 +207,12 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->msr_ia32_feature_control = ctx->msr_ia32_feature_control;
     env->spec_ctrl     = ctx->spec_ctrl;
     env->virt_ssbd     = ctx->virt_ssbd;
-    env->exception_next_eip = ctx->exception_next_eip;
+    env->exception_next_eip = 0;
     env->pkru          = ctx->pkru;
     env->tsx_ctrl      = ctx->tsx_ctrl;
     env->df            = ctx->df;
-    env->error_code    = ctx->error_code;
-    env->exception_is_int = ctx->exception_is_int;
+    env->error_code    = 0;
+    env->exception_is_int = 0;
 
     /* Recompute QEMU's hidden execution flags using the native x86 helper.
      * Hand-rolled reconstruction missed CPL/TF/IOPL and can leave imported
@@ -213,6 +226,15 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->gdt.limit = ctx->gdt_limit;
     env->idt.base = ctx->idt_base;
     env->idt.limit = ctx->idt_limit;
+
+    /*
+     * CR3/CR0/CR4/EFER and segment hidden state are imported by assignment,
+     * bypassing the native helpers that normally invalidate TCG translations.
+     * The helper may have reset-vector or previous-slice TLB entries; keeping
+     * them across a remote context import makes long-mode page walks use stale
+     * translations and can turn a valid remote slice into a false triple fault.
+     */
+    tlb_flush(cpu);
 }
 
 #else

@@ -2042,7 +2042,20 @@ void spawn_tcg_processes(int base_id) {
      * the child failed to bind.
      */
     int internal_base = 20000 + (g_service_port % 512) * 64;
-    char ram_str[32]; snprintf(ram_str, sizeof(ram_str), "%d", g_ram_mb);
+    char ram_str[32];
+    snprintf(ram_str, sizeof(ram_str), "%d", g_ram_mb);
+
+    /*
+     * TCG helper QEMU must expose a guest physical layout compatible with the
+     * master VM whose vCPU state it executes.  Keep the historical per-node
+     * size as the default, but allow the launch environment to mirror a q35
+     * high-memory layout when the cluster topology requires it.
+     */
+    const char *tcg_machine = getenv("WVM_TCG_QEMU_MACHINE");
+    const char *tcg_ram_mb = getenv("WVM_TCG_QEMU_MEM_MB");
+    if (!tcg_ram_mb || !*tcg_ram_mb) {
+        tcg_ram_mb = ram_str;
+    }
 
     for (long i = 0; i < g_num_cores; i++) {
         int port_cmd  = internal_base + i * 3 + 0;
@@ -2113,10 +2126,24 @@ void spawn_tcg_processes(int base_id) {
 
             cpu_set_t cpuset; CPU_ZERO(&cpuset); CPU_SET(i, &cpuset); sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
             
-            execlp(qemu_bin, qemu_bin,
-                   "-accel", "wavevm",
-                   "-m", ram_str, 
-                   "-nographic", "-S", "-nodefaults", NULL);
+            char *qemu_argv[16];
+            int ai = 0;
+
+            qemu_argv[ai++] = (char *)qemu_bin;
+            qemu_argv[ai++] = "-accel";
+            qemu_argv[ai++] = "wavevm";
+            if (tcg_machine && *tcg_machine) {
+                qemu_argv[ai++] = "-machine";
+                qemu_argv[ai++] = (char *)tcg_machine;
+            }
+            qemu_argv[ai++] = "-m";
+            qemu_argv[ai++] = (char *)tcg_ram_mb;
+            qemu_argv[ai++] = "-nographic";
+            qemu_argv[ai++] = "-S";
+            qemu_argv[ai++] = "-nodefaults";
+            qemu_argv[ai] = NULL;
+
+            execvp(qemu_bin, qemu_argv);
             perror("[Hybrid] execlp qemu");
             _exit(127);
         }

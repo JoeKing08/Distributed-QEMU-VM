@@ -328,6 +328,167 @@ static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
     write_exact(qemu_fd, &ack, sizeof(ack));
 }
 
+#define WVM_COMMIT_SYNC_WINDOW     128
+#define WVM_COMMIT_SYNC_TIMEOUT_US 5000000ULL
+#define WVM_COMMIT_SYNC_RETRY_US   50000ULL
+
+struct pending_commit_sync {
+    int active;
+    uint64_t rid;
+    uint8_t ack_status;
+    uint8_t *pkt;
+    size_t pkt_len;
+    uint32_t dir_node;
+    uint64_t gpa;
+    uint64_t start_us;
+    uint64_t last_send_us;
+};
+
+struct pending_commit_queue {
+    struct pending_commit_sync entries[WVM_COMMIT_SYNC_WINDOW];
+    unsigned head;
+    unsigned count;
+};
+
+static void release_pending_commit(struct pending_commit_sync *entry)
+{
+    if (!entry->active) {
+        return;
+    }
+    if (entry->pkt) {
+        u_ops.free_packet(entry->pkt);
+    }
+    if (entry->rid != (uint64_t)-1) {
+        u_ops.free_req_id(entry->rid);
+    }
+    memset(entry, 0, sizeof(*entry));
+}
+
+static int send_pending_commit(struct pending_commit_sync *entry)
+{
+    int ret = u_ops.send_packet(entry->pkt, (int)entry->pkt_len, entry->dir_node);
+    if (ret == 0) {
+        entry->last_send_us = u_ops.get_time_us();
+    }
+    return ret;
+}
+
+static int wait_oldest_pending_commit(struct pending_commit_queue *queue)
+{
+    if (queue->count == 0) {
+        return 0;
+    }
+
+    struct pending_commit_sync *entry = &queue->entries[queue->head];
+    while (u_ops.time_diff_us(entry->start_us) < WVM_COMMIT_SYNC_TIMEOUT_US) {
+        if (u_ops.check_req_status(entry->rid) == 1) {
+            int ret = entry->ack_status == 1 ? 0 : -EIO;
+            if (ret < 0) {
+                fprintf(stderr,
+                        "[IPC COMMIT_SYNC] nack gpa=%#llx dir=%u rid=%llu\n",
+                        (unsigned long long)entry->gpa,
+                        (unsigned)entry->dir_node,
+                        (unsigned long long)entry->rid);
+            }
+            release_pending_commit(entry);
+            queue->head = (queue->head + 1) % WVM_COMMIT_SYNC_WINDOW;
+            queue->count--;
+            return ret;
+        }
+
+        if (u_ops.time_diff_us(entry->last_send_us) > WVM_COMMIT_SYNC_RETRY_US) {
+            send_pending_commit(entry);
+        }
+        u_ops.yield_cpu_short_time();
+    }
+
+    fprintf(stderr, "[IPC COMMIT_SYNC] timeout gpa=%#llx dir=%u rid=%llu\n",
+            (unsigned long long)entry->gpa,
+            (unsigned)entry->dir_node,
+            (unsigned long long)entry->rid);
+    release_pending_commit(entry);
+    queue->head = (queue->head + 1) % WVM_COMMIT_SYNC_WINDOW;
+    queue->count--;
+    return -ETIMEDOUT;
+}
+
+static int drain_pending_commits(struct pending_commit_queue *queue)
+{
+    while (queue->count > 0) {
+        int ret = wait_oldest_pending_commit(queue);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static void cancel_pending_commits(struct pending_commit_queue *queue)
+{
+    while (queue->count > 0) {
+        struct pending_commit_sync *entry = &queue->entries[queue->head];
+        release_pending_commit(entry);
+        queue->head = (queue->head + 1) % WVM_COMMIT_SYNC_WINDOW;
+        queue->count--;
+    }
+}
+
+static int enqueue_commit_diff_sync(struct pending_commit_queue *queue,
+                                    struct wvm_diff_log *log, uint32_t len,
+                                    uint32_t dir_node)
+{
+    if (queue->count >= WVM_COMMIT_SYNC_WINDOW) {
+        int ret = wait_oldest_pending_commit(queue);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    unsigned idx = (queue->head + queue->count) % WVM_COMMIT_SYNC_WINDOW;
+    struct pending_commit_sync *entry = &queue->entries[idx];
+    memset(entry, 0, sizeof(*entry));
+    entry->rid = (uint64_t)-1;
+    entry->dir_node = dir_node;
+    entry->gpa = WVM_NTOHLL(log->gpa);
+    entry->start_us = u_ops.get_time_us();
+
+    entry->rid = u_ops.alloc_req_id(&entry->ack_status, sizeof(entry->ack_status));
+    if (entry->rid == (uint64_t)-1) {
+        return -EBUSY;
+    }
+
+    entry->pkt_len = sizeof(struct wvm_header) + len;
+    entry->pkt = u_ops.alloc_packet(entry->pkt_len, 0);
+    if (!entry->pkt) {
+        u_ops.free_req_id(entry->rid);
+        entry->rid = (uint64_t)-1;
+        return -ENOMEM;
+    }
+
+    struct wvm_header *hdr = (struct wvm_header *)entry->pkt;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = htonl(WVM_MAGIC);
+    hdr->msg_type = htons(MSG_COMMIT_DIFF);
+    hdr->payload_len = htons((uint16_t)len);
+    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr->target_id = htonl(dir_node);
+    hdr->req_id = WVM_HTONLL(entry->rid);
+    hdr->qos_level = 1;
+    hdr->flags = WVM_FLAG_NEED_ACK;
+    hdr->epoch = htonl(g_curr_epoch);
+    hdr->node_state = g_my_node_state;
+    memcpy(entry->pkt + sizeof(*hdr), log, len);
+
+    entry->active = 1;
+    if (send_pending_commit(entry) < 0) {
+        release_pending_commit(entry);
+        return -EIO;
+    }
+
+    queue->count++;
+    return 0;
+}
+
 /* 
  * [物理意图] 维护 Wavelet 协议的“最后一百米”：将网络推送推入 QEMU 的监听线程。
  * [关键逻辑] 构造伪造的 wvm_header 封装入 IPC 包，强制唤醒 QEMU 的信号处理逻辑以更新本地 TLB/EPT。
@@ -353,6 +514,22 @@ void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
     }
     pthread_mutex_unlock(&g_client_lock);
     free(buffer);
+}
+
+void broadcast_raw_packet_to_qemu(const void *packet, size_t len) {
+    wvm_ipc_header_t ipc_hdr;
+    ipc_hdr.type = WVM_IPC_TYPE_INVALIDATE;
+    ipc_hdr.len = (uint32_t)len;
+
+    pthread_mutex_lock(&g_client_lock);
+    for (int i = 0; i < g_client_count; i++) {
+        if (write_exact(g_qemu_clients[i], &ipc_hdr, sizeof(ipc_hdr)) < 0 ||
+            write_exact(g_qemu_clients[i], packet, len) < 0) {
+            fprintf(stderr, "[IPC] raw packet forward failed fd=%d errno=%d\n",
+                    g_qemu_clients[i], errno);
+        }
+    }
+    pthread_mutex_unlock(&g_client_lock);
 }
 
 void broadcast_irq_to_qemu(void) {
@@ -388,6 +565,7 @@ void* client_handler(void *socket_desc) {
 
     wvm_ipc_header_t ipc_hdr;
     uint8_t payload_buf[WVM_MAX_PACKET_SIZE];
+    struct pending_commit_queue commit_queue = {0};
 
     while (1) {
         // [FIX-G2] 使用 read_exact 处理 partial read
@@ -423,15 +601,56 @@ void* client_handler(void *socket_desc) {
             case WVM_IPC_TYPE_MEM_FAULT:
                 handle_ipc_fault(qemu_fd, (struct wvm_ipc_fault_req*)payload_buf);
                 break;
-            case WVM_IPC_TYPE_CPU_RUN:
+            case WVM_IPC_TYPE_CPU_RUN: {
+                int ret = drain_pending_commits(&commit_queue);
+                if (ret < 0) {
+                    struct wvm_ipc_cpu_run_req *req =
+                        (struct wvm_ipc_cpu_run_req*)payload_buf;
+                    struct wvm_ipc_cpu_run_ack ack = {0};
+                    ack.status = ret;
+                    ack.mode_tcg = req->mode_tcg;
+                    write_exact(qemu_fd, &ack, sizeof(ack));
+                    break;
+                }
                 handle_ipc_cpu_run(qemu_fd, (struct wvm_ipc_cpu_run_req*)payload_buf);
                 break;
-            case WVM_IPC_TYPE_COMMIT_DIFF: {
+            }
+            case WVM_IPC_TYPE_COMMIT_DIFF:
+            case WVM_IPC_TYPE_COMMIT_DIFF_SYNC: {
                 // This is the new IPC type for V29
                 struct wvm_diff_log* log = (struct wvm_diff_log*)payload_buf;
                 uint32_t dir_node = wvm_get_directory_node_id(WVM_NTOHLL(log->gpa));
-                // Send MSG_COMMIT_DIFF to the correct directory node
-                u_ops.send_packet_async(MSG_COMMIT_DIFF, log, ipc_hdr.len, dir_node, 1);
+                if (WVM_GET_NODEID(dir_node) == (uint32_t)g_my_node_id) {
+                    /*
+                     * Local directory commits must be applied before later IPC
+                     * messages on the same QEMU connection, especially TCG
+                     * CPU_RUN handoff.  Queueing through async send lets the
+                     * remote vCPU pull a just-written page table before the
+                     * directory copy is updated.
+                     */
+                    struct wvm_header hdr = {0};
+                    hdr.magic = htonl(WVM_MAGIC);
+                    hdr.msg_type = htons(MSG_COMMIT_DIFF);
+                    hdr.payload_len = htons((uint16_t)ipc_hdr.len);
+                    hdr.slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                    hdr.target_id = htonl(dir_node);
+                    hdr.epoch = htonl(g_curr_epoch);
+                    hdr.node_state = g_my_node_state;
+                    wvm_logic_process_packet(&hdr, log,
+                                             WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                } else if (ipc_hdr.type == WVM_IPC_TYPE_COMMIT_DIFF_SYNC) {
+                    int ret = enqueue_commit_diff_sync(&commit_queue, log, ipc_hdr.len,
+                                                       dir_node);
+                    if (ret < 0) {
+                        fprintf(stderr,
+                                "[IPC COMMIT_SYNC] failed gpa=%#llx dir=%u ret=%d\n",
+                                (unsigned long long)WVM_NTOHLL(log->gpa),
+                                (unsigned)dir_node, ret);
+                    }
+                } else {
+                    // Send MSG_COMMIT_DIFF to the correct directory node
+                    u_ops.send_packet_async(MSG_COMMIT_DIFF, log, ipc_hdr.len, dir_node, 1);
+                }
                 break;
             }
             case WVM_IPC_TYPE_RPC_PASSTHROUGH: { // Type 99
@@ -522,6 +741,9 @@ void* client_handler(void *socket_desc) {
                         qemu_fd, (unsigned)ipc_hdr.type, (unsigned)ipc_hdr.len);
                 break;
         }
+    }
+    if (drain_pending_commits(&commit_queue) < 0) {
+        cancel_pending_commits(&commit_queue);
     }
     fprintf(stderr, "[IPC] client disconnected fd=%d\n", qemu_fd);
     close(qemu_fd);

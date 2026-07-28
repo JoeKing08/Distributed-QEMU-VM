@@ -62,6 +62,8 @@ static long wait_for_directory_ack_safe(void);
 static int internal_connect_master(void);
 static int ensure_local_shm_shadow(void);
 static void send_diff_via_ipc(void *buf, size_t len);
+static int write_all_fd(int fd, const void *buf, size_t len);
+static void flush_aggregator(void);
 
 // 脏区捕获链表
 typedef struct WritablePage {
@@ -487,6 +489,7 @@ hit:
 }
 
 static WritablePage *g_writable_pages_list = NULL;
+static pthread_mutex_t g_dirty_flush_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // 线程局部
 static __thread int t_com_sock = -1;
@@ -910,6 +913,25 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
                     // [保留] 写入内存
                     mprotect((void*)aligned_addr, 4096, PROT_READ | PROT_WRITE);
                     memcpy((void*)aligned_addr, payload->data, 4096);
+                    {
+                        static int pull_dbg = 0;
+                        if (pull_dbg < 30) {
+                            uint64_t q0 = *(uint64_t *)aligned_addr;
+                            uint64_t q508 =
+                                *(uint64_t *)((uint8_t *)aligned_addr + 0xfe0);
+                            char msg[224];
+                            int dn = snprintf(msg, sizeof(msg),
+                                              "[WaveVM-User] pull page sample "
+                                              "gpa=%#llx q0=%#llx q508=%#llx\n",
+                                              (unsigned long long)gpa,
+                                              (unsigned long long)q0,
+                                              (unsigned long long)q508);
+                            if (dn > 0) {
+                                write(STDERR_FILENO, msg, (size_t)dn);
+                            }
+                            pull_dbg++;
+                        }
+                    }
 
                     // [V29 新增] 更新本地版本号
                     uint64_t ver = WVM_NTOHLL(payload->version);
@@ -1097,8 +1119,8 @@ static void send_diff_via_ipc(void *buf, size_t len) {
         wvm_ipc_header_t ipc_hdr = { .type = WVM_IPC_TYPE_COMMIT_DIFF, .len = pl };
         void *payload = (uint8_t *)sub + sizeof(struct wvm_header);
         // 发送 IPC header + payload（两次 write，由于是流式 socket 合并发送）
-        if (write(g_ipc_diff_sock, &ipc_hdr, sizeof(ipc_hdr)) < 0 ||
-            write(g_ipc_diff_sock, payload, pl) < 0) {
+        if (write_all_fd(g_ipc_diff_sock, &ipc_hdr, sizeof(ipc_hdr)) < 0 ||
+            write_all_fd(g_ipc_diff_sock, payload, pl) < 0) {
             // 连接断开，尝试重连
             close(g_ipc_diff_sock);
             g_ipc_diff_sock = internal_connect_master();
@@ -1108,8 +1130,125 @@ static void send_diff_via_ipc(void *buf, size_t len) {
     }
 }
 
+static int write_all_fd(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int send_full_page_diff_to_ipc_fd(int fd, uint64_t gpa,
+                                         uint64_t version, void *data)
+{
+    uint8_t payload[sizeof(struct wvm_diff_log) + 4096];
+    struct wvm_diff_log *log = (struct wvm_diff_log *)payload;
+    wvm_ipc_header_t ipc_hdr = {
+        .type = WVM_IPC_TYPE_COMMIT_DIFF_SYNC,
+        .len = sizeof(payload),
+    };
+
+    log->gpa = WVM_HTONLL(gpa);
+    log->version = WVM_HTONLL(version);
+    log->offset = 0;
+    log->size = htons(4096);
+    memcpy(log->data, data, 4096);
+
+    if (write_all_fd(fd, &ipc_hdr, sizeof(ipc_hdr)) < 0 ||
+        write_all_fd(fd, payload, sizeof(payload)) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+void wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd)
+{
+    int flushed = 0;
+    static int flush_log_count = 0;
+
+    if (ipc_fd < 0 || g_is_slave || g_block_count <= 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_dirty_flush_lock);
+
+    /*
+     * Remote TCG handoff is a memory ordering boundary: page tables and other
+     * CPU-visible RAM writes made by the master must reach the directory before
+     * the slave executes the exported architectural state.  Send these diffs on
+     * the same IPC stream as the following CPU_RUN so the master daemon observes
+     * commit-before-run ordering.
+     */
+    for (int bi = 0; bi < g_block_count; bi++) {
+        GVMRamBlock *blk = &g_mem_blocks[bi];
+        ram_addr_t ram_base = qemu_ram_addr_from_host((void *)blk->hva_start);
+        if (ram_base == RAM_ADDR_INVALID) {
+            continue;
+        }
+
+        for (uint64_t off = 0; off + 4096 <= blk->size; off += 4096) {
+            ram_addr_t ra = ram_base + off;
+            if (!cpu_physical_memory_test_and_clear_dirty(ra, 4096,
+                                                          DIRTY_MEMORY_MIGRATION)) {
+                continue;
+            }
+
+            uint64_t gpa = blk->gpa_start + off;
+            void *hva = (void *)(blk->hva_start + off);
+            uint64_t ver = get_local_page_version(gpa) + 1;
+            if (send_full_page_diff_to_ipc_fd(ipc_fd, gpa, ver, hva) < 0) {
+                pthread_mutex_unlock(&g_dirty_flush_lock);
+                return;
+            }
+            set_local_page_version(gpa, ver);
+            flushed++;
+        }
+    }
+
+    pthread_mutex_unlock(&g_dirty_flush_lock);
+
+    if (flushed > 0 && flush_log_count < 20) {
+        fprintf(stderr, "[WaveVM-User] handoff dirty flush pages=%d fd=%d\n",
+                flushed, ipc_fd);
+        flush_log_count++;
+    }
+}
+
+uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset, int *ok)
+{
+    void *hva;
+
+    if (ok) {
+        *ok = 0;
+    }
+    if (offset > 4088) {
+        return 0;
+    }
+    hva = gpa_to_hva_safe(gpa);
+    if (!hva) {
+        return 0;
+    }
+    if (ok) {
+        *ok = 1;
+    }
+    return *(uint64_t *)((uint8_t *)hva + offset);
+}
+
 // 发送函数：将缓冲区推向网络
-static void flush_aggregator(void) {
+static void flush_aggregator_locked(void) {
     if (g_aggregator.curr_offset == 0) return;
     // [FIX-G1] Master TCG 走 IPC, Slave 走 UDP push socket
     if (g_is_slave) {
@@ -1122,6 +1261,12 @@ static void flush_aggregator(void) {
     g_aggregator.curr_offset = 0;
 }
 
+static void flush_aggregator(void) {
+    pthread_mutex_lock(&g_aggregator.lock);
+    flush_aggregator_locked();
+    pthread_mutex_unlock(&g_aggregator.lock);
+}
+
 // 核心聚合函数：取代原有的 send_push_packet
 static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint16_t sz, void *data, uint8_t flags) {
     size_t payload_len = sizeof(struct wvm_diff_log) + sz;
@@ -1131,7 +1276,7 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
 
     // 如果当前包放不下，或者这个包本身就超过了 MTU 分片限制，则先发送之前的
     if (g_aggregator.curr_offset + needed > MTU_SIZE) {
-        flush_aggregator();
+        flush_aggregator_locked();
     }
 
     // 如果单包就超过 MTU（虽然对于 Diff 很少见），直接绕过聚合器发送
@@ -1143,6 +1288,8 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
         h->msg_type = htons(MSG_COMMIT_DIFF);
         h->payload_len = htons(payload_len);
         h->slave_id = htonl(g_slave_id);
+        h->target_id = htonl(WVM_NODE_AUTO_ROUTE);
+        h->qos_level = 1;
         h->flags = flags;
         h->crc32 = 0;
         struct wvm_diff_log *l = (struct wvm_diff_log *)(tmp + sizeof(*h));
@@ -1188,6 +1335,153 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
     pthread_mutex_unlock(&g_aggregator.lock);
 }
 
+static int process_writable_page(WritablePage *curr, void *current_snapshot,
+                                 int *batch_counter)
+{
+    void *page_addr = gpa_to_hva_safe(curr->gpa);
+    if (!page_addr) {
+        return 0;
+    }
+
+    int idx = LATCH_IDX(curr->gpa);
+
+    // Freeze this page while a consistent post-write snapshot is taken.
+    __atomic_store_n(&g_latches[idx].val, curr->gpa, __ATOMIC_RELEASE);
+
+    bool is_volatile = wvm_is_volatile_gpa(curr->gpa);
+    if (!is_volatile) {
+        mprotect(page_addr, 4096, PROT_READ);
+    }
+    __sync_synchronize();
+
+    memcpy(current_snapshot, page_addr, 4096);
+
+    __atomic_store_n(&g_latches[idx].val, (uint64_t)-1, __ATOMIC_RELEASE);
+
+    uint64_t ver = get_local_page_version(curr->gpa);
+    bool committed = false;
+
+    if (is_page_all_zero(current_snapshot)) {
+        /*
+         * Commit packets carry the page's current version.  The directory
+         * advances to the next version after applying the diff.
+         */
+        add_to_aggregator(curr->gpa, ver, 0, 0, NULL, WVM_FLAG_ZERO);
+        committed = true;
+    } else {
+        int start = -1, end = -1;
+        uint64_t *p64_now = (uint64_t *)current_snapshot;
+        uint64_t *p64_pre = (uint64_t *)curr->pre_image_snapshot;
+
+        for (int i = 0; i < 512; i++) {
+            if (p64_now[i] != p64_pre[i]) {
+                if (start == -1) {
+                    start = i * 8;
+                }
+                end = i * 8 + 7;
+            }
+        }
+
+        if (start != -1) {
+            uint16_t size = end - start + 1;
+            add_to_aggregator(curr->gpa, ver, (uint16_t)start, size,
+                              (uint8_t *)current_snapshot + start, 0);
+            committed = true;
+        }
+    }
+
+    if (!committed) {
+        return 0;
+    }
+
+    set_local_page_version(curr->gpa, ver + 1);
+
+    if (batch_counter && g_client_sync_batch > 0) {
+        (*batch_counter)++;
+        if (*batch_counter >= g_client_sync_batch) {
+            flush_aggregator();
+            long rtt = wait_for_directory_ack_safe();
+            *batch_counter = 0;
+
+            if (g_enable_auto_tuning) {
+                if (rtt < 0) {
+                    g_client_sync_batch =
+                        (g_client_sync_batch > 16) ? g_client_sync_batch / 2 : 1;
+                } else if (rtt < 500) {
+                    if (g_client_sync_batch < g_max_batch) {
+                        g_client_sync_batch += 16;
+                    }
+                } else if (rtt > 5000) {
+                    g_client_sync_batch = (g_client_sync_batch * 3) / 4;
+                    if (g_client_sync_batch < g_min_batch) {
+                        g_client_sync_batch = g_min_batch;
+                    }
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
+static int process_writable_batch(WritablePage *batch_head,
+                                  void *current_snapshot,
+                                  int *batch_counter)
+{
+    int committed = 0;
+
+    for (WritablePage *curr = batch_head; curr; curr = curr->next) {
+        committed += process_writable_page(curr, current_snapshot, batch_counter);
+    }
+
+    flush_aggregator();
+    return committed;
+}
+
+int wavevm_user_mem_flush_slave_dirty_sync(void)
+{
+    void *current_snapshot;
+    WritablePage *batch_head;
+    int committed;
+    long rtt;
+    static int flush_log_count;
+
+    if (!g_is_slave || g_fd_push < 0 || g_block_count <= 0) {
+        return 0;
+    }
+
+    current_snapshot = malloc(4096);
+    if (!current_snapshot) {
+        return -ENOMEM;
+    }
+
+    pthread_mutex_lock(&g_dirty_flush_lock);
+    batch_head = __atomic_exchange_n(&g_writable_pages_list, NULL,
+                                     __ATOMIC_ACQ_REL);
+    committed = process_writable_batch(batch_head, current_snapshot, NULL);
+    if (committed > 0) {
+        /*
+         * A remote TCG slice return is a causal handoff: all writes made by the
+         * slave must be visible to the directory before the CPU ACK is exported.
+         */
+        rtt = wait_for_directory_ack_safe();
+    } else {
+        rtt = 0;
+    }
+    pthread_mutex_unlock(&g_dirty_flush_lock);
+
+    free(current_snapshot);
+
+    if (committed > 0 && flush_log_count < 20) {
+        fprintf(stderr,
+                "[WaveVM-User] slave TCG slice dirty flush pages=%d rtt=%ldus\n",
+                committed, rtt);
+        flush_log_count++;
+    }
+
+    return (rtt < 0) ? -ETIMEDOUT : 0;
+}
+
 /*
  * [物理意图] 充当内存页面的“分布式写回缓存（Write-back Cache）”管理器。
  * [关键逻辑] 1. 计算增量（Diff）；2. 聚合（Aggregator）打包；3. 执行 AIMD 自适应同步屏障，根据 RTT 调整提交频率。
@@ -1208,11 +1502,15 @@ static void *diff_harvester_thread_fn(void *arg) {
          * 50ms lets pages stay RW longer, cutting SIGSEGV ~50x. */
         usleep((kvm_enabled() || !g_is_slave) ? 1000 : 50000);
 
-        // KVM and master TCG: harvest QEMU dirty logs, no SIGSEGV/PROT_NONE.
+        // KVM: harvest QEMU dirty logs, no SIGSEGV/PROT_NONE.
+        // Master TCG is synchronized explicitly at remote handoff boundaries.
+        // A continuous async TCG stream uses a different IPC socket from CPU_RUN
+        // and can overtake the handoff fence, making directory versions diverge.
         // [FIX] 遍历 g_mem_blocks 而非 flat 0~g_ram_size，
         //       并用 qemu_ram_addr_from_host 将 HVA 转为正确的 ram_addr_t，
         //       修复 PCI hole (3G-4G) 导致的 gpa != ram_addr_t 问题。
-        if (kvm_enabled() || !g_is_slave) {
+        if (kvm_enabled()) {
+            pthread_mutex_lock(&g_dirty_flush_lock);
             for (int bi = 0; bi < g_block_count; bi++) {
                 GVMRamBlock *blk = &g_mem_blocks[bi];
                 /* 将 block 起始 HVA 转为 ram_addr_t 基址（一次性，避免每页调用） */
@@ -1232,104 +1530,23 @@ static void *diff_harvester_thread_fn(void *arg) {
                 }
             }
             flush_aggregator();
+            pthread_mutex_unlock(&g_dirty_flush_lock);
             continue;
         }
+
+        pthread_mutex_lock(&g_dirty_flush_lock);
 
         // 1. 偷走链表 (Detach List) — 必须用原子交换，与信号处理函数的 CAS 配合
         WritablePage *batch_head = __atomic_exchange_n(&g_writable_pages_list, NULL, __ATOMIC_ACQ_REL);
 
-        if (!batch_head) continue;
+        if (!batch_head) {
+            pthread_mutex_unlock(&g_dirty_flush_lock);
+            continue;
+        }
 
         // 2. 遍历处理脏页
-        WritablePage *curr = batch_head;
-        while (curr) {
-            void *page_addr = gpa_to_hva_safe(curr->gpa);
-            if (!page_addr) {
-                // 错误处理：释放资源并跳过
-                WritablePage *nxt = curr->next; curr = nxt;
-                continue;
-            }
-            int idx = LATCH_IDX(curr->gpa);
-
-            // [A] 上锁 (Freeze): 告诉 Signal Handler 暂停操作
-            __atomic_store_n(&g_latches[idx].val, curr->gpa, __ATOMIC_RELEASE);
-
-            bool is_volatile = wvm_is_volatile_gpa(curr->gpa);
-
-            // [B] 冻结权限: 设为只读。Volatile ranges stay writable after
-            // harvesting; otherwise BIOS/PAM shadow writes can livelock on
-            // periodic write-protect rearming during early boot.
-            if (!is_volatile) {
-                mprotect(page_addr, 4096, PROT_READ);
-            }
-            __sync_synchronize();
-
-            // [C] 快照 (Snapshot): 安全拷贝
-            memcpy(current_snapshot, page_addr, 4096);
-
-            // [D] 解锁 (Release): Signal Handler 可以继续了
-            __atomic_store_n(&g_latches[idx].val, (uint64_t)-1, __ATOMIC_RELEASE);
-
-            uint64_t ver = get_local_page_version(curr->gpa);
-
-            if (is_page_all_zero(current_snapshot)) {
-                // 调用聚合器发送零页消息
-                add_to_aggregator(curr->gpa, ver + 1, 0, 0, NULL, WVM_FLAG_ZERO);
-                set_local_page_version(curr->gpa, ver + 1);
-            } else {
-                // [E] 计算 Diff (耗时操作，已移出临界区)
-                int start = -1, end = -1;
-                uint64_t *p64_now = (uint64_t*)current_snapshot;
-                uint64_t *p64_pre = (uint64_t*)curr->pre_image_snapshot;
-
-                for (int i = 0; i < 512; i++) {
-                    if (p64_now[i] != p64_pre[i]) {
-                        if (start == -1) start = i * 8;
-                        end = i * 8 + 7;
-                    }
-                }
-
-                // [F] 提交与同步 (Commit & Sync)
-                if (start != -1) {
-                    uint16_t size = end - start + 1;
-                    // 发送 Diff 包
-                    add_to_aggregator(curr->gpa, ver + 1, (uint16_t)start, size, (uint8_t*)current_snapshot + start, 0);
-
-                    // --- [AIMD Sync Engine] ---
-                    if (g_client_sync_batch > 0) {
-                        batch_counter++;
-                        // 达到阈值，触发同步屏障
-                        if (batch_counter >= g_client_sync_batch) {
-                            long rtt = wait_for_directory_ack_safe();
-                            batch_counter = 0;
-
-                            // 自适应流控逻辑
-                            if (g_enable_auto_tuning) {
-                                if (rtt < 0) {
-                                    // 超时/丢包：急速降速
-                                    g_client_sync_batch = (g_client_sync_batch > 16) ? g_client_sync_batch / 2 : 1;
-                                } else if (rtt < 500) {
-                                    // 网络极好 (<0.5ms)：加法增大
-                                    if (g_client_sync_batch < g_max_batch) g_client_sync_batch += 16;
-                                } else if (rtt > 5000) {
-                                    // 网络拥塞 (>5ms)：乘法减小
-                                    g_client_sync_batch = (g_client_sync_batch * 3) / 4;
-                                    if (g_client_sync_batch < g_min_batch) g_client_sync_batch = g_min_batch;
-                                }
-                            }
-                        }
-                    }
-
-                    // 乐观更新本地版本号
-                    set_local_page_version(curr->gpa, ver + 1);
-                }
-            }
-
-            // 清理资源：节点与快照都来自预分配池，不在这里 free
-            WritablePage *next_node = curr->next;
-            curr = next_node;
-        }
-        flush_aggregator();
+        process_writable_batch(batch_head, current_snapshot, &batch_counter);
+        pthread_mutex_unlock(&g_dirty_flush_lock);
     }
     free(current_snapshot);
     return NULL;
@@ -1405,6 +1622,8 @@ static long wait_for_directory_ack_safe(void) {
     hdr.slave_id = htonl(g_slave_id);
     hdr.target_id = htonl(WVM_NODE_AUTO_ROUTE);
     hdr.req_id = WVM_HTONLL(SYNC_MAGIC); // 特殊标记
+    hdr.crc32 = 0;
+    hdr.crc32 = htonl(calculate_crc32((uint8_t *)&hdr, sizeof(hdr)));
 
     // 2. 【关键】先加锁，重置状态位
     pthread_mutex_lock(&g_sync_lock);
@@ -1649,12 +1868,11 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
         pthread_create(&g_listen_thread, NULL, mem_push_listener_thread, NULL);
         pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
     }
-    // [FIX-G1] Master TCG 模式：无 WVM_SOCK_PUSH 但仍需启动 harvester
-    // Listener 由 wavevm-all.c 的 wavevm_master_ipc_thread 处理，此处只启 harvester
+    // Master TCG dirty pages are flushed synchronously on CPU handoff.
+    // Do not start the async harvester here: it has no ordering against the
+    // per-vCPU IPC stream and can race the handoff fence.
     else if (!kvm_enabled()) {
-        printf("[WaveVM-User] V31 Master TCG Harvester Active (IPC Diff Path)\n");
-        g_threads_running = true;
-        pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
+        printf("[WaveVM-User] V31 Master TCG Handoff Dirty Flush Active\n");
     }
 
     if (!kvm_enabled() && g_fault_hook_enabled) {

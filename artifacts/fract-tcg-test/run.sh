@@ -4,6 +4,32 @@ ROOT=/workspaces/WaveVM_Frontier-X
 ART_DIR="$ROOT/artifacts/tmp/fract-tcg-test-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$ART_DIR"
 
+limit_log() {
+  local out="$1"
+  local max="${WVM_TEST_LOG_LIMIT_BYTES:-134217728}"
+  awk -v out="$out" -v max="$max" '
+    {
+      line = $0 ORS
+      n = length(line)
+      if (bytes < max) {
+        remain = max - bytes
+        if (n <= remain) {
+          printf "%s", line >> out
+          bytes += n
+        } else {
+          printf "%s", substr(line, 1, remain) >> out
+          bytes = max
+        }
+        fflush(out)
+      } else if (!warned) {
+        printf "\n[WaveVM-Test] log limit reached (%d bytes); further output discarded\n", max >> out
+        fflush(out)
+        warned = 1
+      }
+    }
+  '
+}
+
 mount -o remount,size=8G /dev/shm
 
 # === NODE config (for masters — g_gateways[] points to local sidecars) ===
@@ -50,7 +76,28 @@ rm -f /tmp/wvm_user_0.sock /tmp/wvm_user_1.sock 2>/dev/null || true
 sleep 1
 
 mv /dev/kvm /dev/kvm.off 2>/dev/null || true
-trap 'mv /dev/kvm.off /dev/kvm 2>/dev/null || true; pkill -f wavevm_node_master 2>/dev/null || true; pkill -f wavevm_node_slave 2>/dev/null || true; pkill -f wavevm_gateway 2>/dev/null || true; pkill -f qemu-system-x86_64 2>/dev/null || true' EXIT
+trap 'kill ${LOG_MON:-} 2>/dev/null || true; mv /dev/kvm.off /dev/kvm 2>/dev/null || true; pkill -f wavevm_node_master 2>/dev/null || true; pkill -f wavevm_node_slave 2>/dev/null || true; pkill -f wavevm_gateway 2>/dev/null || true; pkill -f qemu-system-x86_64 2>/dev/null || true' EXIT
+
+monitor_log_sizes() {
+  local max="${WVM_TEST_LOG_LIMIT_BYTES:-134217728}"
+  local f size
+
+  while true; do
+    for f in "$ART_DIR"/*.log; do
+      [ -e "$f" ] || continue
+      size=$(stat -c '%s' "$f" 2>/dev/null || echo 0)
+      if [ "${size:-0}" -gt "$max" ]; then
+        echo "ERROR: log limit exceeded: $f ${size} > ${max}" >&2
+        kill "$$" 2>/dev/null || true
+        return 124
+      fi
+    done
+    sleep 2
+  done
+}
+
+monitor_log_sizes &
+LOG_MON=$!
 
 wait_for_ssh_login() {
   for _ in $(seq 1 40); do
@@ -128,9 +175,9 @@ GSA=$!
 GSB=$!
 
 echo "=== Starting slaves ==="
-(env PATH="$QPATH" WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19105 2 2048 0 19121) >"$ART_DIR/slave0.log" 2>&1 &
+(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB=3072 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19105 2 2048 0 19121) >"$ART_DIR/slave0.log" 2>&1 &
 S0=$!
-(env PATH="$QPATH" WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19205 1 1024 1 19221) >"$ART_DIR/slave1.log" 2>&1 &
+(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB=3072 WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19205 1 1024 1 19221) >"$ART_DIR/slave1.log" 2>&1 &
 S1=$!
 
 echo "=== Starting masters ==="

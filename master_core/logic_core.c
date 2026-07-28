@@ -53,6 +53,8 @@
     #include <string.h>
     #include <sys/mman.h>
     #include <stdio.h>
+    extern void *g_shm_ptr;
+    extern size_t g_shm_size;
 #endif
 
 #ifdef __KERNEL__
@@ -158,7 +160,7 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 #define DIR_TABLE_INIT_SIZE (1024 * 4)   // Kernel: fixed, no dynamic growth
 #define DIR_TABLE_SIZE      DIR_TABLE_INIT_SIZE
 #else
-#define DIR_TABLE_INIT_SIZE (1024 * 64)  // User-mode: initial size, grows on demand
+#define DIR_TABLE_INIT_SIZE (1024 * 1024) // User-mode: page-scale table, grows on demand
 #endif
 #define DIR_MAX_PROBE 128
 #define LOCK_SHARDS 65536
@@ -176,7 +178,13 @@ void handle_rpc_batch_execution(void *payload, uint32_t len);
 
 // 订阅者位图
 typedef struct {
+#ifdef __KERNEL__
     unsigned long bits[(WVM_MAX_SLAVES + 63) / 64];
+#else
+    uint32_t *ids;
+    uint32_t count;
+    uint32_t cap;
+#endif
 } copyset_t;
 
 // [辅助宏] 用于操作 64 位复合版本号
@@ -189,15 +197,40 @@ typedef struct {
     uint64_t gpa;
     uint8_t  is_valid; // bool in C
     uint64_t version; // [FIX] 高32位: Epoch, 低32位: Counter
+#ifdef __KERNEL__
     uint64_t segment_mask[256]; 
+#endif
     copyset_t subscribers;
     uint64_t last_interest_time;
+#ifdef __KERNEL__
     uint8_t  base_page_data[4096];
+#else
+    uint8_t *base_page_data;
+#endif
     pthread_mutex_t lock;
 } page_meta_t;
 
 static page_meta_t *g_dir_table = NULL;
 static pthread_mutex_t g_dir_table_locks[LOCK_SHARDS];
+
+#ifndef __KERNEL__
+static uint8_t *resolve_page_data(page_meta_t *page, uint64_t gpa) {
+    if (page->base_page_data) {
+        return page->base_page_data;
+    }
+
+    if (g_shm_ptr && g_shm_size >= 4096 && gpa <= g_shm_size - 4096) {
+        page->base_page_data = (uint8_t*)g_shm_ptr + gpa;
+        return page->base_page_data;
+    }
+
+    page->base_page_data = wvm_alloc_local(4096);
+    if (page->base_page_data) {
+        memset(page->base_page_data, 0, 4096);
+    }
+    return page->base_page_data;
+}
+#endif
 
 #ifndef __KERNEL__
 static uint32_t g_dir_capacity = DIR_TABLE_INIT_SIZE;
@@ -233,7 +266,22 @@ static inline uint32_t get_lock_idx(uint64_t gpa) {
  */
 static void copyset_set(copyset_t *cs, uint32_t node_id) {
     if (node_id >= WVM_MAX_SLAVES) return;
+#ifdef __KERNEL__
     cs->bits[node_id / 64] |= (1UL << (node_id % 64));
+#else
+    for (uint32_t i = 0; i < cs->count; i++) {
+        if (cs->ids[i] == node_id) return;
+    }
+
+    if (cs->count == cs->cap) {
+        uint32_t new_cap = cs->cap ? cs->cap * 2 : 4;
+        uint32_t *new_ids = realloc(cs->ids, sizeof(*new_ids) * new_cap);
+        if (!new_ids) return;
+        cs->ids = new_ids;
+        cs->cap = new_cap;
+    }
+    cs->ids[cs->count++] = node_id;
+#endif
 }
 
 static uint32_t g_cpu_route_table[WVM_CPU_ROUTE_TABLE_SIZE];
@@ -321,6 +369,11 @@ static page_meta_t* find_or_create_page_meta(uint64_t gpa) {
 
         // 找到存在的
         if (g_dir_table[cur].is_valid && g_dir_table[cur].gpa == gpa) {
+#ifndef __KERNEL__
+            if (!resolve_page_data(&g_dir_table[cur], gpa)) {
+                return NULL;
+            }
+#endif
             return &g_dir_table[cur];
         }
 
@@ -332,6 +385,12 @@ static page_meta_t* find_or_create_page_meta(uint64_t gpa) {
             g_dir_table[cur].is_valid = 1;
             g_dir_table[cur].gpa = gpa;
             g_dir_table[cur].version = MAKE_VERSION(g_curr_epoch, 1);
+#ifndef __KERNEL__
+            if (!resolve_page_data(&g_dir_table[cur], gpa)) {
+                memset(&g_dir_table[cur], 0, sizeof(page_meta_t));
+                return NULL;
+            }
+#endif
 
             // 锁必须初始化，即使是在持锁状态下分配
             pthread_mutex_init(&g_dir_table[cur].lock, NULL);
@@ -489,6 +548,16 @@ static atomic_int g_peers_at_next_epoch = 0; // 观测到处于 E+1 的邻居计
 static uint32_t g_hash_ring_cache[HASH_RING_SIZE];
 static pthread_rwlock_t g_ring_lock;
 
+static inline int peer_participates_in_owner_ring(uint8_t state)
+{
+    /*
+     * Configured seeds must participate before they become ACTIVE, otherwise
+     * each node temporarily maps every GPA to itself and the directory splits.
+     * Liveness, not warm-up state, removes a node from the owner set.
+     */
+    return state != NODE_STATE_OFFLINE && state != NODE_STATE_DRAINING;
+}
+
 /* 
  * [物理意图] 当集群发生节点加减（扩容/宕机）时，在后台重建 P2P 拓扑的逻辑环，复杂度 O(RingSize * PeerCount)，但在后台运行，不阻塞热路径
 。
@@ -512,7 +581,7 @@ static void rebuild_hash_ring_cache(void) {
             uint32_t best_node = g_my_node_id;
             uint64_t max_weight = murmur3_32(slot ^ g_my_node_id);
             for (int i = 0; i < g_peer_count; i++) {
-                if (g_peer_view[i].state != NODE_STATE_ACTIVE) continue;
+                if (!peer_participates_in_owner_ring(g_peer_view[i].state)) continue;
                 uint64_t weight = murmur3_32(slot ^ g_peer_view[i].node_id);
                 if (weight > max_weight) {
                     max_weight = weight;
@@ -701,7 +770,7 @@ static void monitor_peer_liveness(void) {
     pthread_rwlock_wrlock(&g_view_lock);
     
     for (int i = 0; i < g_peer_count; i++) {
-        if (g_peer_view[i].state == NODE_STATE_ACTIVE || g_peer_view[i].state == NODE_STATE_WARMING) {
+        if (peer_participates_in_owner_ring(g_peer_view[i].state)) {
             if (now - g_peer_view[i].last_seen_us > HEARTBEAT_TIMEOUT_US) {
                 // 本地标记失效，不再向其路由请求
                 g_peer_view[i].state = NODE_STATE_OFFLINE;
@@ -993,13 +1062,65 @@ void* broadcast_worker_thread(void* arg) {
     return NULL;
 }
 
+static void enqueue_broadcast_to_target(uint32_t target_id, uint16_t msg_type,
+                                        void *payload, int len, uint8_t flags) {
+    if (target_id == (uint32_t)g_my_node_id) return;
+
+    // 分配内存
+    void *data_copy = NULL;
+    if (len > 0) {
+        #ifdef __KERNEL__
+            data_copy = kmalloc(len, GFP_ATOMIC);
+        #else
+            data_copy = malloc(len);
+        #endif
+        if (!data_copy) return;
+        memcpy(data_copy, payload, len);
+    }
+
+    // 1. 根据目标ID计算分片索引
+    int shard_idx = target_id % NUM_BCAST_WORKERS;
+    bcast_queue_shard_t *target_shard = &g_bcast_shards[shard_idx];
+
+    // 2. 锁住目标分片队列
+    pthread_spin_lock(&target_shard->lock);
+    
+    // 3. 检查目标分片队列是否已满
+    uint64_t current_tail = target_shard->tail;
+    if (current_tail + 1 - target_shard->head >= BCAST_Q_SIZE) {
+        pthread_spin_unlock(&target_shard->lock);
+        if (data_copy) {
+            #ifdef __KERNEL__
+                kfree(data_copy);
+            #else
+                free(data_copy);
+            #endif
+        }
+        return; // Drop-tail
+    }
+
+    // 4. 将任务放入目标分片队列
+    broadcast_task_t *t = &target_shard->queue[current_tail & BCAST_Q_MASK];
+    t->msg_type = msg_type;
+    t->target_id = WVM_ENCODE_ID(g_my_vm_id, target_id); // [Multi-VM] composite ID for network
+    t->len = len;
+    t->data_ptr = data_copy;
+    t->flags = flags;
+
+    __sync_synchronize();
+    target_shard->tail = current_tail + 1; // 更新目标分片队列的tail
+    
+    pthread_spin_unlock(&target_shard->lock);
+}
+
 /* 
  * [物理意图] 针对特定页面的变动，向全网所有利益相关方精准发射"小波（Wavelet）"更新。
- * [关键逻辑] 遍历二级订阅位图，利用多线程分片队列并行发送 Diff 或 Full-Page 包。
+ * [关键逻辑] 遍历订阅者集合，利用多线程分片队列并行发送 Diff 或 Full-Page 包。
  * [后果] 它实现了"读操作本地化"，通过网络带宽换取读时延的消除，是 V30 性能突破的关键。
  */
 static void broadcast_to_subscribers(page_meta_t *page, uint16_t msg_type, void *payload, int len, uint8_t flags) {
-    // 遍历订阅者的
+#ifdef __KERNEL__
+    // 遍历订阅者的二级位图
     int seg_mask_count = ((WVM_MAX_SLAVES / 64) + 63) / 64; /* segment_mask 有效元素数 */
     for (int i = 0; i < seg_mask_count; i++) {
         uint64_t mask = page->segment_mask[i];
@@ -1013,58 +1134,17 @@ static void broadcast_to_subscribers(page_meta_t *page, uint16_t msg_type, void 
                 for (int k = 0; k < 64; k++) {
                     if ((sub_bits >> k) & 1) {
                         uint32_t target_id = (seg_idx * 64) + k;
-                        if (target_id == g_my_node_id) continue;
-
-                        // 分配内存
-                        void *data_copy = NULL;
-                        if (len > 0) {
-                            #ifdef __KERNEL__
-                                data_copy = kmalloc(len, GFP_ATOMIC);
-                            #else
-                                data_copy = malloc(len);
-                            #endif
-                            if (!data_copy) continue;
-                            memcpy(data_copy, payload, len);
-                        }
-
-                        // 1. 根据目标ID计算分片索引
-                        int shard_idx = target_id % NUM_BCAST_WORKERS;
-                        bcast_queue_shard_t *target_shard = &g_bcast_shards[shard_idx];
-
-                        // 2. 锁住目标分片队列
-                        pthread_spin_lock(&target_shard->lock);
-                        
-                        // 3. 检查目标分片队列是否已满
-                        uint64_t current_tail = target_shard->tail;
-                        if (current_tail + 1 - target_shard->head >= BCAST_Q_SIZE) {
-                            pthread_spin_unlock(&target_shard->lock);
-                            if (data_copy) {
-                                #ifdef __KERNEL__
-                                    kfree(data_copy);
-                                #else
-                                    free(data_copy);
-                                #endif
-                            }
-                            continue; // Drop-tail
-                        }
-
-                        // 4. 将任务放入目标分片队列
-                        broadcast_task_t *t = &target_shard->queue[current_tail & BCAST_Q_MASK];
-                        t->msg_type = msg_type;
-                        t->target_id = WVM_ENCODE_ID(g_my_vm_id, target_id); // [Multi-VM] composite ID for network
-                        t->len = len;
-                        t->data_ptr = data_copy;
-                        t->flags = flags;
-
-                        __sync_synchronize();
-                        target_shard->tail = current_tail + 1; // 更新目标分片队列的tail
-                        
-                        pthread_spin_unlock(&target_shard->lock);
+                        enqueue_broadcast_to_target(target_id, msg_type, payload, len, flags);
                     }
                 }
             }
         }
     }
+#else
+    for (uint32_t i = 0; i < page->subscribers.count; i++) {
+        enqueue_broadcast_to_target(page->subscribers.ids[i], msg_type, payload, len, flags);
+    }
+#endif
 }
 
 // [FIX] FORCE_SYNC 限流器状态
@@ -1302,6 +1382,11 @@ static void handle_prophet_metadata_update(uint64_t gpa_start, uint64_t len) {
             
             // 物理落盘：Master 自己的内存也要清零
             memset(page->base_page_data, 0, 4096);
+#ifndef __KERNEL__
+            if (g_shm_ptr && cur_gpa + 4096 <= g_shm_size) {
+                memset((uint8_t*)g_shm_ptr + cur_gpa, 0, 4096);
+            }
+#endif
         }
         pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
     }
@@ -1593,6 +1678,73 @@ static void flush_gossip_aggregator() {
     /* No-op: heartbeat aggregation removed; each heartbeat is sent directly. */
 }
 
+static void send_commit_ack_if_needed(struct wvm_header *req_hdr,
+                                      uint32_t source_node_id,
+                                      int ok)
+{
+    if (!(req_hdr->flags & WVM_FLAG_NEED_ACK) ||
+        WVM_NTOHLL(req_hdr->req_id) == 0) {
+        return;
+    }
+
+    size_t ack_len = sizeof(struct wvm_header) + 1;
+    uint8_t *ack_buf = g_ops->alloc_packet(ack_len, 1);
+    if (!ack_buf) {
+        return;
+    }
+
+    struct wvm_header *ack = (struct wvm_header *)ack_buf;
+    memset(ack, 0, sizeof(*ack));
+    ack->magic = htonl(WVM_MAGIC);
+    ack->msg_type = htons(MSG_MEM_ACK);
+    ack->payload_len = htons(1);
+    ack->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    ack->target_id = req_hdr->slave_id;
+    ack->req_id = req_hdr->req_id;
+    ack->qos_level = 1;
+    ack->flags = ok ? 0 : WVM_FLAG_ERROR;
+    ack->epoch = htonl(g_curr_epoch);
+    ack->node_state = g_my_node_state;
+    ack_buf[sizeof(*ack)] = ok ? 1 : 0;
+
+    g_ops->send_packet(ack_buf, ack_len, source_node_id);
+    g_ops->free_packet(ack_buf);
+}
+
+#ifndef __KERNEL__
+static void log_commit_sync_decision(const char *reason, struct wvm_header *hdr,
+                                     uint32_t source_node_id, uint64_t gpa,
+                                     uint64_t commit_version,
+                                     uint64_t local_version, uint16_t off,
+                                     uint16_t sz, uint16_t pl_len)
+{
+    static int log_count;
+    int is_accept = !strcmp(reason, "accept");
+
+    if (!(hdr->flags & WVM_FLAG_NEED_ACK)) {
+        return;
+    }
+    if (is_accept && __sync_fetch_and_add(&log_count, 1) >= 120) {
+        return;
+    }
+    if (g_ops->log) {
+        g_ops->log("[COMMIT_SYNC RX] %s src=%u target=%u gpa=%#llx "
+                   "commit=%#llx local=%#llx off=%u sz=%u pl=%u flags=0x%x rid=%llu",
+                   reason, (unsigned)source_node_id,
+                   (unsigned)ntohl(hdr->target_id),
+                   (unsigned long long)gpa,
+                   (unsigned long long)commit_version,
+                   (unsigned long long)local_version,
+                   (unsigned)off, (unsigned)sz, (unsigned)pl_len,
+                   (unsigned)hdr->flags,
+                   (unsigned long long)WVM_NTOHLL(hdr->req_id));
+    }
+}
+#else
+#define log_commit_sync_decision(reason, hdr, source_node_id, gpa, commit_version, local_version, off, sz, pl_len) \
+    do { } while (0)
+#endif
+
 /* 
  * [物理意图] 分布式内存事务的终极处理器。
  * [关键逻辑] 拦截所有入站消息，根据 MESI 状态机执行：READ(拉取)、DECLARE(订阅)、COMMIT(增量写) 及 Prophet(指令透传)。
@@ -1707,11 +1859,13 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                 // 记录订阅者 (使用裸 node_id 索引位图，不能用 composite ID)
                 copyset_set(&page->subscribers, src_id);
                 page->last_interest_time = g_ops->get_time_us();
+#ifdef __KERNEL__
                 uint32_t seg_idx = src_id / 64;
                 // 在二级位图中标记该段"有订阅者"
                 page->segment_mask[seg_idx / 64] |= (1UL << (seg_idx % 64));
                 // 在一级位图中标记节点
                 page->subscribers.bits[seg_idx] |= (1UL << (src_id % 64));
+#endif
             }
             
             pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
@@ -1720,22 +1874,48 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
 
         // --- 3. 处理增量提交 (Commit) ---
         case MSG_COMMIT_DIFF: {
-            // 在自治模式下，COMMIT 必须先校验写者的 Epoch
-            if (src_epoch < g_curr_epoch) {
-                // 拒绝陈旧 Epoch 的提交，通知其 FORCE_SYNC
-                force_sync_client(WVM_NTOHLL(((struct wvm_diff_log*)payload)->gpa), NULL, src_id);
-                return;
-            }
             // 安全检查 payload 长度
             uint16_t pl_len = ntohs(hdr->payload_len);
-            if (pl_len < sizeof(struct wvm_diff_log)) return;
+            if (pl_len < sizeof(struct wvm_diff_log)) {
+                log_commit_sync_decision("reject-short-payload", hdr, source_node_id,
+                                         0, 0, 0, 0, 0, pl_len);
+                send_commit_ack_if_needed(hdr, source_node_id, 0);
+                return;
+            }
 
             struct wvm_diff_log *log = (struct wvm_diff_log*)payload;
             uint64_t gpa = WVM_NTOHLL(log->gpa);
             uint64_t commit_version = WVM_NTOHLL(log->version);
             uint16_t off = ntohs(log->offset);
             uint16_t sz = ntohs(log->size);
+
+            // 在自治模式下，COMMIT 必须先校验写者的 Epoch
+            if (src_epoch < g_curr_epoch) {
+                // 拒绝陈旧 Epoch 的提交，通知其 FORCE_SYNC
+                force_sync_client(gpa, NULL, src_id);
+                log_commit_sync_decision("reject-stale-epoch", hdr, source_node_id,
+                                         gpa, commit_version, 0, off, sz, pl_len);
+                send_commit_ack_if_needed(hdr, source_node_id, 0);
+                return;
+            }
+
+            if (sizeof(struct wvm_diff_log) + sz > pl_len || off + sz > 4096) {
+                log_commit_sync_decision("reject-bounds", hdr, source_node_id,
+                                         gpa, commit_version, 0, off, sz, pl_len);
+                send_commit_ack_if_needed(hdr, source_node_id, 0);
+                return;
+            }
+
+            if (WVM_GET_NODEID(wvm_get_directory_node_id(gpa)) != (uint32_t)g_my_node_id) {
+                log_commit_sync_decision("reject-wrong-owner", hdr, source_node_id,
+                                         gpa, commit_version, 0, off, sz, pl_len);
+                send_commit_ack_if_needed(hdr, source_node_id, 0);
+                return;
+            }
+
             uint32_t lock_idx = get_lock_idx(gpa);
+            int commit_ok = 0;
+
             if (sz == 0) {
                 pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
                 // [V29.5] Zero Page Commit
@@ -1743,6 +1923,11 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                 if (page) {
                     // 本地清零
                     memset(page->base_page_data, 0, 4096);
+#ifndef __KERNEL__
+                    if (g_shm_ptr && gpa + 4096 <= g_shm_size) {
+                        memset((uint8_t*)g_shm_ptr + gpa, 0, 4096);
+                    }
+#endif
                     uint32_t local_counter = GET_COUNTER(page->version);
                     page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1);
                     
@@ -1750,15 +1935,10 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     
                     // 广播零页：Diff类型 + ZeroFlag + 无数据
                     broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct wvm_diff_log), WVM_FLAG_ZERO);
+                    commit_ok = 1;
                 }
                 pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
             } else {
-                // 安全检查 diff 数据是否越界
-                if (sizeof(struct wvm_diff_log) + sz > pl_len) return;
-                if (off + sz > 4096) return;
-
-                if (WVM_GET_NODEID(wvm_get_directory_node_id(gpa)) != (uint32_t)g_my_node_id) return;
-
                 pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
 
                 page_meta_t *page = DIR_FIND_OR_CREATE(gpa, lock_idx);
@@ -1766,6 +1946,9 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                 if (!page) {
                     if (g_ops->log) g_ops->log("[Logic] Fatal: Hash Table Full for GPA %llx", gpa);
                     pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+                    log_commit_sync_decision("reject-no-page", hdr, source_node_id,
+                                             gpa, commit_version, 0, off, sz, pl_len);
+                    send_commit_ack_if_needed(hdr, source_node_id, 0);
                     return; // 防御性退出，防止崩溃
                 }
 
@@ -1776,22 +1959,47 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     uint32_t local_epoch = GET_EPOCH(page->version);
                     (void)local_epoch;
                     uint32_t local_counter = GET_COUNTER(page->version);
+                    int full_page_overwrite = (off == 0 && sz == 4096);
+                    int full_page_same_version =
+                        full_page_overwrite &&
+                        commit_epoch == g_curr_epoch &&
+                        commit_counter == local_counter;
+                    int full_page_catchup =
+                        full_page_overwrite &&
+                        is_newer_version(page->version, commit_version);
             
-                    // 1. Epoch 必须与 Directory 当前 Epoch 一致
-                    // 2. Counter 必须是连续的
-                    if (commit_epoch != g_curr_epoch || commit_counter != local_counter) {
+                    /*
+                     * Partial diffs depend on every previous diff and must stay
+                     * strictly ordered.  A full-page commit is a complete
+                     * snapshot from the writer, so it can safely close a version
+                     * gap created by dropped/late async diffs before a remote TCG
+                     * handoff.
+                     */
+                    if (commit_epoch != g_curr_epoch ||
+                        (commit_counter != local_counter && !full_page_catchup)) {
                         // 版本冲突！拒绝并强制同步
                         // [FIX-H8] 传 NULL 让 force_sync_client 走安全的重新查找+拷贝路径，
                         // 避免释放锁后解引用 page 指针导致的数据竞争
+                        uint64_t local_version = page->version;
                         pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
                         force_sync_client(gpa, NULL, src_id);
+                        log_commit_sync_decision("reject-version", hdr, source_node_id,
+                                                 gpa, commit_version, local_version,
+                                                 off, sz, pl_len);
+                        send_commit_ack_if_needed(hdr, source_node_id, 0);
                         return;
                     }
                 
                     // 应用 Diff 到主副本
                     memcpy(page->base_page_data + off, log->data, sz);
-                    // [FIX] 更新版本号：Epoch 不变，Counter++
-                    page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1); 
+#ifndef __KERNEL__
+                    if (g_shm_ptr && gpa + off + sz <= g_shm_size) {
+                        memcpy((uint8_t*)g_shm_ptr + gpa + off, log->data, sz);
+                    }
+#endif
+                    // [FIX] 全页快照可追平版本断层；普通 Diff 维持旧的连续递增语义。
+                    page->version = (full_page_catchup || full_page_same_version) ?
+                        commit_version : MAKE_VERSION(g_curr_epoch, local_counter + 1);
                 
                     // 广播决策
                     if (sz < SMALL_UPDATE_THRESHOLD) {
@@ -1826,9 +2034,14 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                             if (g_ops->log) g_ops->log("[Logic] OOM skipping Full Push");
                         }
                     }
+                    commit_ok = 1;
                 }
                 pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
             }
+            log_commit_sync_decision(commit_ok ? "accept" : "reject-no-commit",
+                                     hdr, source_node_id, gpa, commit_version, 0,
+                                     off, sz, pl_len);
+            send_commit_ack_if_needed(hdr, source_node_id, commit_ok);
             break;
         }
 
@@ -1857,6 +2070,11 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
             if (page) {
                 // 2. [Commit] 先落盘：写入本地内存
                 memcpy(page->base_page_data, data_ptr, 4096);
+#ifndef __KERNEL__
+                if (g_shm_ptr && gpa + 4096 <= g_shm_size) {
+                    memcpy((uint8_t*)g_shm_ptr + gpa, data_ptr, 4096);
+                }
+#endif
                 
                 // 3. [State] 更新状态：版本号递增
                 page->version = MAKE_VERSION(g_curr_epoch, GET_COUNTER(page->version) + 1);

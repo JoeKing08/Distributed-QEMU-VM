@@ -1477,6 +1477,11 @@ void qemu_system_guest_crashloaded(GuestPanicInformation *info)
 
 void qemu_system_reset_request(ShutdownCause reason)
 {
+    fprintf(stderr,
+            "[WVM-RESET] request reason=%s(%d) current_cpu=%d no_reboot=%d\n",
+            ShutdownCause_str(reason), reason,
+            current_cpu ? current_cpu->cpu_index : -1, no_reboot);
+
     if (no_reboot && reason != SHUTDOWN_CAUSE_SUBSYSTEM_RESET) {
         shutdown_requested = reason;
     } else {

@@ -87,6 +87,7 @@ struct wvm_header {
 
 #define WVM_FLAG_ZERO 0x01
 #define WVM_FLAG_ERROR 0x02
+#define WVM_FLAG_NEED_ACK 0x04
 
 // --- 3. Payload 结构体 (Data Structures) ---
 
@@ -170,6 +171,7 @@ typedef struct wvm_ipc_header_t {
 #define WVM_IPC_TYPE_CPU_RUN         3
 #define WVM_IPC_TYPE_IRQ               4
 #define WVM_IPC_TYPE_COMMIT_DIFF     5
+#define WVM_IPC_TYPE_COMMIT_DIFF_SYNC 8
 #define WVM_IPC_TYPE_INVALIDATE       6 
 #define WVM_IPC_TYPE_BLOCK_IO         7
 
@@ -300,6 +302,7 @@ typedef struct {
     uint64_t sysenter_esp, sysenter_eip;
     uint64_t pat;
     uint32_t sysenter_cs;
+    uint32_t hflags;
     uint32_t hflags2;
     uint32_t a20_mask;
     uint32_t mp_state;

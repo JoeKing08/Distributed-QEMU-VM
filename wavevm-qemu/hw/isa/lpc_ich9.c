@@ -622,6 +622,11 @@ static void ich9_rst_cnt_write(void *opaque, hwaddr addr, uint64_t val,
 {
     ICH9LPCState *lpc = opaque;
 
+    fprintf(stderr,
+            "[WVM-RESET] ich9-rst-cnt write val=0x%llx len=%u current_cpu=%d\n",
+            (unsigned long long)val, len,
+            current_cpu ? current_cpu->cpu_index : -1);
+
     if (val & 4) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         return;

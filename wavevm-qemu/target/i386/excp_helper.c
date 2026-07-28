@@ -53,11 +53,27 @@ static int check_exception(CPUX86State *env, int intno, int *error_code,
 
 #if !defined(CONFIG_USER_ONLY)
     if (env->old_exception == EXCP08_DBLE) {
+        CPUState *cs = env_cpu(env);
+
         if (env->hflags & HF_GUEST_MASK) {
             cpu_vmexit(env, SVM_EXIT_SHUTDOWN, 0, retaddr); /* does not return */
         }
 
         qemu_log_mask(CPU_LOG_RESET, "Triple fault\n");
+        fprintf(stderr,
+                "[WVM-RESET] triple-fault cpu=%d rip=0x%llx cs=0x%x "
+                "cr0=0x%llx cr2=0x%llx cr3=0x%llx cr4=0x%llx "
+                "efer=0x%llx hflags=0x%x hflags2=0x%x "
+                "old_exception=0x%x new_exception=0x%x error_code=0x%x\n",
+                cs->cpu_index, (unsigned long long)env->eip,
+                env->segs[R_CS].selector,
+                (unsigned long long)env->cr[0],
+                (unsigned long long)env->cr[2],
+                (unsigned long long)env->cr[3],
+                (unsigned long long)env->cr[4],
+                (unsigned long long)env->efer,
+                env->hflags, env->hflags2,
+                env->old_exception, intno, *error_code);
 
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         return EXCP_HLT;
