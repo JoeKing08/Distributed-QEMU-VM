@@ -2,9 +2,13 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
+#include "hw/i386/apic.h"
+#include "hw/i386/apic_internal.h"
 #include "../../../common_include/wavevm_protocol.h"
 
 #if defined(TARGET_I386) || defined(TARGET_X86_64)
+
+QEMU_BUILD_BUG_ON(sizeof(X86XSaveArea) > WVM_TCG_XSAVE_AREA_SIZE);
 
 /*
  * Keep guest-visible/wakeup interrupt state in the remote TCG context.
@@ -18,10 +22,97 @@
      CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
      CPU_INTERRUPT_TGT_INT_1 | CPU_INTERRUPT_TGT_INT_2)
 
+static void wvm_tcg_get_lapic_state(CPUState *cpu,
+                                    wvm_tcg_lapic_state_t *dst)
+{
+    X86CPU *x86_cpu = X86_CPU(cpu);
+
+    memset(dst, 0, sizeof(*dst));
+    if (!x86_cpu->apic_state) {
+        return;
+    }
+
+    APICCommonState *apic = APIC_COMMON(x86_cpu->apic_state);
+    APICCommonClass *klass = APIC_COMMON_GET_CLASS(apic);
+
+    if (klass->pre_save) {
+        klass->pre_save(apic);
+    }
+
+    dst->valid = 1;
+    dst->apicbase = apic->apicbase;
+    dst->initial_apic_id = apic->initial_apic_id;
+    dst->spurious_vec = apic->spurious_vec;
+    memcpy(dst->isr, apic->isr, sizeof(dst->isr));
+    memcpy(dst->tmr, apic->tmr, sizeof(dst->tmr));
+    memcpy(dst->irr, apic->irr, sizeof(dst->irr));
+    memcpy(dst->lvt, apic->lvt, sizeof(dst->lvt));
+    dst->esr = apic->esr;
+    memcpy(dst->icr, apic->icr, sizeof(dst->icr));
+    dst->divide_conf = apic->divide_conf;
+    dst->initial_count = apic->initial_count;
+    dst->count_shift = apic->count_shift;
+    dst->initial_count_load_time = apic->initial_count_load_time;
+    dst->next_time = apic->next_time;
+    dst->timer_expiry = apic->timer_expiry;
+    dst->sipi_vector = apic->sipi_vector;
+    dst->wait_for_sipi = apic->wait_for_sipi;
+    dst->id = apic->id;
+    dst->arb_id = apic->arb_id;
+    dst->tpr = apic->tpr;
+    dst->log_dest = apic->log_dest;
+    dst->dest_mode = apic->dest_mode;
+    dst->version = apic->version;
+}
+
+static void wvm_tcg_set_lapic_state(CPUState *cpu,
+                                    const wvm_tcg_lapic_state_t *src)
+{
+    X86CPU *x86_cpu = X86_CPU(cpu);
+
+    if (!src->valid || !x86_cpu->apic_state) {
+        return;
+    }
+
+    APICCommonState *apic = APIC_COMMON(x86_cpu->apic_state);
+    APICCommonClass *klass = APIC_COMMON_GET_CLASS(apic);
+
+    apic->apicbase = src->apicbase;
+    apic->initial_apic_id = src->initial_apic_id;
+    apic->spurious_vec = src->spurious_vec;
+    memcpy(apic->isr, src->isr, sizeof(apic->isr));
+    memcpy(apic->tmr, src->tmr, sizeof(apic->tmr));
+    memcpy(apic->irr, src->irr, sizeof(apic->irr));
+    memcpy(apic->lvt, src->lvt, sizeof(apic->lvt));
+    apic->esr = src->esr;
+    memcpy(apic->icr, src->icr, sizeof(apic->icr));
+    apic->divide_conf = src->divide_conf;
+    apic->initial_count = src->initial_count;
+    apic->count_shift = src->count_shift;
+    apic->initial_count_load_time = src->initial_count_load_time;
+    apic->next_time = src->next_time;
+    apic->timer_expiry = src->timer_expiry;
+    apic->sipi_vector = src->sipi_vector;
+    apic->wait_for_sipi = src->wait_for_sipi;
+    apic->id = src->id;
+    apic->arb_id = src->arb_id;
+    apic->tpr = src->tpr;
+    apic->log_dest = src->log_dest;
+    apic->dest_mode = src->dest_mode;
+    apic->version = src->version;
+
+    if (klass->post_load) {
+        klass->post_load(apic);
+    }
+    apic_poll_irq(x86_cpu->apic_state);
+}
+
 // Export QEMU TCG state to network packet
 void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
+
+    memset(ctx, 0, sizeof(*ctx));
 
     // 1. General Registers
     memcpy(ctx->regs, env->regs, sizeof(ctx->regs));
@@ -112,6 +203,14 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->df            = env->df;
     ctx->error_code    = 0;
     ctx->exception_is_int = 0;
+    wvm_tcg_get_lapic_state(cpu, &ctx->lapic);
+    {
+        X86XSaveArea xsave;
+
+        x86_cpu_xsave_all_areas(x86_cpu, &xsave);
+        ctx->xsave_size = sizeof(xsave);
+        memcpy(ctx->xsave_area, &xsave, sizeof(xsave));
+    }
 }
 
 // Import state from network packet to QEMU TCG
@@ -213,6 +312,21 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->df            = ctx->df;
     env->error_code    = 0;
     env->exception_is_int = 0;
+    if (ctx->xsave_size > 0) {
+        X86XSaveArea xsave;
+        size_t xsave_size = ctx->xsave_size;
+
+        if (xsave_size > sizeof(xsave)) {
+            xsave_size = sizeof(xsave);
+        }
+        memset(&xsave, 0, sizeof(xsave));
+        memcpy(&xsave, ctx->xsave_area, xsave_size);
+        x86_cpu_xrstor_all_areas(x86_cpu, &xsave);
+        update_fp_status(env);
+        update_mxcsr_status(env);
+        cpu_sync_bndcs_hflags(env);
+    }
+    wvm_tcg_set_lapic_state(cpu, &ctx->lapic);
 
     /* Recompute QEMU's hidden execution flags using the native x86 helper.
      * Hand-rolled reconstruction missed CPL/TF/IOPL and can leave imported

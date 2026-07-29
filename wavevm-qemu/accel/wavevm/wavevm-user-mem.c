@@ -335,6 +335,7 @@ static void buffer_future_packet(uint64_t gpa, uint64_t version, uint16_t type, 
 
 /* [FIX-F3] Forward declaration: KVM proactive page fetch (defined after request_page_sync) */
 static void kvm_proactive_page_fetch(uint64_t gpa);
+int wavevm_user_mem_sync_page(uint64_t gpa);
 static int request_page_sync(uintptr_t fault_addr, bool is_write);
 
 /*
@@ -490,6 +491,19 @@ hit:
 
 static WritablePage *g_writable_pages_list = NULL;
 static pthread_mutex_t g_dirty_flush_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct WVMHandoffDirtyRecord {
+    uint64_t gpa;
+    ram_addr_t ra;
+    uint64_t old_version;
+    uint64_t new_version;
+} WVMHandoffDirtyRecord;
+
+typedef struct WVMHandoffDirtyJournal {
+    WVMHandoffDirtyRecord *items;
+    size_t count;
+    size_t capacity;
+} WVMHandoffDirtyJournal;
 
 // 线程局部
 static __thread int t_com_sock = -1;
@@ -682,8 +696,12 @@ void wvm_register_volatile_ram(uint64_t gpa, uint64_t size) {
  * 修复：在 KVM 模式下检测到版本断层时，主动通过 IPC 向 Master 发起同步页面拉取，
  * 将最新数据写入 HVA 并更新版本号。不依赖 guest 触发的 SIGSEGV。
  */
-static void kvm_proactive_page_fetch(uint64_t gpa) {
-    if (!g_ram_base) return;
+int wavevm_user_mem_sync_page(uint64_t gpa)
+{
+    gpa &= ~4095ULL;
+    if (!g_ram_base) {
+        return -ENODEV;
+    }
 
     /* 使用线程局部 IPC socket (与 request_page_sync Master 路径相同) */
     if (!g_is_slave) {
@@ -691,9 +709,9 @@ static void kvm_proactive_page_fetch(uint64_t gpa) {
         if (t_com_sock == -1) {
             t_com_sock = internal_connect_master();
             if (t_com_sock < 0) {
-                fprintf(stderr, "[FIX-F3] KVM proactive fetch: IPC connect failed for GPA 0x%"
+                fprintf(stderr, "[WaveVM-User] sync page: IPC connect failed for GPA 0x%"
                         PRIx64 "\n", gpa);
-                return;
+                return -ENOTCONN;
             }
         }
 
@@ -706,42 +724,50 @@ static void kvm_proactive_page_fetch(uint64_t gpa) {
             /* 连接断开，关闭以便下次重建 */
             close(t_com_sock);
             t_com_sock = -1;
-            fprintf(stderr, "[FIX-F3] KVM proactive fetch: IPC send failed for GPA 0x%"
+            fprintf(stderr, "[WaveVM-User] sync page: IPC send failed for GPA 0x%"
                     PRIx64 "\n", gpa);
-            return;
+            return -EIO;
         }
 
         struct wvm_ipc_fault_ack ack;
         if (read_exact(t_com_sock, &ack, sizeof(ack)) < 0) {
             close(t_com_sock);
             t_com_sock = -1;
-            fprintf(stderr, "[FIX-F3] KVM proactive fetch: IPC recv failed for GPA 0x%"
+            fprintf(stderr, "[WaveVM-User] sync page: IPC recv failed for GPA 0x%"
                     PRIx64 "\n", gpa);
-            return;
+            return -EIO;
         }
 
         if (ack.status == 0) {
-            if (ensure_local_shm_shadow() == 0 && gpa + 4096 <= g_ram_size) {
-                void *fetch_hva = gpa_to_hva_safe(gpa);
-                if (fetch_hva) {
-                    mprotect(fetch_hva, 4096, PROT_READ | PROT_WRITE);
-                    memcpy(fetch_hva, (uint8_t *)g_shm_shadow + gpa, 4096);
-                    /* KVM 模式下不降权：脏页由 dirty log 跟踪，
-                     * mprotect(PROT_READ) 会导致 EPT 违例 → exit=17 */
-                }
+            void *fetch_hva = gpa_to_hva_safe(gpa);
+            if (!fetch_hva) {
+                return -EFAULT;
             }
+            mprotect(fetch_hva, 4096, PROT_READ | PROT_WRITE);
+            memcpy(fetch_hva, ack.data, 4096);
+            /* KVM 模式下不降权：脏页由 dirty log 跟踪，
+             * mprotect(PROT_READ) 会导致 EPT 违例 → exit=17 */
             set_local_page_version(gpa, ack.version);
+            return 0;
         }
+        return ack.status;
     } else {
         /* Slave 模式：复用 request_page_sync 的 UDP 路径。
          * 由于 request_page_sync 接受 fault_addr (HVA) 参数，
          * 这里构造 HVA 并直接调用它。
          */
         void *fetch_hva = gpa_to_hva_safe(gpa);
-        if (!fetch_hva) return;
+        if (!fetch_hva) {
+            return -EFAULT;
+        }
         uintptr_t fault_addr = (uintptr_t)fetch_hva;
-        request_page_sync(fault_addr, false);
+        return request_page_sync(fault_addr, false);
     }
+}
+
+static void kvm_proactive_page_fetch(uint64_t gpa)
+{
+    (void)wavevm_user_mem_sync_page(gpa);
 }
 
 // =============================================================
@@ -793,11 +819,8 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
         if (read_exact(t_com_sock, &ack, sizeof(ack)) < 0) return -1;
 
         if (ack.status == 0) {
-            if (ensure_local_shm_shadow() < 0 || gpa + 4096 > g_ram_size) {
-                return -1;
-            }
             mprotect((void *)aligned_addr, 4096, PROT_READ | PROT_WRITE);
-            memcpy((void *)aligned_addr, (uint8_t *)g_shm_shadow + gpa, 4096);
+            memcpy((void *)aligned_addr, ack.data, 4096);
             set_local_page_version(gpa, ack.version); // 同步版本
             return 0;
         }
@@ -1174,13 +1197,99 @@ static int send_full_page_diff_to_ipc_fd(int fd, uint64_t gpa,
     return 0;
 }
 
-void wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd)
+static void free_handoff_dirty_journal(WVMHandoffDirtyJournal *journal)
+{
+    if (!journal) {
+        return;
+    }
+    free(journal->items);
+    free(journal);
+}
+
+static int append_handoff_dirty_record(WVMHandoffDirtyJournal **journalp,
+                                       uint64_t gpa, ram_addr_t ra,
+                                       uint64_t old_version,
+                                       uint64_t new_version)
+{
+    WVMHandoffDirtyJournal *journal = *journalp;
+
+    if (!journal) {
+        journal = calloc(1, sizeof(*journal));
+        if (!journal) {
+            return -ENOMEM;
+        }
+        *journalp = journal;
+    }
+
+    if (journal->count == journal->capacity) {
+        size_t new_capacity = journal->capacity ? journal->capacity * 2 : 256;
+        WVMHandoffDirtyRecord *new_items =
+            realloc(journal->items, new_capacity * sizeof(*new_items));
+        if (!new_items) {
+            return -ENOMEM;
+        }
+        journal->items = new_items;
+        journal->capacity = new_capacity;
+    }
+
+    journal->items[journal->count++] = (WVMHandoffDirtyRecord) {
+        .gpa = gpa,
+        .ra = ra,
+        .old_version = old_version,
+        .new_version = new_version,
+    };
+    return 0;
+}
+
+static void rollback_handoff_dirty_locked(WVMHandoffDirtyJournal *journal)
+{
+    for (size_t i = 0; journal && i < journal->count; i++) {
+        WVMHandoffDirtyRecord *rec = &journal->items[i];
+        if (get_local_page_version(rec->gpa) == rec->new_version) {
+            set_local_page_version(rec->gpa, rec->old_version);
+        }
+        cpu_physical_memory_set_dirty_range(rec->ra, 4096,
+                                            1 << DIRTY_MEMORY_MIGRATION);
+    }
+}
+
+void wavevm_user_mem_finish_handoff_dirty(WVMHandoffDirtyJournal *journal,
+                                          int commit_ok)
+{
+    static int finish_log_count;
+
+    if (!journal) {
+        return;
+    }
+
+    if (!commit_ok) {
+        pthread_mutex_lock(&g_dirty_flush_lock);
+        rollback_handoff_dirty_locked(journal);
+        pthread_mutex_unlock(&g_dirty_flush_lock);
+        if (finish_log_count < 20) {
+            fprintf(stderr,
+                    "[WaveVM-User] handoff dirty rollback pages=%zu\n",
+                    journal->count);
+            finish_log_count++;
+        }
+    }
+
+    free_handoff_dirty_journal(journal);
+}
+
+int wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd,
+                                       WVMHandoffDirtyJournal **journal_out)
 {
     int flushed = 0;
+    int skipped_zero = 0;
     static int flush_log_count = 0;
+    WVMHandoffDirtyJournal *journal = NULL;
 
+    if (journal_out) {
+        *journal_out = NULL;
+    }
     if (ipc_fd < 0 || g_is_slave || g_block_count <= 0) {
-        return;
+        return 0;
     }
 
     pthread_mutex_lock(&g_dirty_flush_lock);
@@ -1208,23 +1317,81 @@ void wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd)
 
             uint64_t gpa = blk->gpa_start + off;
             void *hva = (void *)(blk->hva_start + off);
-            uint64_t ver = get_local_page_version(gpa) + 1;
-            if (send_full_page_diff_to_ipc_fd(ipc_fd, gpa, ver, hva) < 0) {
+            uint64_t cur_ver = get_local_page_version(gpa);
+            if (cur_ver == 0 && is_page_all_zero(hva)) {
+                /*
+                 * Directory SHM starts zeroed and a newly created page meta starts
+                 * at version 1.  Do not turn QEMU's initial zero-fill dirty bits
+                 * into millions of full-page network commits; record that this
+                 * local snapshot matches the implicit zero version instead.
+                 */
+                set_local_page_version(gpa, 1);
+                skipped_zero++;
+                continue;
+            }
+
+            uint64_t ver = cur_ver + 1;
+            if (append_handoff_dirty_record(&journal, gpa, ra, cur_ver, ver) < 0) {
+                int saved_errno = ENOMEM;
+                cpu_physical_memory_set_dirty_range(ra, 4096,
+                                                    1 << DIRTY_MEMORY_MIGRATION);
+                if (journal_out) {
+                    *journal_out = journal;
+                    journal = NULL;
+                } else {
+                    rollback_handoff_dirty_locked(journal);
+                }
                 pthread_mutex_unlock(&g_dirty_flush_lock);
-                return;
+                if (flush_log_count < 20) {
+                    fprintf(stderr,
+                            "[WaveVM-User] handoff dirty journal failed gpa=%#llx "
+                            "sent=%d skipped_zero=%d fd=%d errno=%d\n",
+                            (unsigned long long)gpa, flushed, skipped_zero,
+                            ipc_fd, saved_errno);
+                    flush_log_count++;
+                }
+                free_handoff_dirty_journal(journal);
+                return -ENOMEM;
+            }
+            if (send_full_page_diff_to_ipc_fd(ipc_fd, gpa, ver, hva) < 0) {
+                int saved_errno = errno;
+                if (journal_out) {
+                    *journal_out = journal;
+                    journal = NULL;
+                } else {
+                    rollback_handoff_dirty_locked(journal);
+                }
+                pthread_mutex_unlock(&g_dirty_flush_lock);
+                if (flush_log_count < 20) {
+                    fprintf(stderr,
+                            "[WaveVM-User] handoff dirty flush failed gpa=%#llx "
+                            "sent=%d skipped_zero=%d fd=%d errno=%d\n",
+                            (unsigned long long)gpa, flushed, skipped_zero,
+                            ipc_fd, saved_errno);
+                    flush_log_count++;
+                }
+                free_handoff_dirty_journal(journal);
+                return -EIO;
             }
             set_local_page_version(gpa, ver);
             flushed++;
         }
     }
 
+    if (journal_out) {
+        *journal_out = journal;
+        journal = NULL;
+    }
     pthread_mutex_unlock(&g_dirty_flush_lock);
+    free_handoff_dirty_journal(journal);
 
-    if (flushed > 0 && flush_log_count < 20) {
-        fprintf(stderr, "[WaveVM-User] handoff dirty flush pages=%d fd=%d\n",
-                flushed, ipc_fd);
+    if ((flushed > 0 || skipped_zero > 0) && flush_log_count < 20) {
+        fprintf(stderr,
+                "[WaveVM-User] handoff dirty flush pages=%d skipped_zero=%d fd=%d\n",
+                flushed, skipped_zero, ipc_fd);
         flush_log_count++;
     }
+    return 0;
 }
 
 uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset, int *ok)
@@ -1660,6 +1827,54 @@ static long wait_for_directory_ack_safe(void) {
  * [关键逻辑] 1. 维护重排窗口（Reorder Window）填补版本空洞；2. 执行延迟刷新（Lazy Flush）以合并 mprotect 调用。
  * [后果] 延迟刷新是性能的救星。若每收到一个 Diff 都执行一次 TLB Shootdown，vCPU 的有效执行时间将缩减到不足 10%。
  */
+static void process_push_net_packet(struct wvm_header *hdr, void *payload,
+                                    uint16_t p_len)
+{
+    uint16_t msg_type = ntohs(hdr->msg_type);
+
+    if (msg_type == MSG_PAGE_PUSH_DIFF) {
+        if (p_len < sizeof(struct wvm_diff_log)) {
+            return;
+        }
+
+        struct wvm_diff_log* log = (struct wvm_diff_log*)payload;
+        uint64_t gpa = WVM_NTOHLL(log->gpa);
+        uint64_t push_ver = WVM_NTOHLL(log->version);
+        uint64_t local_ver = get_local_page_version(gpa);
+
+        if (is_next_version(local_ver, push_ver)) {
+            wvm_apply_remote_push(msg_type, payload);
+            while (check_and_apply_next(gpa, 0)) ;
+        } else if (is_newer_version(local_ver, push_ver) &&
+                   !is_next_version(local_ver, push_ver)) {
+            if (!is_newer_version(local_ver + REORDER_WIN_SIZE, push_ver)) {
+                buffer_future_packet(gpa, push_ver, msg_type, payload, p_len);
+            } else {
+                if (!kvm_enabled() && g_fault_hook_enabled) {
+                    void *inv_hva = gpa_to_hva_safe(gpa);
+                    if (inv_hva) {
+                        mprotect(inv_hva, 4096, PROT_NONE);
+                    }
+                }
+                set_local_page_version(gpa, 0);
+                if (kvm_enabled()) {
+                    kvm_proactive_page_fetch(gpa);
+                }
+            }
+        }
+    } else if (msg_type == MSG_PAGE_PUSH_FULL || msg_type == MSG_FORCE_SYNC) {
+        wvm_apply_remote_push(msg_type, payload);
+    } else if (msg_type == MSG_RPC_BATCH_MEMSET) {
+        wvm_apply_remote_push(msg_type, payload);
+    } else if (msg_type == MSG_MEM_ACK &&
+               WVM_NTOHLL(hdr->req_id) == SYNC_MAGIC) {
+        pthread_mutex_lock(&g_sync_lock);
+        g_ack_received = 1;
+        pthread_cond_signal(&g_sync_cond);
+        pthread_mutex_unlock(&g_sync_lock);
+    }
+}
+
 static void *mem_push_listener_thread(void *arg) {
     StreamBuffer sb;
     sb_init(&sb);
@@ -1716,82 +1931,54 @@ static void *mem_push_listener_thread(void *arg) {
         }
         sb.tail += n;
 
-        // [Stage 2] 批量解析与应用
+        // [Stage 2] Parse raw WaveVM datagrams from the slave proxy, while
+        // retaining compatibility with IPC-framed packets.
         while (sb.tail - sb.head >= sizeof(struct wvm_ipc_header_t)) {
-            struct wvm_ipc_header_t *ipc = (struct wvm_ipc_header_t *)(sb.buffer + sb.head);
-            size_t total_msg_len = sizeof(struct wvm_ipc_header_t) + ipc->len;
+            uint8_t *cur = sb.buffer + sb.head;
+            size_t avail = sb.tail - sb.head;
+            size_t total_msg_len = 0;
 
-            if (sb.tail - sb.head < total_msg_len) break; // 数据未收全，等待下一轮
-
-            // 指向 WVM 协议头
-            void *data = sb.buffer + sb.head + sizeof(struct wvm_ipc_header_t);
-
-            // 只有 INVALIDATE 类型的 IPC 消息才包含网络包数据
-            if (ipc->type == WVM_IPC_TYPE_INVALIDATE) {
-                struct wvm_header *hdr = (struct wvm_header *)data;
-                void *payload = data + sizeof(struct wvm_header);
-                uint16_t msg_type = ntohs(hdr->msg_type);
-
-                // [FIXED] 提取包长度，供乱序重排使用
-                uint16_t p_len = ntohs(hdr->payload_len);
-
-                // --- 逻辑 A: Diff 推送 (带乱序处理) ---
-                if (msg_type == MSG_PAGE_PUSH_DIFF) {
-                    struct wvm_diff_log* log = (struct wvm_diff_log*)payload;
-                    uint64_t gpa = WVM_NTOHLL(log->gpa);
-                    uint64_t push_ver = WVM_NTOHLL(log->version);
-                    uint64_t local_ver = get_local_page_version(gpa);
-
-                    if (is_next_version(local_ver, push_ver)) {
-                        // 顺序到达：直接应用 (内部调用 defer_ro_protect，保持 RW)
-                        wvm_apply_remote_push(msg_type, payload);
-
-                        // 链式反应：检查重排缓冲区是否有 v+2, v+3...
-                        // 只要能应用成功，就继续。参数虽然传了，但函数内部现在会动态寻找真正的“下一跳”。
-                        while (check_and_apply_next(gpa, 0)) ;
-
-                    } else if (is_newer_version(local_ver, push_ver) && !is_next_version(local_ver, push_ver)) {
-                        // 乱序到达：存入重排窗口
-                        if (!is_newer_version(local_ver + REORDER_WIN_SIZE, push_ver)) {
-                            // [Safety] 这里使用 p_len 确保拷贝完整
-                            buffer_future_packet(gpa, push_ver, msg_type, payload, p_len);
-                        } else {
-                            // 严重乱序：回退到 Pull 模式
-                            // 这种情况下必须立即锁回，不能 Lazy，因为状态已重置
-                            if (!kvm_enabled() && g_fault_hook_enabled) {
-                                void *inv_hva2 = gpa_to_hva_safe(gpa);
-                                if (inv_hva2) mprotect(inv_hva2, 4096, PROT_NONE);
-                            }
-                            set_local_page_version(gpa, 0);
-                            // [FIX-F3] KVM 下主动拉取，替代 SIGSEGV 驱动的缺页
-                            if (kvm_enabled()) {
-                                kvm_proactive_page_fetch(gpa);
-                            }
-                        }
+            if (avail >= sizeof(struct wvm_header)) {
+                struct wvm_header *raw = (struct wvm_header *)cur;
+                if (ntohl(raw->magic) == WVM_MAGIC) {
+                    uint16_t p_len = ntohs(raw->payload_len);
+                    total_msg_len = sizeof(struct wvm_header) + p_len;
+                    if (avail < total_msg_len) {
+                        break;
                     }
-                }
-                // --- 逻辑 B: 全页推送 / 强制同步 ---
-                else if (msg_type == MSG_PAGE_PUSH_FULL || msg_type == MSG_FORCE_SYNC) {
-                    wvm_apply_remote_push(msg_type, payload);
-                }
-                // --- 逻辑 C: Prophet RPC (V29 保留) ---
-                else if (msg_type == MSG_RPC_BATCH_MEMSET) {
-                    // Prophet 通知。这里不需要 Lazy Flush，因为 RPC 执行通常是原子的
-                    wvm_apply_remote_push(msg_type, payload);
-                }
-                // --- 逻辑 D: 同步 ACK (Sync Batch 闭环) ---
-                else if (msg_type == MSG_MEM_ACK && WVM_NTOHLL(hdr->req_id) == SYNC_MAGIC) {
-                    // 收到 Directory 的确认，说明 sync_batch 内的所有 diff 都已落盘
-                    // 唤醒 Harvester 线程继续发送下一批
-                    pthread_mutex_lock(&g_sync_lock);
-                    g_ack_received = 1;
-                    pthread_cond_signal(&g_sync_cond);
-                    pthread_mutex_unlock(&g_sync_lock);
+                    process_push_net_packet(raw, cur + sizeof(struct wvm_header),
+                                            p_len);
+                    sb.head += total_msg_len;
+                    continue;
                 }
             }
 
-            // 移动环形缓冲区指针
-            sb.head += total_msg_len;
+            struct wvm_ipc_header_t *ipc = (struct wvm_ipc_header_t *)cur;
+            if (ipc->type == WVM_IPC_TYPE_INVALIDATE &&
+                ipc->len >= sizeof(struct wvm_header) &&
+                ipc->len <= WVM_MAX_PACKET_SIZE) {
+                total_msg_len = sizeof(struct wvm_ipc_header_t) + ipc->len;
+                if (avail < total_msg_len) {
+                    break;
+                }
+
+                struct wvm_header *hdr =
+                    (struct wvm_header *)(cur + sizeof(struct wvm_ipc_header_t));
+                if (ntohl(hdr->magic) == WVM_MAGIC) {
+                    uint16_t p_len = ntohs(hdr->payload_len);
+                    if (sizeof(struct wvm_header) + p_len <= ipc->len) {
+                        process_push_net_packet(hdr,
+                                                (uint8_t *)hdr + sizeof(*hdr),
+                                                p_len);
+                    }
+                }
+                sb.head += total_msg_len;
+                continue;
+            }
+
+            // Resynchronize after an unexpected byte; prevents one malformed
+            // datagram from wedging the listener forever.
+            sb.head++;
         }
         sb_compact(&sb);
 
@@ -1806,6 +1993,7 @@ static void *mem_push_listener_thread(void *arg) {
 
 // --- 初始化 ---
 void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
+    static bool push_listener_started;
     g_ram_base = ram_ptr;
     g_ram_size = ram_size;
     if (!getenv("WVM_SOCK_REQ")) {
@@ -1864,15 +2052,60 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
 
         printf("[WaveVM-User] V29 Wavelet Engine Active (Slave ID: %d)\n", g_slave_id);
 
-        g_threads_running = true;
-        pthread_create(&g_listen_thread, NULL, mem_push_listener_thread, NULL);
-        pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
+        if (!push_listener_started) {
+            g_threads_running = true;
+            if (pthread_create(&g_listen_thread, NULL,
+                               mem_push_listener_thread, NULL) == 0) {
+                push_listener_started = true;
+            }
+        }
+        if (kvm_enabled()) {
+            pthread_create(&g_harvester_thread, NULL, diff_harvester_thread_fn, NULL);
+        } else {
+            /*
+             * A TCG slave vCPU slice is a causal execution unit: memory writes
+             * must be committed and fenced immediately before the CPU state ACK.
+             * The async harvester can otherwise race that handoff and let memory
+             * packets overtake or lag behind the returned vCPU context.
+             */
+            fprintf(stderr, "[WaveVM-User] TCG slave dirty flush is handoff-synchronous\n");
+        }
     }
-    // Master TCG dirty pages are flushed synchronously on CPU handoff.
-    // Do not start the async harvester here: it has no ordering against the
-    // per-vCPU IPC stream and can race the handoff fence.
-    else if (!kvm_enabled()) {
-        printf("[WaveVM-User] V31 Master TCG Handoff Dirty Flush Active\n");
+    else {
+        /*
+         * Master QEMU also needs a dedicated async push channel: remote
+         * directories send FORCE_SYNC/PAGE_PUSH updates back to this process
+         * when a local writer is stale.  vCPU RPC sockets are synchronous and
+         * cannot safely double as the push listener.
+         */
+        if (g_fd_push < 0) {
+            g_fd_push = internal_connect_master();
+        }
+        if (g_fd_push >= 0 && !push_listener_started) {
+            g_threads_running = true;
+            if (pthread_create(&g_listen_thread, NULL,
+                               mem_push_listener_thread, NULL) == 0) {
+                push_listener_started = true;
+                fprintf(stderr, "[WaveVM-User] master async push listener active fd=%d\n",
+                        g_fd_push);
+            } else {
+                fprintf(stderr, "[WaveVM-User] master async push listener start failed errno=%d\n",
+                        errno);
+                close(g_fd_push);
+                g_fd_push = -1;
+            }
+        } else if (g_fd_push < 0) {
+            fprintf(stderr, "[WaveVM-User] master async push connect failed errno=%d\n",
+                    errno);
+        }
+        if (!kvm_enabled()) {
+            /*
+             * Master TCG dirty pages are flushed synchronously on CPU handoff.
+             * Do not start the async harvester here: it has no ordering against
+             * the per-vCPU IPC stream and can race the handoff fence.
+             */
+            printf("[WaveVM-User] V31 Master TCG Handoff Dirty Flush Active\n");
+        }
     }
 
     if (!kvm_enabled() && g_fault_hook_enabled) {

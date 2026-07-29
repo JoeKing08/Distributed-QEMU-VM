@@ -182,7 +182,12 @@ static int read_full(int fd, void *buf, size_t len)
 extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wavevm_slave_vcpu_loop(CPUState *cpu);
-extern void wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd);
+typedef struct WVMHandoffDirtyJournal WVMHandoffDirtyJournal;
+extern int wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd,
+                                              WVMHandoffDirtyJournal **journal_out);
+extern void wavevm_user_mem_finish_handoff_dirty(WVMHandoffDirtyJournal *journal,
+                                                 int commit_ok);
+extern int wavevm_user_mem_sync_page(uint64_t gpa);
 extern uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset,
                                                int *ok);
 
@@ -200,6 +205,53 @@ extern uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset,
      CPU_INTERRUPT_VIRQ | CPU_INTERRUPT_TPR)
 
 static pthread_once_t g_wavevm_tcg_region_once = PTHREAD_ONCE_INIT;
+static QemuMutex g_wavevm_tcg_slice_lock;
+static QemuCond g_wavevm_tcg_slice_cond;
+static int g_wavevm_tcg_local_active;
+static bool g_wavevm_tcg_remote_pending;
+static bool g_wavevm_tcg_remote_active;
+
+static void wavevm_tcg_local_slice_enter(void)
+{
+    qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
+    while (g_wavevm_tcg_remote_pending || g_wavevm_tcg_remote_active) {
+        qemu_cond_wait(&g_wavevm_tcg_slice_cond, &g_wavevm_tcg_slice_lock);
+    }
+    g_wavevm_tcg_local_active++;
+    qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
+}
+
+static void wavevm_tcg_local_slice_leave(void)
+{
+    qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
+    if (g_wavevm_tcg_local_active > 0) {
+        g_wavevm_tcg_local_active--;
+    }
+    if (g_wavevm_tcg_local_active == 0) {
+        qemu_cond_broadcast(&g_wavevm_tcg_slice_cond);
+    }
+    qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
+}
+
+static void wavevm_tcg_remote_slice_enter(void)
+{
+    qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
+    g_wavevm_tcg_remote_pending = true;
+    while (g_wavevm_tcg_local_active > 0 || g_wavevm_tcg_remote_active) {
+        qemu_cond_wait(&g_wavevm_tcg_slice_cond, &g_wavevm_tcg_slice_lock);
+    }
+    g_wavevm_tcg_remote_active = true;
+    g_wavevm_tcg_remote_pending = false;
+    qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
+}
+
+static void wavevm_tcg_remote_slice_leave(void)
+{
+    qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
+    g_wavevm_tcg_remote_active = false;
+    qemu_cond_broadcast(&g_wavevm_tcg_slice_cond);
+    qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
+}
 
 static void wavevm_init_tcg_region_once(void)
 {
@@ -214,6 +266,8 @@ static void wavevm_init_tcg_region_once(void)
     extern bool parallel_cpus;
     mttcg_enabled = true;
     parallel_cpus = true;
+    qemu_mutex_init(&g_wavevm_tcg_slice_lock);
+    qemu_cond_init(&g_wavevm_tcg_slice_cond);
     tcg_region_init();
 }
 
@@ -1056,7 +1110,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
 
         // 1. 准备请求结构体
         struct wvm_ipc_cpu_run_req req;
-        struct wvm_ipc_cpu_run_ack ack;
+        struct wvm_ipc_cpu_run_ack ack = {0};
         memset(&req, 0, sizeof(req));
         
         req.slave_id = WVM_NODE_AUTO_ROUTE;
@@ -1214,7 +1268,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
     };
     struct wvm_ipc_cpu_run_req req;
     struct wvm_ipc_cpu_run_ack ack;
+    WVMHandoffDirtyJournal *dirty_journal = NULL;
+    bool tcg_slice_active = false;
     memset(&req, 0, sizeof(req));
+    memset(&ack, 0, sizeof(ack));
 
     req.slave_id = WVM_NODE_AUTO_ROUTE;
     req.vcpu_index = cpu->cpu_index;
@@ -1401,10 +1458,27 @@ static void wavevm_remote_exec(CPUState *cpu) {
     }
 
     if (req.mode_tcg) {
-        wavevm_user_mem_flush_dirty_to_ipc(vcpu_sock);
+        int ci = cpu->cpu_index < MAX_VCPUS ? cpu->cpu_index : 0;
+        static int handoff_dbg[MAX_VCPUS] = {0};
+        wavevm_tcg_remote_slice_enter();
+        tcg_slice_active = true;
+        if (handoff_dbg[ci] < 20) {
+            fprintf(stderr, "[WVM-TCG-HANDOFF] cpu=%d flush begin fd=%d\n",
+                    cpu->cpu_index, vcpu_sock);
+        }
+        int flush_ret = wavevm_user_mem_flush_dirty_to_ipc(vcpu_sock,
+                                                           &dirty_journal);
+        if (handoff_dbg[ci] < 20) {
+            fprintf(stderr, "[WVM-TCG-HANDOFF] cpu=%d flush done fd=%d ret=%d\n",
+                    cpu->cpu_index, vcpu_sock, flush_ret);
+        }
+        if (flush_ret < 0) {
+            wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
+            wavevm_tcg_remote_slice_leave();
+            return;
+        }
         {
             static int cr3_dbg[MAX_VCPUS] = {0};
-            int ci = cpu->cpu_index < MAX_VCPUS ? cpu->cpu_index : 0;
             if (cr3_dbg[ci] < 20) {
                 int ok = 0;
                 uint64_t pml4e508 =
@@ -1418,22 +1492,75 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 cr3_dbg[ci]++;
             }
         }
+        handoff_dbg[ci]++;
     }
 
     // 2. IPC 发送 (wvm_ipc_header + wvm_ipc_cpu_run_req)
+    int tcg_ipc_dbg_ci = cpu->cpu_index < MAX_VCPUS ? cpu->cpu_index : 0;
+    static int tcg_ipc_dbg[MAX_VCPUS] = {0};
+    if (req.mode_tcg && tcg_ipc_dbg[tcg_ipc_dbg_ci] < 20) {
+        fprintf(stderr, "[WVM-TCG-IPC] cpu=%d write CPU_RUN begin fd=%d\n",
+                cpu->cpu_index, vcpu_sock);
+    }
     if (write_full(vcpu_sock, &ipc_hdr, sizeof(ipc_hdr)) < 0) {
+        if (req.mode_tcg) {
+            fprintf(stderr, "[WVM-TCG-IPC] cpu=%d write header failed fd=%d errno=%d\n",
+                    cpu->cpu_index, vcpu_sock, errno);
+            wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
+            if (tcg_slice_active) {
+                wavevm_tcg_remote_slice_leave();
+            }
+        }
         return;
     }
     if (write_full(vcpu_sock, &req, sizeof(req)) < 0) {
+        if (req.mode_tcg) {
+            fprintf(stderr, "[WVM-TCG-IPC] cpu=%d write payload failed fd=%d errno=%d\n",
+                    cpu->cpu_index, vcpu_sock, errno);
+            wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
+            if (tcg_slice_active) {
+                wavevm_tcg_remote_slice_leave();
+            }
+        }
         return;
     }
 
     // 3. IPC 接收 ACK (阻塞本线程，不影响其他 vCPU)
+    if (req.mode_tcg && tcg_ipc_dbg[tcg_ipc_dbg_ci] < 20) {
+        fprintf(stderr, "[WVM-TCG-IPC] cpu=%d write CPU_RUN done, wait ack fd=%d\n",
+                cpu->cpu_index, vcpu_sock);
+        tcg_ipc_dbg[tcg_ipc_dbg_ci]++;
+    }
     if (read_full(vcpu_sock, &ack, sizeof(ack)) < 0) {
+        if (req.mode_tcg) {
+            fprintf(stderr, "[WVM-TCG-IPC] cpu=%d read ack failed fd=%d errno=%d\n",
+                    cpu->cpu_index, vcpu_sock, errno);
+            wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
+            if (tcg_slice_active) {
+                wavevm_tcg_remote_slice_leave();
+            }
+        }
         return;
     }
     if (ack.status < 0) {
+        if (req.mode_tcg) {
+            wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
+            int sync_ret = 0;
+            if (ack.error_gpa != 0) {
+                sync_ret = wavevm_user_mem_sync_page(ack.error_gpa);
+            }
+            fprintf(stderr,
+                    "[WVM-TCG-IPC] cpu=%d ack status=%d mode=%u error_gpa=%#llx sync_ret=%d\n",
+                    cpu->cpu_index, ack.status, ack.mode_tcg,
+                    (unsigned long long)ack.error_gpa, sync_ret);
+            if (tcg_slice_active) {
+                wavevm_tcg_remote_slice_leave();
+            }
+        }
         return;
+    }
+    if (req.mode_tcg) {
+        wavevm_user_mem_finish_handoff_dirty(dirty_journal, 1);
     }
 
     // 4. 反序列化 CPU 状态
@@ -1443,7 +1570,15 @@ static void wavevm_remote_exec(CPUState *cpu) {
         wvm_tcg_set_state(cpu, &ack.ctx.tcg);
         cpu->interrupt_request |= master_irq;
         cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
+        if (tcg_slice_active) {
+            wavevm_tcg_remote_slice_leave();
+            tcg_slice_active = false;
+        }
     } else {
+        if (tcg_slice_active) {
+            wavevm_tcg_remote_slice_leave();
+            tcg_slice_active = false;
+        }
         struct kvm_regs kregs;
         struct kvm_sregs ksregs;
         wvm_kvm_context_t *kctx = &ack.ctx.kvm;
@@ -2100,9 +2235,11 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                 static int local_tcg_dbg[MAX_VCPUS];
                 int dbg = local_tcg_dbg[ci];
                 qemu_mutex_unlock_iothread();
+                wavevm_tcg_local_slice_enter();
                 cpu_exec_start(cpu);
                 r = cpu_exec(cpu);
                 cpu_exec_end(cpu);
+                wavevm_tcg_local_slice_leave();
                 qemu_mutex_lock_iothread();
 
                 if (dbg < 80 || (dbg < 2000 && (dbg % 200) == 0)) {
@@ -2131,7 +2268,9 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                     break;
                 case EXCP_ATOMIC:
                     qemu_mutex_unlock_iothread();
+                    wavevm_tcg_local_slice_enter();
                     cpu_exec_step_atomic(cpu);
+                    wavevm_tcg_local_slice_leave();
                     qemu_mutex_lock_iothread();
                     break;
                 default:

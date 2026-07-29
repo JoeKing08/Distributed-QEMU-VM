@@ -122,6 +122,21 @@ int g_ctrl_port = 0; // 这里的定义同时供应给 wavevm_node_master 和 wa
 uint32_t g_curr_epoch = 0;
 extern uint8_t g_my_vm_id; // Multi-VM: 定义在 main_wrapper.c
 
+#ifndef __KERNEL__
+extern void broadcast_push_to_qemu(uint16_t msg_type, void *payload, int len);
+#endif
+
+static inline void notify_local_qemu_push(uint16_t msg_type, void *payload, int len)
+{
+#ifndef __KERNEL__
+    broadcast_push_to_qemu(msg_type, payload, len);
+#else
+    (void)msg_type;
+    (void)payload;
+    (void)len;
+#endif
+}
+
 // 哈希环脏标记 (解决 CPU 抖动)
 static atomic_bool g_ring_dirty = false;
 
@@ -140,6 +155,7 @@ static uint64_t g_last_view_sync_us WVM_UNUSED = 0;
 static void add_gossip_to_aggregator(uint32_t target_node_id, uint8_t state, uint32_t epoch);
 static void flush_gossip_aggregator(void);
 void handle_rpc_batch_execution(void *payload, uint32_t len);
+static void init_broadcast_shards(void);
 
 // --- 指数退避与超时参数 ---
 #define INITIAL_RETRY_DELAY_US 50000      // 50ms
@@ -281,6 +297,17 @@ static void copyset_set(copyset_t *cs, uint32_t node_id) {
         cs->cap = new_cap;
     }
     cs->ids[cs->count++] = node_id;
+#endif
+}
+
+static void register_page_subscriber(page_meta_t *page, uint32_t node_id) {
+    if (!page || node_id >= WVM_MAX_SLAVES) return;
+
+    copyset_set(&page->subscribers, node_id);
+    page->last_interest_time = g_ops->get_time_us();
+#ifdef __KERNEL__
+    uint32_t seg_idx = node_id / 64;
+    page->segment_mask[seg_idx / 64] |= (1UL << (seg_idx % 64));
 #endif
 }
 
@@ -925,7 +952,8 @@ int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
     pthread_rwlock_init(&g_view_lock, NULL);
     pthread_rwlock_init(&g_ring_lock, NULL);
     
-    // 分片广播队列在定义处进行静态零初始化；此处不重复初始化。
+    init_broadcast_shards();
+
     for (int i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i++) {
         g_cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
     }
@@ -995,6 +1023,15 @@ typedef struct {
 
 // 创建分片队列数组
 static bcast_queue_shard_t g_bcast_shards[NUM_BCAST_WORKERS];
+
+static void init_broadcast_shards(void)
+{
+    for (int i = 0; i < NUM_BCAST_WORKERS; i++) {
+        pthread_spin_init(&g_bcast_shards[i].lock, PTHREAD_PROCESS_PRIVATE);
+        g_bcast_shards[i].head = 0;
+        g_bcast_shards[i].tail = 0;
+    }
+}
 
 // [V29 Optimization] 多线程消费者：读取指针，发送并释放
 void* broadcast_worker_thread(void* arg) {
@@ -1266,9 +1303,8 @@ int wvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer, uint64_t *versi
                         (unsigned long long)gpa,
                         (unsigned long long)page->version);
             
-            // [V29] 既然由于缺页进来了，说明本地之前可能被设为 Invalid
-            // 我们需要把自己加入订阅者列表，确保未来收到 Push
-            copyset_set(&page->subscribers, g_my_node_id);
+            // 缺页读取会在本地形成缓存副本，后续必须接收该页 push。
+            register_page_subscriber(page, g_my_node_id);
             ret = 0;
         }
         
@@ -1832,6 +1868,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                 // 关键：填入当前版本号
                 ack_pl->version = WVM_HTONLL(page->version);
                 memcpy(ack_pl->data, page->base_page_data, 4096);
+                register_page_subscriber(page, src_id);
             } else {
                 // Should not happen if alloc succeeds, but handle it
                 memset(ack_pl, 0, sizeof(*ack_pl));
@@ -1857,15 +1894,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
             page_meta_t *page = DIR_FIND_OR_CREATE(gpa, lock_idx);
             if (page) {
                 // 记录订阅者 (使用裸 node_id 索引位图，不能用 composite ID)
-                copyset_set(&page->subscribers, src_id);
-                page->last_interest_time = g_ops->get_time_us();
-#ifdef __KERNEL__
-                uint32_t seg_idx = src_id / 64;
-                // 在二级位图中标记该段"有订阅者"
-                page->segment_mask[seg_idx / 64] |= (1UL << (seg_idx % 64));
-                // 在一级位图中标记节点
-                page->subscribers.bits[seg_idx] |= (1UL << (src_id % 64));
-#endif
+                register_page_subscriber(page, src_id);
             }
             
             pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
@@ -1932,6 +1961,15 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     page->version = MAKE_VERSION(g_curr_epoch, local_counter + 1);
                     
                     log->version = WVM_HTONLL(page->version);
+
+                    struct wvm_full_page_push local_full;
+                    local_full.gpa = WVM_HTONLL(gpa);
+                    local_full.version = WVM_HTONLL(page->version);
+                    memset(local_full.data, 0, sizeof(local_full.data));
+                    if (src_id != (uint32_t)g_my_node_id) {
+                        notify_local_qemu_push(MSG_PAGE_PUSH_FULL,
+                                               &local_full, sizeof(local_full));
+                    }
                     
                     // 广播零页：Diff类型 + ZeroFlag + 无数据
                     broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct wvm_diff_log), WVM_FLAG_ZERO);
@@ -2006,6 +2044,11 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                         // 小更新：推送 Diff
                         // 需要修改 log 中的 version 为新版本号
                         log->version = WVM_HTONLL(page->version); 
+
+                        if (src_id != (uint32_t)g_my_node_id) {
+                            notify_local_qemu_push(MSG_PAGE_PUSH_DIFF, log,
+                                                   sizeof(struct wvm_diff_log) + sz);
+                        }
                     
                         // 广播 Diff 包
                         broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct wvm_diff_log) + sz, 0);
@@ -2023,6 +2066,10 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                             p->version = WVM_HTONLL(page->version);
                             // 第一次拷贝：从 Page Cache 到 临时堆内存
                             memcpy(p->data, page->base_page_data, 4096);
+
+                            if (src_id != (uint32_t)g_my_node_id) {
+                                notify_local_qemu_push(MSG_PAGE_PUSH_FULL, p, push_size);
+                            }
                 
                             // 广播函数内部会进行第二次分配和拷贝 (入队)
                             // 虽然仍有双重拷贝，但避开了栈溢出风险

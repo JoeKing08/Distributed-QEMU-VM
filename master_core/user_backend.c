@@ -251,6 +251,30 @@ static int maybe_forward_local_slave_mem_ack(int sockfd, uint8_t *packet, int pa
     return 1;
 }
 
+static int forward_local_slave_sync_ack(int sockfd, uint8_t *packet, int packet_len,
+                                        struct wvm_header *hdr, uint64_t req_id) {
+    if (g_slave_forward_port <= 0 || req_id != SYNC_MAGIC) {
+        return 0;
+    }
+
+    struct sockaddr_in slave_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(g_slave_forward_port)
+    };
+    ssize_t fw = sendto(sockfd, packet, packet_len, 0,
+                       (struct sockaddr *)&slave_addr, sizeof(slave_addr));
+    if (fw < 0) {
+        u_log("[Slave SyncAck] forward failed target=%u dst_port=%d err=%d",
+              (unsigned)ntohl(hdr->target_id), g_slave_forward_port, errno);
+        return 0;
+    }
+
+    u_log("[Slave SyncAck] forwarded target=%u dst_port=%d len=%d",
+          (unsigned)ntohl(hdr->target_id), g_slave_forward_port, packet_len);
+    return 1;
+}
+
 // --- QoS 发送队列结构 ---
 typedef struct tx_node {
     struct tx_node *next;
@@ -1194,6 +1218,11 @@ static void* rx_thread_loop(void *arg) {
                         if (!matched_req_ctx &&
                             msg_type == MSG_MEM_ACK &&
                             rid == SYNC_MAGIC) {
+                            if (forward_local_slave_sync_ack(sockfd, base_ptr + offset,
+                                                            current_pkt_len, hdr, rid)) {
+                                offset += current_pkt_len;
+                                continue;
+                            }
                             broadcast_raw_packet_to_qemu(base_ptr + offset,
                                                          (size_t)current_pkt_len);
                             offset += current_pkt_len;
@@ -1221,9 +1250,10 @@ static void* rx_thread_loop(void *arg) {
                             if (gpa + 4096 <= g_shm_size) {
                                 // 1. 更新本地 SHM (成为最新版本)
                                 memcpy((uint8_t*)g_shm_ptr + gpa, push->data, 4096);
-                                // 2. 转发给 QEMU (IPC) 以更新版本号/TLB
-                                broadcast_push_to_qemu(msg_type, payload, sizeof(struct wvm_full_page_push));
                             }
+                            // 2. 转发给 QEMU (IPC) 以更新版本号/TLB。高 GPA
+                            // 可能不在 daemon SHM 中，但 QEMU 的 RAM block 仍能映射。
+                            broadcast_push_to_qemu(msg_type, payload, sizeof(struct wvm_full_page_push));
                         } 
                         else if (msg_type == MSG_PAGE_PUSH_DIFF) {
                             struct wvm_diff_log *log = (struct wvm_diff_log *)payload;
@@ -1231,10 +1261,12 @@ static void* rx_thread_loop(void *arg) {
                             uint16_t off = ntohs(log->offset);
                             uint16_t sz = ntohs(log->size);
 
-                            if (gpa < g_shm_size && off + sz <= 4096) {
+                            if (off + sz <= 4096) {
                                 if (hdr->flags & WVM_FLAG_ZERO) {
                                     // 零页：清零 SHM，转化为 FULL_PUSH 发给 QEMU
-                                    memset((uint8_t*)g_shm_ptr + gpa, 0, 4096);
+                                    if (gpa + 4096 <= g_shm_size) {
+                                        memset((uint8_t*)g_shm_ptr + gpa, 0, 4096);
+                                    }
                                     struct wvm_full_page_push fake_full;
                                     fake_full.gpa = log->gpa;
                                     fake_full.version = log->version;
@@ -1242,7 +1274,9 @@ static void* rx_thread_loop(void *arg) {
                                     broadcast_push_to_qemu(MSG_PAGE_PUSH_FULL, &fake_full, sizeof(fake_full));
                                 } else if (sz > 0) {
                                     // 1. 应用 Diff 到 SHM
-                                    memcpy((uint8_t*)g_shm_ptr + gpa + off, log->data, sz);
+                                    if (gpa + off + sz <= g_shm_size) {
+                                        memcpy((uint8_t*)g_shm_ptr + gpa + off, log->data, sz);
+                                    }
                                     // 2. 转发给 QEMU
                                     broadcast_push_to_qemu(msg_type, payload, sizeof(struct wvm_diff_log) + sz);
                                 }

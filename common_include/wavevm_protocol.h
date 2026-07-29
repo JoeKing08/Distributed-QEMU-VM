@@ -208,7 +208,14 @@ struct wvm_ipc_fault_req {
 
 struct wvm_ipc_fault_ack {
     int status;
+    uint32_t reserved;
     uint64_t version;
+    /*
+     * Local QEMU<->master IPC must carry page bytes explicitly: guest GPA is
+     * not a flat offset into the master SHM when QEMU exposes multiple RAM
+     * regions (for example NUMA high memory).
+     */
+    uint8_t data[4096];
 };
 
 struct wvm_ipc_write_req {
@@ -275,6 +282,37 @@ typedef struct {
     uint32_t _pad;
 } wvm_seg_reg_t;
 
+#define WVM_TCG_APIC_LVT_NB 6
+#define WVM_TCG_XSAVE_AREA_SIZE 0xB00U
+
+typedef struct {
+    uint32_t valid;
+    uint32_t apicbase;
+    uint32_t initial_apic_id;
+    uint32_t spurious_vec;
+    uint32_t isr[8];
+    uint32_t tmr[8];
+    uint32_t irr[8];
+    uint32_t lvt[WVM_TCG_APIC_LVT_NB];
+    uint32_t esr;
+    uint32_t icr[2];
+    uint32_t divide_conf;
+    uint32_t initial_count;
+    int32_t count_shift;
+    int64_t initial_count_load_time;
+    int64_t next_time;
+    int64_t timer_expiry;
+    int32_t sipi_vector;
+    int32_t wait_for_sipi;
+    uint8_t id;
+    uint8_t arb_id;
+    uint8_t tpr;
+    uint8_t log_dest;
+    uint8_t dest_mode;
+    uint8_t version;
+    uint8_t _pad0[2];
+} wvm_tcg_lapic_state_t;
+
 typedef struct {
     uint64_t regs[16];
     uint64_t eip;
@@ -318,6 +356,21 @@ typedef struct {
     int32_t df;
     int32_t error_code;
     int32_t exception_is_int;
+    /*
+     * TCG runs the emulated local APIC in QEMU device state, not in
+     * CPUX86State.  A remote TCG slice must carry the vCPU's LAPIC state with
+     * the CPU context, otherwise timer/IPI delivery diverges between master
+     * and slave QEMU processes after SMP bring-up.
+     */
+    wvm_tcg_lapic_state_t lapic;
+    /*
+     * QEMU TCG keeps guest x87/MMX/SSE/AVX/MPX/PKRU state outside the general
+     * registers.  Carry the native xsave image so remote slices are equivalent
+     * to local TCG execution when Linux uses FPU/SIMD in kernel threads.
+     */
+    uint32_t xsave_size;
+    uint32_t _pad1;
+    uint8_t xsave_area[WVM_TCG_XSAVE_AREA_SIZE];
 } wvm_tcg_context_t;
 
 struct wvm_ipc_cpu_run_req {
@@ -333,6 +386,7 @@ struct wvm_ipc_cpu_run_req {
 struct wvm_ipc_cpu_run_ack {
     int status;
     uint32_t mode_tcg;
+    uint64_t error_gpa;
     union {
         wvm_kvm_context_t kvm;
         wvm_tcg_context_t tcg;

@@ -2271,8 +2271,9 @@ void* tcg_proxy_thread(void *arg) {
                           (struct sockaddr*)&tcg_endpoints[core_idx].push_addr, sizeof(struct sockaddr_in));
                 }
                 else if (msg_type == MSG_MEM_ACK) {
-                    // 如果 req_id 是 ~0ULL，说明是异步回包，也走 PUSH
-                    if (WVM_NTOHLL(hdr->req_id) == ~0ULL)
+                    uint64_t ack_rid = WVM_NTOHLL(hdr->req_id);
+                    // 异步推送 ACK 和 slave dirty-flush 栅栏 ACK 都属于 PUSH 通道。
+                    if (ack_rid == ~0ULL || ack_rid == SYNC_MAGIC)
                         sendto(sockfd, buffers[i], msgs[i].msg_len, 0, 
                               (struct sockaddr*)&tcg_endpoints[core_idx].push_addr, sizeof(struct sockaddr_in));
                     else
