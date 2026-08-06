@@ -174,6 +174,14 @@ typedef struct wvm_ipc_header_t {
 #define WVM_IPC_TYPE_COMMIT_DIFF_SYNC 8
 #define WVM_IPC_TYPE_INVALIDATE       6 
 #define WVM_IPC_TYPE_BLOCK_IO         7
+#define WVM_IPC_TYPE_PUSH_BARRIER     9
+#define WVM_IPC_TYPE_PUSH_BARRIER_ACK 10
+#define WVM_IPC_TYPE_REGISTER         11
+
+/* Local IPC connection roles.  Registration removes any dependency on
+ * connection arrival order when a QEMU instance opens several sockets. */
+#define WVM_IPC_ROLE_ASYNC_PUSH       1
+#define WVM_IPC_ROLE_SYNC             2
 
 // [V29 Fix] 正式定义 RPC 透传类型
 #define WVM_IPC_TYPE_RPC_PASSTHROUGH 99
@@ -284,6 +292,8 @@ typedef struct {
 
 #define WVM_TCG_APIC_LVT_NB 6
 #define WVM_TCG_XSAVE_AREA_SIZE 0xB00U
+#define WVM_TCG_MTRR_FIXED_NB 11
+#define WVM_TCG_MTRR_VAR_NB 8
 
 typedef struct {
     uint32_t valid;
@@ -312,6 +322,11 @@ typedef struct {
     uint8_t version;
     uint8_t _pad0[2];
 } wvm_tcg_lapic_state_t;
+
+typedef struct {
+    uint64_t base;
+    uint64_t mask;
+} wvm_tcg_mtrr_var_t;
 
 typedef struct {
     uint64_t regs[16];
@@ -344,6 +359,30 @@ typedef struct {
     uint32_t hflags2;
     uint32_t a20_mask;
     uint32_t mp_state;
+    uint64_t dr[8];
+    uint64_t vm_hsave, vm_vmcb, tsc_offset, intercept, nested_cr3;
+    uint64_t mtrr_fixed[WVM_TCG_MTRR_FIXED_NB];
+    uint64_t mtrr_deftype;
+    wvm_tcg_mtrr_var_t mtrr_var[WVM_TCG_MTRR_VAR_NB];
+    uint64_t system_time_msr, wall_clock_msr, steal_time_msr;
+    uint64_t async_pf_en_msr, async_pf_int_msr, pv_eoi_en_msr;
+    uint64_t poll_control_msr;
+    uint64_t msr_bndcfgs;
+    uint64_t exception_payload;
+    uint32_t nested_pg_mode;
+    uint32_t interrupt_injected;
+    int32_t exception_nr;
+    uint32_t ins_len;
+    uint32_t sipi_vector;
+    uint32_t intercept_exceptions;
+    uint16_t intercept_cr_read, intercept_cr_write;
+    uint16_t intercept_dr_read, intercept_dr_write;
+    uint8_t v_tpr;
+    uint8_t soft_interrupt;
+    uint8_t nmi_injected, nmi_pending;
+    uint8_t has_error_code;
+    uint8_t exception_pending, exception_injected, exception_has_payload;
+    uint8_t _pad2;
     int32_t old_exception;
     uint64_t smbase;
     uint64_t tsc, tsc_adjust, tsc_deadline, tsc_aux;

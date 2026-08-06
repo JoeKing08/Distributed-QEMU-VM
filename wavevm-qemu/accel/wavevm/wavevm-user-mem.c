@@ -58,8 +58,10 @@ static int g_enable_auto_tuning = 1;   // 开关：1=自动, 0=固定(强一致�
 static uint64_t get_us_time(void);
 static uint64_t get_local_page_version(uint64_t gpa);
 static void set_local_page_version(uint64_t gpa, uint64_t version);
+static long wait_for_directory_ack_safe_us(uint64_t timeout_us);
 static long wait_for_directory_ack_safe(void);
 static int internal_connect_master(void);
+static int internal_connect_master_role(uint32_t role);
 static int ensure_local_shm_shadow(void);
 static void send_diff_via_ipc(void *buf, size_t len);
 static int write_all_fd(int fd, const void *buf, size_t len);
@@ -261,7 +263,7 @@ static void send_push_packet(uint64_t gpa, uint64_t version, void *data, uint16_
     hdr->crc32 = htonl(calculate_crc32(buf, pkt_len));
     // [FIX-G1] Master TCG 走 IPC
     if (g_is_slave) {
-        send(g_fd_push, buf, pkt_len, 0);
+        write_all_fd(g_fd_push, buf, pkt_len);
     } else {
         send_diff_via_ipc(buf, pkt_len);
     }
@@ -344,6 +346,31 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write);
  * [后果] 实现了 MESI 协议的远程写入动作。它保证了即便在乱序网络下，本地 vCPU 看到的内存也是单调递增的一致性状态。
  */
 void wvm_apply_remote_push(uint16_t msg_type, void *payload) {
+    {
+        static unsigned long push_count;
+        bool tracked_push = msg_type == MSG_PAGE_PUSH_DIFF ||
+                            msg_type == MSG_PAGE_PUSH_FULL ||
+                            msg_type == MSG_FORCE_SYNC;
+        if (tracked_push) {
+            uint64_t gpa = (msg_type == MSG_PAGE_PUSH_DIFF)
+                ? WVM_NTOHLL(((struct wvm_diff_log *)payload)->gpa)
+                : WVM_NTOHLL(((struct wvm_full_page_push *)payload)->gpa);
+            uint64_t version = (msg_type == MSG_PAGE_PUSH_DIFF)
+                ? WVM_NTOHLL(((struct wvm_diff_log *)payload)->version)
+                : WVM_NTOHLL(((struct wvm_full_page_push *)payload)->version);
+            unsigned long n = ++push_count;
+            if (n <= 12 || (n % 5000) == 0) {
+                fprintf(stderr,
+                        "[WVM-PUSH-APPLY] pid=%d n=%lu type=%u gpa=%#llx "
+                        "version=%#llx local=%#llx t=%llu\n",
+                        (int)getpid(), n, (unsigned)msg_type,
+                        (unsigned long long)gpa,
+                        (unsigned long long)version,
+                        (unsigned long long)get_local_page_version(gpa),
+                        (unsigned long long)get_us_time());
+            }
+        }
+    }
 // --- 分支 1: Diff 推送 ---
     if (msg_type == MSG_PAGE_PUSH_DIFF) {
         struct wvm_diff_log* log = (struct wvm_diff_log*)payload;
@@ -571,7 +598,7 @@ static int read_exact(int fd, void *buf, size_t len) {
     return 0;
 }
 
-static int internal_connect_master(void) {
+static int internal_connect_master_role(uint32_t role) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -587,7 +614,24 @@ static int internal_connect_master(void) {
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(sock); return -1;
     }
+
+    if (role != 0) {
+        wvm_ipc_header_t reg_hdr = {
+            .type = WVM_IPC_TYPE_REGISTER,
+            .len = sizeof(role),
+        };
+        if (write_all_fd(sock, &reg_hdr, sizeof(reg_hdr)) < 0 ||
+            write_all_fd(sock, &role, sizeof(role)) < 0) {
+            close(sock);
+            return -1;
+        }
+    }
     return sock;
+}
+
+static int internal_connect_master(void)
+{
+    return internal_connect_master_role(0);
 }
 
 static int ensure_local_shm_shadow(void)
@@ -1110,7 +1154,7 @@ static void send_commit_diff_dual_mode(uint64_t gpa, uint16_t offset, uint16_t s
     hdr->crc32 = htonl(calculate_crc32(buf, pkt_len));
 
     // 6. 发送并释放
-    send(g_fd_push, buf, pkt_len, 0);
+    write_all_fd(g_fd_push, buf, pkt_len);
     free(buf);
 }
 
@@ -1419,9 +1463,7 @@ static void flush_aggregator_locked(void) {
     if (g_aggregator.curr_offset == 0) return;
     // [FIX-G1] Master TCG 走 IPC, Slave 走 UDP push socket
     if (g_is_slave) {
-        if (send(g_fd_push, g_aggregator.buf, g_aggregator.curr_offset, 0) < 0) {
-            // 网络拥塞处理：如果发送失败，清空，版本号一致性由 FORCE_SYNC 保证
-        }
+        (void)write_all_fd(g_fd_push, g_aggregator.buf, g_aggregator.curr_offset);
     } else {
         send_diff_via_ipc(g_aggregator.buf, g_aggregator.curr_offset);
     }
@@ -1468,7 +1510,7 @@ static void add_to_aggregator(uint64_t gpa, uint64_t version, uint16_t off, uint
         h->crc32 = htonl(calculate_crc32(tmp, needed));
         // [FIX-G1] Master TCG 走 IPC
         if (g_is_slave) {
-            send(g_fd_push, tmp, needed, 0);
+            (void)write_all_fd(g_fd_push, tmp, needed);
         } else {
             send_diff_via_ipc(tmp, needed);
         }
@@ -1605,6 +1647,72 @@ static int process_writable_batch(WritablePage *batch_head,
     return committed;
 }
 
+static int process_writable_batch_full_snapshot(WritablePage *batch_head,
+                                                void *current_snapshot)
+{
+    int committed = 0;
+    uint64_t *seen = NULL;
+    size_t seen_count = 0;
+    size_t seen_capacity = 0;
+
+    for (WritablePage *curr = batch_head; curr; curr = curr->next) {
+        bool duplicate = false;
+
+        for (size_t i = 0; i < seen_count; i++) {
+            if (seen[i] == curr->gpa) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+
+        if (seen_count == seen_capacity) {
+            size_t new_capacity = seen_capacity ? seen_capacity * 2 : 64;
+            uint64_t *new_seen = realloc(seen, new_capacity * sizeof(*seen));
+            if (!new_seen) {
+                break;
+            }
+            seen = new_seen;
+            seen_capacity = new_capacity;
+        }
+        seen[seen_count++] = curr->gpa;
+
+        void *page_addr = gpa_to_hva_safe(curr->gpa);
+        if (!page_addr) {
+            continue;
+        }
+
+        int idx = LATCH_IDX(curr->gpa);
+
+        __atomic_store_n(&g_latches[idx].val, curr->gpa, __ATOMIC_RELEASE);
+        if (!wvm_is_volatile_gpa(curr->gpa)) {
+            mprotect(page_addr, 4096, PROT_READ);
+        }
+        __sync_synchronize();
+
+        memcpy(current_snapshot, page_addr, 4096);
+
+        __atomic_store_n(&g_latches[idx].val, (uint64_t)-1, __ATOMIC_RELEASE);
+
+        /*
+         * A remote TCG slice returns one final architectural state.  Match that
+         * with one final full-page memory snapshot per dirty GPA so high-churn
+         * pages such as kernel stacks do not depend on a lossless chain of
+         * intermediate partial diffs.
+         */
+        uint64_t ver = get_local_page_version(curr->gpa) + 1;
+        add_to_aggregator(curr->gpa, ver, 0, 4096, current_snapshot, 0);
+        set_local_page_version(curr->gpa, ver);
+        committed++;
+    }
+
+    free(seen);
+    flush_aggregator();
+    return committed;
+}
+
 int wavevm_user_mem_flush_slave_dirty_sync(void)
 {
     void *current_snapshot;
@@ -1625,13 +1733,14 @@ int wavevm_user_mem_flush_slave_dirty_sync(void)
     pthread_mutex_lock(&g_dirty_flush_lock);
     batch_head = __atomic_exchange_n(&g_writable_pages_list, NULL,
                                      __ATOMIC_ACQ_REL);
-    committed = process_writable_batch(batch_head, current_snapshot, NULL);
+    committed = process_writable_batch_full_snapshot(batch_head,
+                                                     current_snapshot);
     if (committed > 0) {
         /*
          * A remote TCG slice return is a causal handoff: all writes made by the
          * slave must be visible to the directory before the CPU ACK is exported.
          */
-        rtt = wait_for_directory_ack_safe();
+            rtt = wait_for_directory_ack_safe_us(5000000ULL);
     } else {
         rtt = 0;
     }
@@ -1668,6 +1777,16 @@ static void *diff_harvester_thread_fn(void *arg) {
          * that kernel boot triggers millions of SIGSEGVs (2.3M+ in V32g).
          * 50ms lets pages stay RW longer, cutting SIGSEGV ~50x. */
         usleep((kvm_enabled() || !g_is_slave) ? 1000 : 50000);
+
+        /*
+         * Slave TCG memory is committed at CPU_RUN ACK boundaries.  Letting the
+         * background harvester emit partial diffs during a remote slice creates
+         * version gaps for high-frequency pages before the causal CPU state is
+         * returned.
+         */
+        if (g_is_slave && !kvm_enabled()) {
+            continue;
+        }
 
         // KVM: harvest QEMU dirty logs, no SIGSEGV/PROT_NONE.
         // Master TCG is synchronized explicitly at remote handoff boundaries.
@@ -1776,7 +1895,7 @@ void wvm_set_client_sync_mode(int batch_size, int auto_tune) {
  * [关键逻辑] 发起一个带有特殊 Magic ID 的 PING 包，并阻塞等待 Directory 的 ACK，以确认上一批次的写入已落盘。
  * [后果] 确保了分布式内存的“强顺序一致性”。它防止了在执行关键 IO 指令（如 GPU 命令提交）时，内存数据尚未同步完成的情况。
  */
-static long wait_for_directory_ack_safe(void) {
+static long wait_for_directory_ack_safe_us(uint64_t timeout_us) {
     // Master TCG 模式走 IPC，本地不需要网络栅栏
     if (!g_is_slave) return 100;
     if (g_fd_push < 0) return -1;
@@ -1792,6 +1911,19 @@ static long wait_for_directory_ack_safe(void) {
     hdr.crc32 = 0;
     hdr.crc32 = htonl(calculate_crc32((uint8_t *)&hdr, sizeof(hdr)));
 
+    {
+        static int fence_dbg;
+        if (fence_dbg < 20) {
+            fprintf(stderr,
+                    "[WVM-SLAVE-FENCE] pid=%d send req=%#llx target=%u "
+                    "flags=%#x t=%llu\n",
+                    (int)getpid(), (unsigned long long)SYNC_MAGIC,
+                    (unsigned)WVM_NODE_AUTO_ROUTE, (unsigned)hdr.flags,
+                    (unsigned long long)get_us_time());
+            fence_dbg++;
+        }
+    }
+
     // 2. 【关键】先加锁，重置状态位
     pthread_mutex_lock(&g_sync_lock);
     g_ack_received = 0;
@@ -1800,14 +1932,19 @@ static long wait_for_directory_ack_safe(void) {
     uint64_t t_start = get_us_time();
 
     // 3. 发送网络包
-    if (send(g_fd_push, &hdr, sizeof(hdr), 0) < 0) return -1;
+    if (write_all_fd(g_fd_push, &hdr, sizeof(hdr)) < 0) return -1;
 
     // 4. 【关键】带超时的条件等待
     pthread_mutex_lock(&g_sync_lock);
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 1; // 1秒超时
+    ts.tv_sec += timeout_us / 1000000ULL;
+    ts.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
 
     // 只要没收到 ACK，就继续等 (防止虚假唤醒)
     while (g_ack_received == 0) {
@@ -1819,7 +1956,23 @@ static long wait_for_directory_ack_safe(void) {
     }
     pthread_mutex_unlock(&g_sync_lock);
 
+    {
+        static int fence_ack_dbg;
+        if (fence_ack_dbg < 20) {
+            fprintf(stderr,
+                    "[WVM-SLAVE-FENCE] pid=%d ack req=%#llx elapsed_us=%llu\n",
+                    (int)getpid(), (unsigned long long)SYNC_MAGIC,
+                    (unsigned long long)(get_us_time() - t_start));
+            fence_ack_dbg++;
+        }
+    }
+
     return (long)(get_us_time() - t_start);
+}
+
+static long wait_for_directory_ack_safe(void)
+{
+    return wait_for_directory_ack_safe_us(1000000ULL);
 }
 
 /*
@@ -1976,6 +2129,53 @@ static void *mem_push_listener_thread(void *arg) {
                 continue;
             }
 
+            if (ipc->type == WVM_IPC_TYPE_PUSH_BARRIER &&
+                ipc->len == sizeof(uint64_t)) {
+                total_msg_len = sizeof(struct wvm_ipc_header_t) + ipc->len;
+                if (avail < total_msg_len) {
+                    break;
+                }
+
+                /*
+                 * The master sends this after one or more PAGE_PUSH messages
+                 * on the same stream.  Reaching this point means every prior
+                 * push was applied; flush lazy protections before ACKing the
+                 * CPU handoff fence.
+                 */
+                uint64_t cookie;
+                struct wvm_ipc_header_t ack = {
+                    .type = WVM_IPC_TYPE_PUSH_BARRIER_ACK,
+                    .len = sizeof(cookie),
+                };
+
+                memcpy(&cookie, cur + sizeof(struct wvm_ipc_header_t),
+                       sizeof(cookie));
+                {
+                    static int barrier_rx_log_count;
+                    if (barrier_rx_log_count < 20) {
+                        fprintf(stderr,
+                                "[WVM-PUSH-BARRIER] rx cookie=%llu\n",
+                                (unsigned long long)cookie);
+                        barrier_rx_log_count++;
+                    }
+                }
+                flush_lazy_ro_queue();
+                if (write_all_fd(g_fd_push, &ack, sizeof(ack)) == 0) {
+                    write_all_fd(g_fd_push, &cookie, sizeof(cookie));
+                    {
+                        static int barrier_ack_log_count;
+                        if (barrier_ack_log_count < 20) {
+                            fprintf(stderr,
+                                    "[WVM-PUSH-BARRIER] ack cookie=%llu\n",
+                                    (unsigned long long)cookie);
+                            barrier_ack_log_count++;
+                        }
+                    }
+                }
+                sb.head += total_msg_len;
+                continue;
+            }
+
             // Resynchronize after an unexpected byte; prevents one malformed
             // datagram from wedging the listener forever.
             sb.head++;
@@ -2079,7 +2279,7 @@ void wavevm_user_mem_init(void *ram_ptr, size_t ram_size) {
          * cannot safely double as the push listener.
          */
         if (g_fd_push < 0) {
-            g_fd_push = internal_connect_master();
+            g_fd_push = internal_connect_master_role(WVM_IPC_ROLE_ASYNC_PUSH);
         }
         if (g_fd_push >= 0 && !push_listener_started) {
             g_threads_running = true;

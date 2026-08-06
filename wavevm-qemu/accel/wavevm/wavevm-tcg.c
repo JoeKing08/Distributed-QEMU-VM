@@ -9,6 +9,7 @@
 #if defined(TARGET_I386) || defined(TARGET_X86_64)
 
 QEMU_BUILD_BUG_ON(sizeof(X86XSaveArea) > WVM_TCG_XSAVE_AREA_SIZE);
+QEMU_BUILD_BUG_ON(MSR_MTRRcap_VCNT != WVM_TCG_MTRR_VAR_NB);
 
 /*
  * Keep guest-visible/wakeup interrupt state in the remote TCG context.
@@ -180,6 +181,45 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->hflags2       = env->hflags2;
     ctx->a20_mask      = env->a20_mask;
     ctx->mp_state      = env->mp_state;
+    memcpy(ctx->dr, env->dr, sizeof(ctx->dr));
+    ctx->vm_hsave      = env->vm_hsave;
+    ctx->vm_vmcb       = env->vm_vmcb;
+    ctx->tsc_offset    = env->tsc_offset;
+    ctx->intercept     = env->intercept;
+    ctx->nested_cr3    = env->nested_cr3;
+    ctx->nested_pg_mode = env->nested_pg_mode;
+    ctx->intercept_cr_read = env->intercept_cr_read;
+    ctx->intercept_cr_write = env->intercept_cr_write;
+    ctx->intercept_dr_read = env->intercept_dr_read;
+    ctx->intercept_dr_write = env->intercept_dr_write;
+    ctx->intercept_exceptions = env->intercept_exceptions;
+    ctx->v_tpr         = env->v_tpr;
+    memcpy(ctx->mtrr_fixed, env->mtrr_fixed, sizeof(ctx->mtrr_fixed));
+    ctx->mtrr_deftype  = env->mtrr_deftype;
+    for (int i = 0; i < WVM_TCG_MTRR_VAR_NB; i++) {
+        ctx->mtrr_var[i].base = env->mtrr_var[i].base;
+        ctx->mtrr_var[i].mask = env->mtrr_var[i].mask;
+    }
+    ctx->system_time_msr = env->system_time_msr;
+    ctx->wall_clock_msr = env->wall_clock_msr;
+    ctx->steal_time_msr = env->steal_time_msr;
+    ctx->async_pf_en_msr = env->async_pf_en_msr;
+    ctx->async_pf_int_msr = env->async_pf_int_msr;
+    ctx->pv_eoi_en_msr = env->pv_eoi_en_msr;
+    ctx->poll_control_msr = env->poll_control_msr;
+    ctx->msr_bndcfgs   = env->msr_bndcfgs;
+    ctx->exception_nr  = env->exception_nr;
+    ctx->interrupt_injected = env->interrupt_injected;
+    ctx->soft_interrupt = env->soft_interrupt;
+    ctx->nmi_injected  = env->nmi_injected;
+    ctx->nmi_pending   = env->nmi_pending;
+    ctx->has_error_code = env->has_error_code;
+    ctx->exception_pending = env->exception_pending;
+    ctx->exception_injected = env->exception_injected;
+    ctx->exception_has_payload = env->exception_has_payload;
+    ctx->exception_payload = env->exception_payload;
+    ctx->ins_len       = env->ins_len;
+    ctx->sipi_vector   = env->sipi_vector;
     /*
      * old_exception/error_code/exception_is_int/exception_next_eip are QEMU
      * exception-delivery scratch state, not persistent architectural state.
@@ -221,9 +261,10 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     // 1. General Registers
     memcpy(env->regs, ctx->regs, sizeof(env->regs));
     env->eip = ctx->eip;
-    env->eflags = ctx->eflags;
-    env->cc_op = CC_OP_EFLAGS;
-    env->cc_src = 0;
+    cpu_load_eflags(env, (uint32_t)ctx->eflags,
+                    CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C |
+                    TF_MASK | IF_MASK | DF_MASK | IOPL_MASK |
+                    NT_MASK | RF_MASK | VM_MASK | AC_MASK | ID_MASK);
     env->cc_src2 = 0;
     env->cc_dst = 0;
 
@@ -274,7 +315,7 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->tr.limit     = ctx->tr.limit;
     env->tr.selector  = ctx->tr.selector;
     env->tr.flags     = ctx->tr.flags;
-    env->efer         = ctx->efer;
+    cpu_load_efer(env, ctx->efer);
     env->star         = ctx->star;
     env->sysenter_cs  = ctx->sysenter_cs;
     env->sysenter_esp = ctx->sysenter_esp;
@@ -290,6 +331,48 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->hflags2       = ctx->hflags2;
     env->a20_mask      = ctx->a20_mask;
     env->mp_state      = ctx->mp_state;
+    for (int i = 0; i < 7; i++) {
+        env->dr[i] = ctx->dr[i];
+    }
+    cpu_x86_update_dr7(env, ctx->dr[7]);
+    env->vm_hsave      = ctx->vm_hsave;
+    env->vm_vmcb       = ctx->vm_vmcb;
+    env->tsc_offset    = ctx->tsc_offset;
+    env->intercept     = ctx->intercept;
+    env->nested_cr3    = ctx->nested_cr3;
+    env->nested_pg_mode = ctx->nested_pg_mode;
+    env->intercept_cr_read = ctx->intercept_cr_read;
+    env->intercept_cr_write = ctx->intercept_cr_write;
+    env->intercept_dr_read = ctx->intercept_dr_read;
+    env->intercept_dr_write = ctx->intercept_dr_write;
+    env->intercept_exceptions = ctx->intercept_exceptions;
+    env->v_tpr         = ctx->v_tpr;
+    memcpy(env->mtrr_fixed, ctx->mtrr_fixed, sizeof(env->mtrr_fixed));
+    env->mtrr_deftype  = ctx->mtrr_deftype;
+    for (int i = 0; i < WVM_TCG_MTRR_VAR_NB; i++) {
+        env->mtrr_var[i].base = ctx->mtrr_var[i].base;
+        env->mtrr_var[i].mask = ctx->mtrr_var[i].mask;
+    }
+    env->system_time_msr = ctx->system_time_msr;
+    env->wall_clock_msr = ctx->wall_clock_msr;
+    env->steal_time_msr = ctx->steal_time_msr;
+    env->async_pf_en_msr = ctx->async_pf_en_msr;
+    env->async_pf_int_msr = ctx->async_pf_int_msr;
+    env->pv_eoi_en_msr = ctx->pv_eoi_en_msr;
+    env->poll_control_msr = ctx->poll_control_msr;
+    env->msr_bndcfgs   = ctx->msr_bndcfgs;
+    env->exception_nr  = ctx->exception_nr;
+    env->interrupt_injected = ctx->interrupt_injected;
+    env->soft_interrupt = ctx->soft_interrupt;
+    env->nmi_injected  = ctx->nmi_injected;
+    env->nmi_pending   = ctx->nmi_pending;
+    env->has_error_code = ctx->has_error_code;
+    env->exception_pending = ctx->exception_pending;
+    env->exception_injected = ctx->exception_injected;
+    env->exception_has_payload = ctx->exception_has_payload;
+    env->exception_payload = ctx->exception_payload;
+    env->ins_len       = ctx->ins_len;
+    env->sipi_vector   = ctx->sipi_vector;
     /*
      * Do not import transient exception-delivery state across a remote TCG
      * slice boundary.  cpu->exception_index was already cleared above, so
@@ -309,7 +392,6 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     env->exception_next_eip = 0;
     env->pkru          = ctx->pkru;
     env->tsx_ctrl      = ctx->tsx_ctrl;
-    env->df            = ctx->df;
     env->error_code    = 0;
     env->exception_is_int = 0;
     if (ctx->xsave_size > 0) {
@@ -349,6 +431,28 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
      * translations and can turn a valid remote slice into a false triple fault.
      */
     tlb_flush(cpu);
+
+    {
+        static int import_dbg;
+        if (import_dbg < 24) {
+            fprintf(stderr,
+                    "[WVM-TCG-IMPORT] pid=%d cpu=%d eip=%#llx rsp=%#llx "
+                    "rflags=%#llx cr0=%#llx cr3=%#llx cr4=%#llx efer=%#llx "
+                    "hflags=%#x/%#x oldex=%d env_eip=%#llx env_rsp=%#llx\n",
+                    (int)getpid(), cpu->cpu_index,
+                    (unsigned long long)ctx->eip,
+                    (unsigned long long)ctx->regs[R_ESP],
+                    (unsigned long long)ctx->eflags,
+                    (unsigned long long)ctx->cr[0],
+                    (unsigned long long)ctx->cr[3],
+                    (unsigned long long)ctx->cr[4],
+                    (unsigned long long)ctx->efer,
+                    env->hflags, env->hflags2, env->old_exception,
+                    (unsigned long long)env->eip,
+                    (unsigned long long)env->regs[R_ESP]);
+            import_dbg++;
+        }
+    }
 }
 
 #else

@@ -105,7 +105,7 @@ extern uint8_t g_my_node_state;
 extern void broadcast_irq_to_qemu(void);
 extern void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t source_node_id);
 extern uint32_t wvm_get_directory_node_id(uint64_t gpa);
-extern void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len);
+extern int broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len);
 extern void broadcast_raw_packet_to_qemu(const void *packet, size_t len);
 
 // --- 请求ID管理结构 ---
@@ -125,6 +125,19 @@ struct local_slave_req_t {
 };
 static struct local_slave_req_t g_local_slave_reqs[LOCAL_SLAVE_REQS];
 static pthread_mutex_t g_local_slave_req_locks[LOCAL_SLAVE_REQS];
+
+/*
+ * TCG slave dirty commits arrive at the local master before they reach the
+ * directory.  Keep a small local fence state so a slave-side SYNC PING is
+ * acknowledged only after every forwarded commit has received a directory
+ * ACK.  This is deliberately scoped to the local slave channel; normal RPC
+ * request/response traffic keeps using g_u_req_ctx.
+ */
+static pthread_mutex_t g_local_commit_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int g_local_commit_pending;
+static int g_local_commit_fence_waiting;
+static int g_local_commit_fence_failed;
+static uint32_t g_local_commit_fence_target;
 
 static int g_nonblock_recv = 0;
 static int g_poll_timeout_ms = 100;   /* [V30 FIX] 默认 100ms，不再是 -1 (无限阻塞) */
@@ -180,6 +193,190 @@ static int local_slave_req_consume(uint64_t req_id, uint32_t slave_target) {
     }
     pthread_mutex_unlock(&g_local_slave_req_locks[idx]);
     return matched;
+}
+
+static int send_local_slave_fence_ack(int sockfd, uint32_t slave_target, int ok)
+{
+    if (g_slave_forward_port <= 0 || sockfd < 0) {
+        return -1;
+    }
+
+    uint8_t packet[sizeof(struct wvm_header) + 1];
+    struct wvm_header *ack = (struct wvm_header *)packet;
+    memset(ack, 0, sizeof(*ack));
+    ack->magic = htonl(WVM_MAGIC);
+    ack->msg_type = htons(MSG_MEM_ACK);
+    ack->payload_len = htons(1);
+    ack->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, (uint32_t)g_my_node_id));
+    ack->target_id = htonl(slave_target);
+    ack->req_id = WVM_HTONLL(SYNC_MAGIC);
+    ack->qos_level = 1;
+    ack->flags = ok ? 0 : WVM_FLAG_ERROR;
+    ack->epoch = htonl(g_curr_epoch);
+    ack->node_state = g_my_node_state;
+    packet[sizeof(*ack)] = ok ? 1 : 0;
+    ack->crc32 = 0;
+    ack->crc32 = htonl(calculate_crc32(packet, sizeof(packet)));
+
+    struct sockaddr_in slave_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(g_slave_forward_port)
+    };
+    ssize_t sent = sendto(sockfd, packet, sizeof(packet), 0,
+                          (struct sockaddr *)&slave_addr,
+                          sizeof(slave_addr));
+    if (sent != (ssize_t)sizeof(packet)) {
+        u_log("[Slave Fence] local ACK failed target=%u ok=%d err=%d",
+              (unsigned)slave_target, ok, (sent < 0) ? errno : EIO);
+        return -1;
+    }
+    u_log("[Slave Fence] local ACK target=%u ok=%d pending=0",
+          (unsigned)slave_target, ok);
+    return 0;
+}
+
+static void local_commit_mark_send_failed(void)
+{
+    pthread_mutex_lock(&g_local_commit_fence_lock);
+    if (g_local_commit_pending > 0) {
+        g_local_commit_pending--;
+    }
+    g_local_commit_fence_failed = 1;
+    pthread_mutex_unlock(&g_local_commit_fence_lock);
+}
+
+static int handle_local_slave_sync_ping(int sockfd, struct wvm_header *hdr)
+{
+    uint64_t req_id = WVM_NTOHLL(hdr->req_id);
+    uint32_t slave_target;
+    int send_now = 0;
+    int ok = 0;
+
+    if (req_id != SYNC_MAGIC) {
+        return 0;
+    }
+
+    slave_target = ntohl(hdr->slave_id);
+    pthread_mutex_lock(&g_local_commit_fence_lock);
+    g_local_commit_fence_target = slave_target;
+    if (g_local_commit_pending == 0) {
+        ok = !g_local_commit_fence_failed;
+        g_local_commit_fence_failed = 0;
+        send_now = 1;
+    } else {
+        g_local_commit_fence_waiting = 1;
+    }
+    pthread_mutex_unlock(&g_local_commit_fence_lock);
+
+    if (send_now) {
+        send_local_slave_fence_ack(sockfd, slave_target, ok);
+    }
+    return 1;
+}
+
+static int consume_local_commit_ack(int sockfd, struct wvm_header *hdr,
+                                    void *payload, uint16_t payload_len)
+{
+    uint64_t req_id = WVM_NTOHLL(hdr->req_id);
+    int send_now = 0;
+    int ok = 1;
+    int fence_ok = 1;
+    uint32_t slave_target = 0;
+
+    if (req_id != SYNC_MAGIC) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_local_commit_fence_lock);
+    if (g_local_commit_pending == 0) {
+        pthread_mutex_unlock(&g_local_commit_fence_lock);
+        return 0;
+    }
+
+    /*
+     * SYNC_MAGIC is carried on the normal MEM_ACK payload path.
+     * That payload starts with GPA/version fields, so its first byte is not
+     * a success flag.  Only the transport-level error bit is authoritative.
+     */
+    if (hdr->flags & WVM_FLAG_ERROR) {
+        ok = 0;
+    }
+    if (!ok) {
+        g_local_commit_fence_failed = 1;
+    }
+    g_local_commit_pending--;
+    if (g_local_commit_pending == 0 && g_local_commit_fence_waiting) {
+        slave_target = g_local_commit_fence_target;
+        fence_ok = !g_local_commit_fence_failed;
+        g_local_commit_fence_waiting = 0;
+        g_local_commit_fence_failed = 0;
+        send_now = 1;
+    }
+    pthread_mutex_unlock(&g_local_commit_fence_lock);
+
+    if (send_now) {
+        send_local_slave_fence_ack(sockfd, slave_target, fence_ok);
+    }
+    return 1;
+}
+
+static int maybe_forward_local_slave_commit(uint8_t *packet, int packet_len,
+                                            struct wvm_header *hdr,
+                                            void *payload, uint16_t payload_len)
+{
+    uint32_t source_id;
+    uint32_t target_id;
+    uint32_t dir_node;
+    uint64_t gpa;
+    int ret;
+
+    if (payload_len < sizeof(struct wvm_diff_log)) {
+        return 0;
+    }
+
+    source_id = ntohl(hdr->slave_id);
+    target_id = ntohl(hdr->target_id);
+    if (WVM_GET_NODEID(source_id) != (uint32_t)g_my_node_id ||
+        WVM_IS_VALID_TARGET(target_id)) {
+        return 0;
+    }
+
+    gpa = WVM_NTOHLL(((struct wvm_diff_log *)payload)->gpa);
+    dir_node = wvm_get_directory_node_id(gpa);
+    if (WVM_GET_NODEID(dir_node) == (uint32_t)g_my_node_id) {
+        wvm_logic_process_packet(hdr, payload, source_id);
+        return 1;
+    }
+
+    /*
+     * The slave's packet intentionally uses AUTO_ROUTE because the QEMU
+     * process does not own the cluster's DHT view.  Resolve that route at the
+     * local master, which does own the authoritative ring.
+     */
+    hdr->req_id = WVM_HTONLL(SYNC_MAGIC);
+    hdr->flags |= WVM_FLAG_NEED_ACK;
+    pthread_mutex_lock(&g_local_commit_fence_lock);
+    g_local_commit_pending++;
+    pthread_mutex_unlock(&g_local_commit_fence_lock);
+
+    ret = u_send_packet(packet, packet_len, dir_node);
+    if (ret < 0) {
+        local_commit_mark_send_failed();
+    }
+
+    {
+        static int route_log_count;
+        if (route_log_count < 20) {
+            u_log("[Slave COMMIT] gpa=%#llx dir=%u ret=%d pending=%u",
+                  (unsigned long long)gpa,
+                  (unsigned)dir_node,
+                  ret,
+                  g_local_commit_pending);
+            route_log_count++;
+        }
+    }
+    return 1;
 }
 
 static int maybe_forward_local_slave_mem_read(uint8_t *packet, int packet_len,
@@ -1079,6 +1276,21 @@ static void* rx_thread_loop(void *arg) {
                         }
                     }
 
+                    if (from_local_slave && msg_type == MSG_COMMIT_DIFF) {
+                        if (maybe_forward_local_slave_commit(base_ptr + offset,
+                                                              current_pkt_len,
+                                                              hdr, payload, p_len)) {
+                            offset += current_pkt_len;
+                            continue;
+                        }
+                    }
+
+                    if (from_local_slave && msg_type == MSG_PING &&
+                        handle_local_slave_sync_ping(sockfd, hdr)) {
+                        offset += current_pkt_len;
+                        continue;
+                    }
+
                     if (from_local_slave && msg_type == MSG_MEM_READ && p_len >= sizeof(uint64_t)) {
                         if (maybe_forward_local_slave_mem_read(base_ptr + offset,
                                                                current_pkt_len,
@@ -1146,6 +1358,13 @@ static void* rx_thread_loop(void *arg) {
 
                     if (is_response_msg && rid != (uint64_t)-1 &&
                         (rid != 0 || msg_type == MSG_MEM_ACK)) {
+                        if (msg_type == MSG_MEM_ACK && rid == SYNC_MAGIC &&
+                            !from_local_slave &&
+                            consume_local_commit_ack(sockfd, hdr, payload, p_len)) {
+                            offset += current_pkt_len;
+                            continue;
+                        }
+
                         // 请求-响应模式 (ACK / EXIT / BLOCK_ACK)
                         uint32_t idx = rid % MAX_INFLIGHT_REQS;
                         bool matched_req_ctx = false;

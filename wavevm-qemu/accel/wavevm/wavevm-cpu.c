@@ -253,6 +253,19 @@ static void wavevm_tcg_remote_slice_leave(void)
     qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
 }
 
+static void wavevm_tcg_clear_stale_exit(CPUState *cpu)
+{
+    /*
+     * WaveVM deliberately kicks TCG slices out at handoff boundaries.  Before
+     * re-entering local TCG, clear only the stale exit latch; real interrupt
+     * bits stay in interrupt_request and are still consumed by cpu_exec().
+     */
+    qatomic_mb_set(&cpu->exit_request, 0);
+    if (cpu->icount_decr_ptr) {
+        qatomic_mb_set(&cpu->icount_decr_ptr->u16.high, 0);
+    }
+}
+
 static void wavevm_init_tcg_region_once(void)
 {
     /* Enable MTTCG-style region allocation so each vCPU thread gets its
@@ -391,7 +404,7 @@ static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
      */
     while (wake_iters < max_wake_iters) {
         cpu->exception_index = -1;
-        qatomic_mb_set(&cpu->exit_request, 0);
+        wavevm_tcg_clear_stale_exit(cpu);
         qemu_mutex_unlock_iothread();
         cpu_exec_start(cpu);
         tr = cpu_exec(cpu);
@@ -810,10 +823,11 @@ static void wavevm_remote_exec(CPUState *cpu) {
             const int max_tramp_iters = 100;
             qemu_mutex_lock_iothread();
             while (tramp_iters < max_tramp_iters) {
-                qemu_mutex_unlock_iothread();
-                cpu_exec_start(cpu);
-                int tr = cpu_exec(cpu);
-                cpu_exec_end(cpu);
+            qemu_mutex_unlock_iothread();
+            wavevm_tcg_clear_stale_exit(cpu);
+            cpu_exec_start(cpu);
+            int tr = cpu_exec(cpu);
+            cpu_exec_end(cpu);
                 qemu_mutex_lock_iothread();
 
                 /* EXCP_INTERRUPT (0x10000): another vCPU called cpu_exit()
@@ -904,6 +918,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 qemu_mutex_lock_iothread();
                 while (tramp_iters < max_tramp_iters) {
                     qemu_mutex_unlock_iothread();
+                    wavevm_tcg_clear_stale_exit(cpu);
                     cpu_exec_start(cpu);
                     int tr = cpu_exec(cpu);
                     cpu_exec_end(cpu);
@@ -1018,8 +1033,9 @@ static void wavevm_remote_exec(CPUState *cpu) {
              * event wakes it locally; only a runnable state is handed back
              * to the remote TCG worker. */
             if (cpu->halted ||
-                (cs->interrupt_request &
-                 (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+                ((cs->interrupt_request &
+                  (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL)) &&
+                 cpu_has_work(cpu))) {
                 if (!cpu->halted) {
                     sched_yield();
                 }
@@ -1042,11 +1058,13 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 cs->interrupt_request &= ~CPU_INTERRUPT_POLL;
                 qemu_mutex_unlock_iothread();
             }
-            if (cs->interrupt_request & CPU_INTERRUPT_HARD) {
+            if ((cs->interrupt_request & CPU_INTERRUPT_HARD) &&
+                cpu_has_work(cpu)) {
                 wavevm_tcg_run_local_wake(cpu, x86cpu, ci);
                 if (cpu->halted ||
-                    (cs->interrupt_request &
-                     (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL))) {
+                    ((cs->interrupt_request &
+                      (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL)) &&
+                     cpu_has_work(cpu))) {
                     if (!cpu->halted) {
                         sched_yield();
                     }
@@ -2245,13 +2263,21 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                 if (dbg < 80 || (dbg < 2000 && (dbg % 200) == 0)) {
                     X86CPU *x86cpu = X86_CPU(cpu);
                     CPUX86State *env = &x86cpu->env;
+                    uint32_t lock_word = 0;
+                    int lock_ret = cpu_memory_rw_debug(cpu, env->regs[R_EDI],
+                                                       (uint8_t *)&lock_word,
+                                                       sizeof(lock_word), 0);
                     fprintf(stderr,
                             "[WVM-TCG-LOCAL] cpu=%d n=%d ret=%d rip=0x%lx cs=0x%x "
-                            "cr0=0x%lx halted=%d intreq=0x%x exit_req=%d\n",
+                            "cr0=0x%lx rdi=0x%lx rax=0x%lx lock=0x%x/lr=%d "
+                            "halted=%d intreq=0x%x exit_req=%d\n",
                             cpu->cpu_index, dbg, r,
                             (unsigned long)env->eip,
                             (unsigned)env->segs[R_CS].selector,
                             (unsigned long)env->cr[0],
+                            (unsigned long)env->regs[R_EDI],
+                            (unsigned long)env->regs[R_EAX],
+                            lock_word, lock_ret,
                             cpu->halted,
                             (unsigned)cpu->interrupt_request,
                             cpu->exit_request);

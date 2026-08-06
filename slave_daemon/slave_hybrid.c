@@ -1892,8 +1892,16 @@ void* kvm_worker_thread(void *arg) {
         wvm_vfio_init(g_vfio_config_path);
     }
     
-    struct mmsghdr msgs[BATCH_SIZE] = {0}; struct iovec iov[BATCH_SIZE] = {0}; uint8_t bufs[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in c[BATCH_SIZE] = {0};
-    for(int i=0;i<BATCH_SIZE;i++) { iov[i].iov_base=bufs[i]; iov[i].iov_len=POOL_ITEM_SIZE; msgs[i].msg_hdr.msg_iov=&iov[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&c[i]; msgs[i].msg_hdr.msg_namelen=sizeof(c[i]); }
+    struct mmsghdr msgs[BATCH_SIZE] = {0};
+    struct iovec iov[BATCH_SIZE] = {0};
+    struct sockaddr_in c[BATCH_SIZE] = {0};
+    uint8_t *rx_pool = calloc(BATCH_SIZE, WVM_MAX_PACKET_SIZE);
+    if (!rx_pool) {
+        perror("[SLAVE-RX] alloc rx_pool");
+        close(s);
+        return NULL;
+    }
+    for(int i=0;i<BATCH_SIZE;i++) { iov[i].iov_base=rx_pool + (size_t)i * WVM_MAX_PACKET_SIZE; iov[i].iov_len=WVM_MAX_PACKET_SIZE; msgs[i].msg_hdr.msg_iov=&iov[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&c[i]; msgs[i].msg_hdr.msg_namelen=sizeof(c[i]); }
 
     while(1) {
         for (int i = 0; i < BATCH_SIZE; i++) {
@@ -1905,7 +1913,8 @@ void* kvm_worker_thread(void *arg) {
         int n = recvmmsg(s, msgs, BATCH_SIZE, recv_flags, NULL);
         if (n<=0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
         for(int i=0;i<n;i++) {
-            struct wvm_header *h = (struct wvm_header*)bufs[i];
+            uint8_t *pkt = (uint8_t *)iov[i].iov_base;
+            struct wvm_header *h = (struct wvm_header*)pkt;
             if (h->magic != htonl(WVM_MAGIC)) continue;
 
             { static int __dbg=0;
@@ -1957,7 +1966,7 @@ void* kvm_worker_thread(void *arg) {
             if (type == MSG_VCPU_RUN) {
                 struct wvm_ipc_cpu_run_req local_req;
                 struct wvm_ipc_cpu_run_req *run_req = NULL;
-                void *net_payload_ptr = bufs[i] + sizeof(struct wvm_header);
+                void *net_payload_ptr = pkt + sizeof(struct wvm_header);
 
                 memset(&local_req, 0, sizeof(local_req));
 
@@ -1984,9 +1993,9 @@ void* kvm_worker_thread(void *arg) {
             }
             else if (type == MSG_BLOCK_WRITE || type == MSG_BLOCK_READ || type == MSG_BLOCK_FLUSH) {
                 // 存储入口
-                handle_block_io_phys(s, &c[i], h, bufs[i]+sizeof(*h));
+                handle_block_io_phys(s, &c[i], h, pkt+sizeof(*h));
             }
-            else handle_kvm_mem(s, &c[i], h, bufs[i]+sizeof(*h));
+            else handle_kvm_mem(s, &c[i], h, pkt+sizeof(*h));
         }
     }
 }
@@ -2166,8 +2175,16 @@ void* tcg_proxy_thread(void *arg) {
         fprintf(stderr, "[SLAVE-BIND] port=%d ok\n", g_service_port);
     }
 
-    struct mmsghdr msgs[BATCH_SIZE] = {0}; struct iovec iovecs[BATCH_SIZE] = {0}; uint8_t buffers[BATCH_SIZE][POOL_ITEM_SIZE]; struct sockaddr_in src_addrs[BATCH_SIZE] = {0};
-    for(int i=0;i<BATCH_SIZE;i++) { iovecs[i].iov_base=buffers[i]; iovecs[i].iov_len=POOL_ITEM_SIZE; msgs[i].msg_hdr.msg_iov=&iovecs[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&src_addrs[i]; msgs[i].msg_hdr.msg_namelen=sizeof(src_addrs[i]); }
+    struct mmsghdr msgs[BATCH_SIZE] = {0};
+    struct iovec iovecs[BATCH_SIZE] = {0};
+    struct sockaddr_in src_addrs[BATCH_SIZE] = {0};
+    uint8_t *rx_pool = calloc(BATCH_SIZE, WVM_MAX_PACKET_SIZE);
+    if (!rx_pool) {
+        perror("[Proxy] alloc rx_pool");
+        close(sockfd);
+        return NULL;
+    }
+    for(int i=0;i<BATCH_SIZE;i++) { iovecs[i].iov_base=rx_pool + (size_t)i * WVM_MAX_PACKET_SIZE; iovecs[i].iov_len=WVM_MAX_PACKET_SIZE; msgs[i].msg_hdr.msg_iov=&iovecs[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&src_addrs[i]; msgs[i].msg_hdr.msg_namelen=sizeof(src_addrs[i]); }
 
     printf("[Proxy] Tri-Channel NAT Active (CMD/REQ/PUSH) + MESI Support.\n");
 
@@ -2182,7 +2199,8 @@ void* tcg_proxy_thread(void *arg) {
         if (n <= 0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
 
         for (int i=0; i<n; i++) {
-            struct wvm_header *hdr = (struct wvm_header *)buffers[i];
+            uint8_t *pkt = (uint8_t *)iovecs[i].iov_base;
+            struct wvm_header *hdr = (struct wvm_header *)pkt;
             { static int __dbg=0;
               if (__dbg < 10) {
                   char ipbuf[16] = {0};
@@ -2224,15 +2242,15 @@ void* tcg_proxy_thread(void *arg) {
                     if (actual_payload >= 8 &&
                         payload_len >= 8 &&
                         payload_len <= (uint16_t)actual_payload) {
-                        uint64_t gpa = WVM_NTOHLL(*(uint64_t*)(buffers[i] + sizeof(struct wvm_header)));
-                        void *data = buffers[i] + sizeof(struct wvm_header) + 8;
+                        uint64_t gpa = WVM_NTOHLL(*(uint64_t*)(pkt + sizeof(struct wvm_header)));
+                        void *data = pkt + sizeof(struct wvm_header) + 8;
                         int len = payload_len - 8;
                         if (wvm_vfio_intercept_mmio(gpa, data, len, 1)) {
                             hdr->msg_type = htons(MSG_MEM_ACK);
                             hdr->payload_len = htons(0);
                             hdr->crc32 = 0;
-                            hdr->crc32 = htonl(calculate_crc32(buffers[i], sizeof(struct wvm_header)));
-                            sendto(sockfd, buffers[i], sizeof(struct wvm_header), 0,
+                            hdr->crc32 = htonl(calculate_crc32(pkt, sizeof(struct wvm_header)));
+                            sendto(sockfd, pkt, sizeof(struct wvm_header), 0,
                                    (struct sockaddr*)&src_addrs[i], sizeof(struct sockaddr_in));
                             continue; 
                         }
@@ -2240,7 +2258,7 @@ void* tcg_proxy_thread(void *arg) {
                 }
                 
                 if (g_gateway_known) 
-                    sendto(sockfd, buffers[i], msgs[i].msg_len, 0, (struct sockaddr*)&g_upstream_gateway, sizeof(struct sockaddr_in));
+                    sendto(sockfd, pkt, msgs[i].msg_len, 0, (struct sockaddr*)&g_upstream_gateway, sizeof(struct sockaddr_in));
             }
             // 2. Downstream (Gateway -> Local QEMU)
             else {
@@ -2267,21 +2285,21 @@ void* tcg_proxy_thread(void *arg) {
                     msg_type == MSG_PAGE_PUSH_FULL || 
                     msg_type == MSG_PAGE_PUSH_DIFF || 
                     msg_type == MSG_FORCE_SYNC) {
-                     sendto(sockfd, buffers[i], msgs[i].msg_len, 0, 
+                     sendto(sockfd, pkt, msgs[i].msg_len, 0,
                           (struct sockaddr*)&tcg_endpoints[core_idx].push_addr, sizeof(struct sockaddr_in));
                 }
                 else if (msg_type == MSG_MEM_ACK) {
                     uint64_t ack_rid = WVM_NTOHLL(hdr->req_id);
                     // 异步推送 ACK 和 slave dirty-flush 栅栏 ACK 都属于 PUSH 通道。
                     if (ack_rid == ~0ULL || ack_rid == SYNC_MAGIC)
-                        sendto(sockfd, buffers[i], msgs[i].msg_len, 0, 
+                        sendto(sockfd, pkt, msgs[i].msg_len, 0,
                               (struct sockaddr*)&tcg_endpoints[core_idx].push_addr, sizeof(struct sockaddr_in));
                     else
-                        sendto(sockfd, buffers[i], msgs[i].msg_len, 0, 
+                        sendto(sockfd, pkt, msgs[i].msg_len, 0,
                               (struct sockaddr*)&tcg_endpoints[core_idx].req_addr, sizeof(struct sockaddr_in));
                 }
                 else {
-                    sendto(sockfd, buffers[i], msgs[i].msg_len, 0, 
+                    sendto(sockfd, pkt, msgs[i].msg_len, 0,
                           (struct sockaddr*)&tcg_endpoints[core_idx].cmd_addr, sizeof(struct sockaddr_in));
                 }
             }

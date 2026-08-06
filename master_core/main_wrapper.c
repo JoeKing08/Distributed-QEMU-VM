@@ -119,6 +119,10 @@ static int g_seed_count = 0;
 static int g_qemu_clients[8];
 static int g_client_count = 0;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_push_barrier_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_push_barrier_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t g_push_barrier_next = 1;
+static uint64_t g_push_barrier_done = 0;
 
 extern void* broadcast_worker_thread(void* arg);
 extern void* autonomous_monitor_thread(void* arg);
@@ -527,16 +531,42 @@ static int enqueue_commit_diff_sync(struct pending_commit_queue *queue,
  * [关键逻辑] 构造伪造的 wvm_header 封装入 IPC 包，强制唤醒 QEMU 的信号处理逻辑以更新本地 TLB/EPT。
  * [后果] 实现了“真理下达”。若此函数丢失，Daemon 虽然收到了数据，但 QEMU 里的 vCPU 依然会因为读到过期旧数据而崩溃。
  */
-void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
+static void mark_push_barrier_done(uint64_t cookie)
+{
+    pthread_mutex_lock(&g_push_barrier_lock);
+    if (cookie > g_push_barrier_done) {
+        g_push_barrier_done = cookie;
+    }
+    static int push_barrier_ack_log_count;
+    if (push_barrier_ack_log_count < 20) {
+        fprintf(stderr, "[PUSH-BARRIER-ACK] cookie=%llu done=%llu\n",
+                (unsigned long long)cookie,
+                (unsigned long long)g_push_barrier_done);
+        push_barrier_ack_log_count++;
+    }
+    pthread_cond_broadcast(&g_push_barrier_cond);
+    pthread_mutex_unlock(&g_push_barrier_lock);
+}
+
+static int broadcast_push_to_qemu_locked(uint16_t msg_type, void* payload, int len)
+{
     wvm_ipc_header_t ipc_hdr;
+    int sent = 0;
+
+    if (g_client_count <= 0) {
+        return 0;
+    }
+
     ipc_hdr.type = WVM_IPC_TYPE_INVALIDATE;
     ipc_hdr.len = sizeof(struct wvm_header) + len;
-    
-    uint8_t* buffer = malloc(sizeof(ipc_hdr) + ipc_hdr.len);
-    if (!buffer) return;
+
+    uint8_t *buffer = malloc(sizeof(ipc_hdr) + ipc_hdr.len);
+    if (!buffer) {
+        return 0;
+    }
 
     memcpy(buffer, &ipc_hdr, sizeof(ipc_hdr));
-    struct wvm_header *hdr = (struct wvm_header*)(buffer + sizeof(ipc_hdr));
+    struct wvm_header *hdr = (struct wvm_header *)(buffer + sizeof(ipc_hdr));
     memset(hdr, 0, sizeof(*hdr));
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
@@ -546,14 +576,131 @@ void broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
     hdr->qos_level = (msg_type == MSG_PAGE_PUSH_FULL || msg_type == MSG_FORCE_SYNC) ? 0 : 1;
     hdr->epoch = htonl(g_curr_epoch);
     hdr->node_state = g_my_node_state;
-    memcpy((void*)hdr + sizeof(*hdr), payload, len);
-    
-    pthread_mutex_lock(&g_client_lock);
+    memcpy((void *)hdr + sizeof(*hdr), payload, len);
+
     for (int i = 0; i < g_client_count; i++) {
-        write_exact(g_qemu_clients[i], buffer, sizeof(ipc_hdr) + ipc_hdr.len);
+        if (write_exact(g_qemu_clients[i], buffer,
+                        sizeof(ipc_hdr) + ipc_hdr.len) >= 0) {
+            sent++;
+        }
     }
-    pthread_mutex_unlock(&g_client_lock);
     free(buffer);
+    return sent;
+}
+
+static int send_push_barrier_locked(uint64_t *cookie_out)
+{
+    wvm_ipc_header_t ipc_hdr = {
+        .type = WVM_IPC_TYPE_PUSH_BARRIER,
+        .len = sizeof(uint64_t),
+    };
+    uint64_t cookie;
+
+    if (g_client_count <= 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_push_barrier_lock);
+    cookie = g_push_barrier_next++;
+    pthread_mutex_unlock(&g_push_barrier_lock);
+
+    /*
+     * Caller must hold g_client_lock so no other PAGE_PUSH can be inserted
+     * between this commit's push and the fence marker.
+     */
+    if (write_exact(g_qemu_clients[0], &ipc_hdr, sizeof(ipc_hdr)) < 0 ||
+        write_exact(g_qemu_clients[0], &cookie, sizeof(cookie)) < 0) {
+        return -EIO;
+    }
+
+    static int push_barrier_send_log_count;
+    if (push_barrier_send_log_count < 20) {
+        fprintf(stderr, "[PUSH-BARRIER] send cookie=%llu fd=%d clients=%d\n",
+                (unsigned long long)cookie, g_qemu_clients[0], g_client_count);
+        push_barrier_send_log_count++;
+    }
+
+    if (cookie_out) {
+        *cookie_out = cookie;
+    }
+    return 0;
+}
+
+static int wait_for_push_barrier_cookie(uint64_t cookie, uint64_t timeout_us)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_us / 1000000ULL;
+    ts.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_push_barrier_lock);
+    while (g_push_barrier_done < cookie) {
+        int rc = pthread_cond_timedwait(&g_push_barrier_cond,
+                                        &g_push_barrier_lock, &ts);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_push_barrier_lock);
+            return -ETIMEDOUT;
+        }
+    }
+    pthread_mutex_unlock(&g_push_barrier_lock);
+    return 0;
+}
+
+int wait_local_qemu_push_barrier(uint64_t timeout_us)
+{
+    pthread_mutex_lock(&g_client_lock);
+    if (g_client_count <= 0) {
+        pthread_mutex_unlock(&g_client_lock);
+        return 0;
+    }
+
+    uint64_t cookie = 0;
+    int ret = send_push_barrier_locked(&cookie);
+    pthread_mutex_unlock(&g_client_lock);
+    if (ret < 0) {
+        return ret;
+    }
+
+    return wait_for_push_barrier_cookie(cookie, timeout_us);
+}
+
+int broadcast_push_to_qemu_fenced(uint16_t msg_type, void* payload, int len,
+                                  uint64_t timeout_us)
+{
+    uint64_t cookie = 0;
+    int ret;
+    int sent;
+
+    pthread_mutex_lock(&g_client_lock);
+    sent = broadcast_push_to_qemu_locked(msg_type, payload, len);
+    if (sent <= 0) {
+        pthread_mutex_unlock(&g_client_lock);
+        return sent;
+    }
+
+    ret = send_push_barrier_locked(&cookie);
+    pthread_mutex_unlock(&g_client_lock);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = wait_for_push_barrier_cookie(cookie, timeout_us);
+    if (ret < 0) {
+        return ret;
+    }
+    return sent;
+}
+
+int broadcast_push_to_qemu(uint16_t msg_type, void* payload, int len) {
+    pthread_mutex_lock(&g_client_lock);
+    int sent = broadcast_push_to_qemu_locked(msg_type, payload, len);
+    pthread_mutex_unlock(&g_client_lock);
+    return sent;
 }
 
 void broadcast_raw_packet_to_qemu(const void *packet, size_t len) {
@@ -594,14 +741,7 @@ void* client_handler(void *socket_desc) {
     free(socket_desc);
     fprintf(stderr, "[IPC] client connected fd=%d\n", qemu_fd);
 
-    pthread_mutex_lock(&g_client_lock);
-    if (g_client_count == 0) {
-        g_qemu_clients[g_client_count++] = qemu_fd;
-        fprintf(stderr, "[IPC] fd=%d registered as async push client\n", qemu_fd);
-    } else {
-        fprintf(stderr, "[IPC] fd=%d treated as sync RPC client only\n", qemu_fd);
-    }
-    pthread_mutex_unlock(&g_client_lock);
+    int is_push_client = 0;
 
     wvm_ipc_header_t ipc_hdr;
     uint8_t payload_buf[WVM_MAX_PACKET_SIZE];
@@ -638,6 +778,42 @@ void* client_handler(void *socket_desc) {
         }
 
         switch (ipc_hdr.type) {
+            case WVM_IPC_TYPE_REGISTER: {
+                if (ipc_hdr.len != sizeof(uint32_t)) {
+                    fprintf(stderr, "[IPC] invalid registration fd=%d len=%u\n",
+                            qemu_fd, (unsigned)ipc_hdr.len);
+                    break;
+                }
+
+                uint32_t role;
+                memcpy(&role, payload_buf, sizeof(role));
+                if (role == WVM_IPC_ROLE_ASYNC_PUSH) {
+                    pthread_mutex_lock(&g_client_lock);
+                    if (!is_push_client && g_client_count < (int)(sizeof(g_qemu_clients) /
+                                                                   sizeof(g_qemu_clients[0]))) {
+                        g_qemu_clients[g_client_count++] = qemu_fd;
+                        is_push_client = 1;
+                        fprintf(stderr,
+                                "[IPC] fd=%d registered as async push client count=%d\n",
+                                qemu_fd, g_client_count);
+                    } else if (!is_push_client) {
+                        fprintf(stderr, "[IPC] WARN: async push slots full fd=%d\n", qemu_fd);
+                    }
+                    pthread_mutex_unlock(&g_client_lock);
+                } else {
+                    fprintf(stderr, "[IPC] fd=%d registered as sync role=%u\n",
+                            qemu_fd, (unsigned)role);
+                }
+                break;
+            }
+            case WVM_IPC_TYPE_PUSH_BARRIER_ACK: {
+                if (ipc_hdr.len == sizeof(uint64_t)) {
+                    uint64_t cookie;
+                    memcpy(&cookie, payload_buf, sizeof(cookie));
+                    mark_push_barrier_done(cookie);
+                }
+                break;
+            }
             case WVM_IPC_TYPE_MEM_FAULT:
                 handle_ipc_fault(qemu_fd, (struct wvm_ipc_fault_req*)payload_buf);
                 break;
@@ -805,18 +981,20 @@ void* client_handler(void *socket_desc) {
     close(qemu_fd);
     
     // 移除客户端并压缩数组，防止 Slot 耗尽
-    pthread_mutex_lock(&g_client_lock);
-    for (int i = 0; i < g_client_count; i++) {
-        if (g_qemu_clients[i] == qemu_fd) {
-            // 将最后一个元素移到当前空位（无序数组删除法，效率 O(1)）
-            if (i != g_client_count - 1) {
-                g_qemu_clients[i] = g_qemu_clients[g_client_count - 1];
+    if (is_push_client) {
+        pthread_mutex_lock(&g_client_lock);
+        for (int i = 0; i < g_client_count; i++) {
+            if (g_qemu_clients[i] == qemu_fd) {
+                // 将最后一个元素移到当前空位（无序数组删除法，效率 O(1)）
+                if (i != g_client_count - 1) {
+                    g_qemu_clients[i] = g_qemu_clients[g_client_count - 1];
+                }
+                g_client_count--;
+                break;
             }
-            g_client_count--;
-            break;
         }
+        pthread_mutex_unlock(&g_client_lock);
     }
-    pthread_mutex_unlock(&g_client_lock);
     
     return NULL;
 }

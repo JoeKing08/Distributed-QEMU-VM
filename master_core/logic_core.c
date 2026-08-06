@@ -123,17 +123,45 @@ uint32_t g_curr_epoch = 0;
 extern uint8_t g_my_vm_id; // Multi-VM: 定义在 main_wrapper.c
 
 #ifndef __KERNEL__
-extern void broadcast_push_to_qemu(uint16_t msg_type, void *payload, int len);
+extern int broadcast_push_to_qemu(uint16_t msg_type, void *payload, int len);
+extern int broadcast_push_to_qemu_fenced(uint16_t msg_type, void *payload,
+                                          int len, uint64_t timeout_us);
+extern int wait_local_qemu_push_barrier(uint64_t timeout_us);
 #endif
 
-static inline void notify_local_qemu_push(uint16_t msg_type, void *payload, int len)
+static inline int notify_local_qemu_push(uint16_t msg_type, void *payload, int len)
 {
 #ifndef __KERNEL__
-    broadcast_push_to_qemu(msg_type, payload, len);
+    return broadcast_push_to_qemu(msg_type, payload, len);
 #else
     (void)msg_type;
     (void)payload;
     (void)len;
+    return 0;
+#endif
+}
+
+static inline int notify_local_qemu_push_fenced(uint16_t msg_type, void *payload,
+                                                int len, uint64_t timeout_us)
+{
+#ifndef __KERNEL__
+    return broadcast_push_to_qemu_fenced(msg_type, payload, len, timeout_us);
+#else
+    (void)msg_type;
+    (void)payload;
+    (void)len;
+    (void)timeout_us;
+    return 0;
+#endif
+}
+
+static inline int wait_local_qemu_push_barrier_safe(uint64_t timeout_us)
+{
+#ifndef __KERNEL__
+    return wait_local_qemu_push_barrier(timeout_us);
+#else
+    (void)timeout_us;
+    return 0;
 #endif
 }
 
@@ -1944,6 +1972,8 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
 
             uint32_t lock_idx = get_lock_idx(gpa);
             int commit_ok = 0;
+            int local_qemu_push_barrier_failed = 0;
+            int needs_push_fence = (hdr->flags & WVM_FLAG_NEED_ACK) != 0;
 
             if (sz == 0) {
                 pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
@@ -1967,8 +1997,17 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     local_full.version = WVM_HTONLL(page->version);
                     memset(local_full.data, 0, sizeof(local_full.data));
                     if (src_id != (uint32_t)g_my_node_id) {
-                        notify_local_qemu_push(MSG_PAGE_PUSH_FULL,
-                                               &local_full, sizeof(local_full));
+                        int push_ret = needs_push_fence ?
+                            notify_local_qemu_push_fenced(MSG_PAGE_PUSH_FULL,
+                                                          &local_full,
+                                                          sizeof(local_full),
+                                                          5000000ULL) :
+                            notify_local_qemu_push(MSG_PAGE_PUSH_FULL,
+                                                   &local_full,
+                                                   sizeof(local_full));
+                        if (push_ret < 0) {
+                            local_qemu_push_barrier_failed = 1;
+                        }
                     }
                     
                     // 广播零页：Diff类型 + ZeroFlag + 无数据
@@ -2046,8 +2085,17 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                         log->version = WVM_HTONLL(page->version); 
 
                         if (src_id != (uint32_t)g_my_node_id) {
-                            notify_local_qemu_push(MSG_PAGE_PUSH_DIFF, log,
-                                                   sizeof(struct wvm_diff_log) + sz);
+                            int push_ret = needs_push_fence ?
+                                notify_local_qemu_push_fenced(MSG_PAGE_PUSH_DIFF,
+                                                              log,
+                                                              sizeof(struct wvm_diff_log) + sz,
+                                                              5000000ULL) :
+                                notify_local_qemu_push(MSG_PAGE_PUSH_DIFF,
+                                                       log,
+                                                       sizeof(struct wvm_diff_log) + sz);
+                            if (push_ret < 0) {
+                                local_qemu_push_barrier_failed = 1;
+                            }
                         }
                     
                         // 广播 Diff 包
@@ -2068,7 +2116,17 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                             memcpy(p->data, page->base_page_data, 4096);
 
                             if (src_id != (uint32_t)g_my_node_id) {
-                                notify_local_qemu_push(MSG_PAGE_PUSH_FULL, p, push_size);
+                                int push_ret = needs_push_fence ?
+                                    notify_local_qemu_push_fenced(MSG_PAGE_PUSH_FULL,
+                                                                  p,
+                                                                  push_size,
+                                                                  5000000ULL) :
+                                    notify_local_qemu_push(MSG_PAGE_PUSH_FULL,
+                                                           p,
+                                                           push_size);
+                                if (push_ret < 0) {
+                                    local_qemu_push_barrier_failed = 1;
+                                }
                             }
                 
                             // 广播函数内部会进行第二次分配和拷贝 (入队)
@@ -2084,6 +2142,13 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     commit_ok = 1;
                 }
                 pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+            }
+            if (local_qemu_push_barrier_failed) {
+                if (g_ops->log) {
+                    g_ops->log("[COMMIT_SYNC RX] qemu-push-barrier failed gpa=%#llx src=%u",
+                               (unsigned long long)gpa, src_id);
+                }
+                commit_ok = 0;
             }
             log_commit_sync_decision(commit_ok ? "accept" : "reject-no-commit",
                                      hdr, source_node_id, gpa, commit_version, 0,
