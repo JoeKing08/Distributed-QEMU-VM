@@ -59,6 +59,13 @@ static int write_all(int fd, const void *buf, size_t len);
      CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
      CPU_INTERRUPT_TGT_INT_1 | CPU_INTERRUPT_TGT_INT_2)
 
+/*
+ * A remote TCG slice can consume a master-owned LAPIC IRQ only when the
+ * master transfers both the LAPIC snapshot and its pending HARD indication.
+ * Other interrupt_request bits remain local lifecycle/control state.
+ */
+#define WVM_TCG_REMOTE_IRQ_FORWARD_MASK CPU_INTERRUPT_HARD
+
 int g_wvm_local_split = 0;
 static bool g_wvm_split_explicit = false;
 static bool g_wvm_mode_explicit = false;
@@ -120,12 +127,14 @@ static void wavevm_slave_prepare_tcg_slice(CPUState *cpu,
      * guest's device model.  Lifecycle and interrupt bits queued on the slave's
      * local QEMU CPU object are therefore host-local noise; importing or
      * consuming them can reset a valid remote AP context back to the slave's
-     * own firmware path.  The master keeps device/APIC ownership and replays
-     * pending wake sources after the ACK is imported.
+     * own firmware path.  Preserve only a HARD IRQ explicitly transferred by
+     * the master: its matching LAPIC snapshot was imported with the context,
+     * so the slave can consume it when guest IF becomes enabled.
      */
     cpu->stop = false;
     cpu->exception_index = -1;
-    cpu->interrupt_request = 0;
+    cpu->interrupt_request = req->ctx.tcg.interrupt_request &
+                             WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
     qatomic_mb_set(&cpu->exit_request, 0);
     qatomic_mb_set(&cpu->icount_decr_ptr->u16.high, 0);
     if (!req->ctx.tcg.halted) {
@@ -657,7 +666,14 @@ static void wavevm_slave_export_ctx(CPUState *cpu,
                 ack->ctx.tcg.exit_reason = cpu->exception_index;
                 ack->ctx.tcg.halted = cpu->halted ? 1 : 0;
                 if (req->mode_tcg) {
-                    ack->ctx.tcg.interrupt_request = 0;
+                    /*
+                     * Return an unconsumed master HARD IRQ.  The slave starts
+                     * each slice with no local lifecycle noise, so this cannot
+                     * leak helper-process wakeups back to the master.
+                     */
+                    ack->ctx.tcg.interrupt_request =
+                        cpu->interrupt_request &
+                        WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
                 } else {
                     ack->ctx.tcg.interrupt_request =
                         cpu->interrupt_request & WVM_TCG_INTERRUPT_SYNC_MASK;
@@ -918,6 +934,9 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
                 }
                 fprintf(stderr, "\n");
             }
+            if (log_exec) {
+                wavevm_log_slave_timer_state(cpu, "pre", exec_seq);
+            }
             qemu_mutex_unlock_iothread();
             if (log_run || log_exec) {
                 fprintf(stderr,
@@ -971,6 +990,9 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             }
             qemu_mutex_lock_iothread();
             cpu_exec_end(cpu);
+            if (log_exec) {
+                wavevm_log_slave_timer_state(cpu, "post", exec_seq);
+            }
             if (exec_ret == EXCP_ATOMIC) {
                 qemu_mutex_unlock_iothread();
                 cpu_exec_step_atomic(cpu);

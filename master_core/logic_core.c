@@ -2012,6 +2012,13 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     
                     // 广播零页：Diff类型 + ZeroFlag + 无数据
                     broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct wvm_diff_log), WVM_FLAG_ZERO);
+                    /*
+                     * A successful commit proves the writer now holds a cached
+                     * copy of this page.  Register it after broadcasting this
+                     * update so future writers push invalidations/updates back
+                     * to it without echoing the writer's own commit.
+                     */
+                    register_page_subscriber(page, src_id);
                     commit_ok = 1;
                 }
                 pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
@@ -2100,6 +2107,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     
                         // 广播 Diff 包
                         broadcast_to_subscribers(page, MSG_PAGE_PUSH_DIFF, log, sizeof(struct wvm_diff_log) + sz, 0);
+                        register_page_subscriber(page, src_id);
                     } else {
                         // 大更新：推送全页
                         size_t push_size = sizeof(struct wvm_full_page_push);
@@ -2132,6 +2140,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                             // 广播函数内部会进行第二次分配和拷贝 (入队)
                             // 虽然仍有双重拷贝，但避开了栈溢出风险
                             broadcast_to_subscribers(page, MSG_PAGE_PUSH_FULL, p, push_size, 0);
+                            register_page_subscriber(page, src_id);
                 
                             // 立即释放临时内存
                             g_ops->free_packet(temp_buf);

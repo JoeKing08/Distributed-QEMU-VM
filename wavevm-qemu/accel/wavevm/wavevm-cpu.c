@@ -204,12 +204,41 @@ extern uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset,
      CPU_INTERRUPT_SMI | CPU_INTERRUPT_NMI | CPU_INTERRUPT_MCE | \
      CPU_INTERRUPT_VIRQ | CPU_INTERRUPT_TPR)
 
+/*
+ * A master HARD IRQ can remain pending while guest IF is disabled.  Transfer
+ * it with the LAPIC context so a remote slice can consume it once IF opens;
+ * do not blindly replay it after the ACK.
+ */
+#define WVM_TCG_REMOTE_IRQ_FORWARD_MASK CPU_INTERRUPT_HARD
+
+static void wavevm_tcg_import_remote_ack(CPUState *cpu,
+                                         wvm_tcg_context_t *ctx,
+                                         uint32_t forwarded_irq)
+{
+    uint32_t master_irq =
+        cpu->interrupt_request & WVM_TCG_MASTER_IRQ_PRESERVE_MASK;
+
+    wvm_tcg_set_state(cpu, ctx);
+
+    /*
+     * The ACK carries the forwarded HARD bit if the remote CPU could not
+     * consume it.  Preserve only master-side events that were not handed to
+     * the remote slice.
+     */
+    cpu->interrupt_request |= master_irq & ~forwarded_irq;
+    cpu->halted = ctx->halted ? 1 : 0;
+}
+
 static pthread_once_t g_wavevm_tcg_region_once = PTHREAD_ONCE_INIT;
 static QemuMutex g_wavevm_tcg_slice_lock;
 static QemuCond g_wavevm_tcg_slice_cond;
 static int g_wavevm_tcg_local_active;
 static bool g_wavevm_tcg_remote_pending;
 static bool g_wavevm_tcg_remote_active;
+static bool g_wavevm_tcg_local_handoff;
+
+static bool wavevm_tcg_has_runnable_local_peer(CPUState *owner);
+static void wavevm_tcg_kick_runnable_local_peers(CPUState *owner);
 
 static void wavevm_tcg_local_slice_enter(void)
 {
@@ -218,6 +247,10 @@ static void wavevm_tcg_local_slice_enter(void)
         qemu_cond_wait(&g_wavevm_tcg_slice_cond, &g_wavevm_tcg_slice_lock);
     }
     g_wavevm_tcg_local_active++;
+    if (g_wavevm_tcg_local_handoff) {
+        g_wavevm_tcg_local_handoff = false;
+        qemu_cond_broadcast(&g_wavevm_tcg_slice_cond);
+    }
     qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
 }
 
@@ -233,10 +266,38 @@ static void wavevm_tcg_local_slice_leave(void)
     qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
 }
 
-static void wavevm_tcg_remote_slice_enter(void)
+static void wavevm_tcg_remote_slice_enter(CPUState *owner)
 {
+    CPUState *cpu;
+
     qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
+    /*
+     * A remote slice must not immediately reclaim execution after it returns:
+     * the local peer may be required to release a guest lock observed by the
+     * remote vCPU.  Leave remote_pending clear while waiting so that peer can
+     * enter cpu_exec().  If it is no longer runnable, drop the stale handoff
+     * instead of waiting forever.
+     */
+    while (g_wavevm_tcg_remote_active || g_wavevm_tcg_local_active > 0 ||
+           (g_wavevm_tcg_local_handoff &&
+            wavevm_tcg_has_runnable_local_peer(owner))) {
+        qemu_cond_wait(&g_wavevm_tcg_slice_cond, &g_wavevm_tcg_slice_lock);
+    }
+    if (g_wavevm_tcg_local_handoff) {
+        g_wavevm_tcg_local_handoff = false;
+    }
     g_wavevm_tcg_remote_pending = true;
+    /*
+     * Do not wait indefinitely for a local TCG vCPU that is spinning on a
+     * lock held by the remote vCPU.  This matches MTTCG's normal atomic
+     * rendezvous: request a boundary from active peers, then wait until they
+     * have left cpu_exec() before handing the authoritative RAM view remote.
+     */
+    CPU_FOREACH(cpu) {
+        if (cpu != owner && !cpu->unplug) {
+            cpu_exit(cpu);
+        }
+    }
     while (g_wavevm_tcg_local_active > 0 || g_wavevm_tcg_remote_active) {
         qemu_cond_wait(&g_wavevm_tcg_slice_cond, &g_wavevm_tcg_slice_lock);
     }
@@ -245,12 +306,26 @@ static void wavevm_tcg_remote_slice_enter(void)
     qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
 }
 
-static void wavevm_tcg_remote_slice_leave(void)
+static void wavevm_tcg_remote_slice_leave(CPUState *owner)
 {
+    bool handoff_local;
+
     qemu_mutex_lock(&g_wavevm_tcg_slice_lock);
     g_wavevm_tcg_remote_active = false;
+    handoff_local = wavevm_tcg_has_runnable_local_peer(owner);
+    g_wavevm_tcg_local_handoff = handoff_local;
     qemu_cond_broadcast(&g_wavevm_tcg_slice_cond);
     qemu_mutex_unlock(&g_wavevm_tcg_slice_lock);
+
+    /*
+     * Local vCPU threads can be asleep in qemu_wait_io_event().  The private
+     * slice condition is not enough to wake them, so use QEMU's normal kick
+     * path.  The local entry path clears the deliberate exit latch before it
+     * re-enters cpu_exec().
+    */
+    if (handoff_local) {
+        wavevm_tcg_kick_runnable_local_peers(owner);
+    }
 }
 
 static void wavevm_tcg_clear_stale_exit(CPUState *cpu)
@@ -296,6 +371,31 @@ static int remote_rpc_policy(int cpu_index) {
 }
 
 static struct wavevm_policy_ops ops = { .schedule_policy = remote_rpc_policy };
+
+static bool wavevm_tcg_has_runnable_local_peer(CPUState *owner)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu != owner && !cpu->unplug &&
+            ops.schedule_policy(cpu->cpu_index) == 0 && cpu_can_run(cpu)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void wavevm_tcg_kick_runnable_local_peers(CPUState *owner)
+{
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        if (cpu != owner && !cpu->unplug &&
+            ops.schedule_policy(cpu->cpu_index) == 0 && cpu_can_run(cpu)) {
+            qemu_cpu_kick(cpu);
+        }
+    }
+}
 
 static bool wavevm_valid_io_exit(const struct kvm_run *run)
 {
@@ -1185,11 +1285,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
         memcpy(&ack, &req, sizeof(ack)); 
 
         if (ack.mode_tcg) {
-            uint32_t master_irq =
-                cpu->interrupt_request & WVM_TCG_MASTER_IRQ_PRESERVE_MASK;
-            wvm_tcg_set_state(cpu, &ack.ctx.tcg);
-            cpu->interrupt_request |= master_irq;
-            cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
+            uint32_t forwarded_irq =
+                req.ctx.tcg.interrupt_request &
+                WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
+            wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, forwarded_irq);
         } else {
             struct kvm_regs kregs;
             struct kvm_sregs ksregs;
@@ -1478,7 +1577,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
     if (req.mode_tcg) {
         int ci = cpu->cpu_index < MAX_VCPUS ? cpu->cpu_index : 0;
         static int handoff_dbg[MAX_VCPUS] = {0};
-        wavevm_tcg_remote_slice_enter();
+        wavevm_tcg_remote_slice_enter(cpu);
         tcg_slice_active = true;
         if (handoff_dbg[ci] < 20) {
             fprintf(stderr, "[WVM-TCG-HANDOFF] cpu=%d flush begin fd=%d\n",
@@ -1492,7 +1591,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
         }
         if (flush_ret < 0) {
             wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
-            wavevm_tcg_remote_slice_leave();
+            wavevm_tcg_remote_slice_leave(cpu);
             return;
         }
         {
@@ -1526,7 +1625,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     cpu->cpu_index, vcpu_sock, errno);
             wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
             if (tcg_slice_active) {
-                wavevm_tcg_remote_slice_leave();
+                wavevm_tcg_remote_slice_leave(cpu);
             }
         }
         return;
@@ -1537,7 +1636,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     cpu->cpu_index, vcpu_sock, errno);
             wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
             if (tcg_slice_active) {
-                wavevm_tcg_remote_slice_leave();
+                wavevm_tcg_remote_slice_leave(cpu);
             }
         }
         return;
@@ -1555,7 +1654,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     cpu->cpu_index, vcpu_sock, errno);
             wavevm_user_mem_finish_handoff_dirty(dirty_journal, 0);
             if (tcg_slice_active) {
-                wavevm_tcg_remote_slice_leave();
+                wavevm_tcg_remote_slice_leave(cpu);
             }
         }
         return;
@@ -1572,7 +1671,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                     cpu->cpu_index, ack.status, ack.mode_tcg,
                     (unsigned long long)ack.error_gpa, sync_ret);
             if (tcg_slice_active) {
-                wavevm_tcg_remote_slice_leave();
+                wavevm_tcg_remote_slice_leave(cpu);
             }
         }
         return;
@@ -1583,18 +1682,17 @@ static void wavevm_remote_exec(CPUState *cpu) {
 
     // 4. 反序列化 CPU 状态
     if (ack.mode_tcg) {
-        uint32_t master_irq =
-            cpu->interrupt_request & WVM_TCG_MASTER_IRQ_PRESERVE_MASK;
-        wvm_tcg_set_state(cpu, &ack.ctx.tcg);
-        cpu->interrupt_request |= master_irq;
-        cpu->halted = ack.ctx.tcg.halted ? 1 : 0;
+        uint32_t forwarded_irq =
+            req.ctx.tcg.interrupt_request &
+            WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
+        wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, forwarded_irq);
         if (tcg_slice_active) {
-            wavevm_tcg_remote_slice_leave();
+            wavevm_tcg_remote_slice_leave(cpu);
             tcg_slice_active = false;
         }
     } else {
         if (tcg_slice_active) {
-            wavevm_tcg_remote_slice_leave();
+            wavevm_tcg_remote_slice_leave(cpu);
             tcg_slice_active = false;
         }
         struct kvm_regs kregs;
@@ -2254,6 +2352,7 @@ static void *wavevm_cpu_thread_fn(void *arg) {
                 int dbg = local_tcg_dbg[ci];
                 qemu_mutex_unlock_iothread();
                 wavevm_tcg_local_slice_enter();
+                wavevm_tcg_clear_stale_exit(cpu);
                 cpu_exec_start(cpu);
                 r = cpu_exec(cpu);
                 cpu_exec_end(cpu);
