@@ -5,6 +5,8 @@
 #include "sysemu/accel.h"
 #include "qemu/thread.h"
 
+typedef struct CPUState CPUState;
+
 /*
  * Shared WaveVM accelerator definitions (used across wavevm-*.c files).
  * Keep this header minimal: it only defines the accelerator state and
@@ -39,3 +41,5 @@ typedef struct WaveVMAccelState {
 
 extern int g_wvm_local_split;
 
+/* Bounded diagnostic for remote TCG handoff stack visibility. */
+void wavevm_tcg_log_stack(CPUState *cpu, const char *phase);

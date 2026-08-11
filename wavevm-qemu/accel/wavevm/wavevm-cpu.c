@@ -181,6 +181,9 @@ static int read_full(int fd, void *buf, size_t len)
 // TCG Helper Declarations (Defined in wavevm-tcg.c)
 extern void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx);
 extern void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
+extern void wvm_tcg_set_master_ack_state(CPUState *cpu,
+                                         wvm_tcg_context_t *ctx,
+                                         const wvm_tcg_context_t *sent);
 extern void wavevm_slave_vcpu_loop(CPUState *cpu);
 typedef struct WVMHandoffDirtyJournal WVMHandoffDirtyJournal;
 extern int wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd,
@@ -213,12 +216,13 @@ extern uint64_t wavevm_user_mem_debug_read_u64(uint64_t gpa, uint64_t offset,
 
 static void wavevm_tcg_import_remote_ack(CPUState *cpu,
                                          wvm_tcg_context_t *ctx,
+                                         const wvm_tcg_context_t *sent,
                                          uint32_t forwarded_irq)
 {
     uint32_t master_irq =
         cpu->interrupt_request & WVM_TCG_MASTER_IRQ_PRESERVE_MASK;
 
-    wvm_tcg_set_state(cpu, ctx);
+    wvm_tcg_set_master_ack_state(cpu, ctx, sent);
 
     /*
      * The ACK carries the forwarded HARD bit if the remote CPU could not
@@ -533,6 +537,8 @@ static void wavevm_tcg_run_local_wake(CPUState *cpu, X86CPU *x86cpu, int ci)
     if (log_wake) {
         CPUX86State *denv = &x86cpu->env;
         uint32_t eflags = cpu_compute_eflags(denv);
+
+        wavevm_tcg_log_stack(cpu, "master-local-wake");
         fprintf(stderr,
                 "[WVM-TCG-WAKE] cpu=%d local wake ret=%d iters=%d "
                 "interrupts=%d rip=0x%lx cs=0x%x eflags=0x%x "
@@ -1229,7 +1235,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
         // 1. 准备请求结构体
         struct wvm_ipc_cpu_run_req req;
         struct wvm_ipc_cpu_run_ack ack = {0};
+        wvm_tcg_context_t sent_tcg;
+        uint32_t forwarded_irq = 0;
         memset(&req, 0, sizeof(req));
+        memset(&sent_tcg, 0, sizeof(sent_tcg));
         
         req.slave_id = WVM_NODE_AUTO_ROUTE;
         req.vcpu_index = cpu->cpu_index;
@@ -1254,6 +1263,9 @@ static void wavevm_remote_exec(CPUState *cpu) {
         } else {
             req.mode_tcg = 1;
             wvm_tcg_get_state(cpu, &req.ctx.tcg);
+            sent_tcg = req.ctx.tcg;
+            forwarded_irq = sent_tcg.interrupt_request &
+                            WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
         }
 
         // 3. 陷入内核 (Trap into Kernel)
@@ -1285,10 +1297,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
         memcpy(&ack, &req, sizeof(ack)); 
 
         if (ack.mode_tcg) {
-            uint32_t forwarded_irq =
-                req.ctx.tcg.interrupt_request &
-                WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
-            wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, forwarded_irq);
+            wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, &sent_tcg,
+                                         forwarded_irq);
         } else {
             struct kvm_regs kregs;
             struct kvm_sregs ksregs;
@@ -1609,6 +1619,7 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 cr3_dbg[ci]++;
             }
         }
+        wavevm_tcg_log_stack(cpu, "master-pre-send");
         handoff_dbg[ci]++;
     }
 
@@ -1685,7 +1696,22 @@ static void wavevm_remote_exec(CPUState *cpu) {
         uint32_t forwarded_irq =
             req.ctx.tcg.interrupt_request &
             WVM_TCG_REMOTE_IRQ_FORWARD_MASK;
-        wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, forwarded_irq);
+        if (cpu->cpu_index > 0 &&
+            ((uint64_t)ack.ctx.tcg.eip >= 0xffffffff80000000ULL ||
+             (uint64_t)ack.ctx.tcg.eip < 0x10000ULL)) {
+            static unsigned int ack_stack_ctx_count;
+            if (ack_stack_ctx_count++ < 64) {
+                fprintf(stderr,
+                        "[WVM-TCG-STACK-CTX] phase=master-ack cpu=%d "
+                        "rip=%#llx rsp=%#llx\n",
+                        cpu->cpu_index,
+                        (unsigned long long)ack.ctx.tcg.eip,
+                        (unsigned long long)ack.ctx.tcg.regs[R_ESP]);
+            }
+        }
+        wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, &req.ctx.tcg,
+                                     forwarded_irq);
+        wavevm_tcg_log_stack(cpu, "master-post-import");
         if (tcg_slice_active) {
             wavevm_tcg_remote_slice_leave(cpu);
             tcg_slice_active = false;

@@ -937,6 +937,7 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
             if (log_exec) {
                 wavevm_log_slave_timer_state(cpu, "pre", exec_seq);
             }
+            wavevm_tcg_log_stack(cpu, "slave-pre-exec");
             qemu_mutex_unlock_iothread();
             if (log_run || log_exec) {
                 fprintf(stderr,
@@ -952,6 +953,7 @@ void wavevm_slave_vcpu_loop(CPUState *cpu)
                         cpu->cpu_index);
             }
             exec_ret = cpu_exec(cpu);
+            wavevm_tcg_log_stack(cpu, "slave-post-exec");
             qemu_mutex_lock(&g_tcg_kick_lock);
             if (kick_generation == g_tcg_kick_generation) {
                 g_tcg_kick_generation++;

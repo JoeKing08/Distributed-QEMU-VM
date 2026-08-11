@@ -5,6 +5,7 @@
 #include "hw/i386/apic.h"
 #include "hw/i386/apic_internal.h"
 #include "../../../common_include/wavevm_protocol.h"
+#include "wavevm-accel.h"
 
 #if defined(TARGET_I386) || defined(TARGET_X86_64)
 
@@ -23,10 +24,70 @@ QEMU_BUILD_BUG_ON(MSR_MTRRcap_VCNT != WVM_TCG_MTRR_VAR_NB);
      CPU_INTERRUPT_TGT_EXT_4 | CPU_INTERRUPT_TGT_INT_0 | \
      CPU_INTERRUPT_TGT_INT_1 | CPU_INTERRUPT_TGT_INT_2)
 
+void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx);
+
+void wavevm_tcg_log_stack(CPUState *cpu, const char *phase)
+{
+    static unsigned int sample_count;
+    static unsigned int suspicious_count;
+    X86CPU *x86_cpu = X86_CPU(cpu);
+    CPUX86State *env = &x86_cpu->env;
+    target_ulong rip = env->eip;
+    target_ulong rsp = env->regs[R_ESP];
+    uint8_t stack[32] = {0};
+    bool kernel_rip;
+    bool long_mode;
+    bool suspicious;
+    bool master_phase;
+    int ret;
+
+    /*
+     * The failure happens in the 64-bit kernel on remote CPU2.  Avoid
+     * firmware/userspace noise, but keep a small budget for a corrupted low
+     * RIP/RSP so the first bad return target is still captured.
+     */
+    kernel_rip = (uint64_t)rip >= 0xffffffff80000000ULL;
+    long_mode = (env->efer & MSR_EFER_LMA) != 0;
+    suspicious = (uint64_t)rip < 0x10000ULL ||
+                 (uint64_t)rsp < 0xffff800000000000ULL ||
+                 (long_mode && !kernel_rip);
+    /*
+     * A slave helper owns one local CPUState(0), even when that object is
+     * executing an imported remote vCPU.  Filter only master CPU0's local
+     * path; otherwise the most useful slave-side samples disappear.
+     */
+    master_phase = strncmp(phase, "master-", 7) == 0;
+    if ((master_phase && cpu->cpu_index == 0) ||
+        (!kernel_rip && !suspicious)) {
+        return;
+    }
+    if (suspicious) {
+        if (suspicious_count++ >= 16) {
+            return;
+        }
+    } else if (sample_count++ >= 64) {
+        return;
+    }
+
+    ret = cpu_memory_rw_debug(cpu, rsp, stack, sizeof(stack), 0);
+    fprintf(stderr,
+            "[WVM-TCG-STACK] phase=%s cpu=%d rip=%#llx rsp=%#llx "
+            "ret=%d q0=%#llx q1=%#llx q2=%#llx q3=%#llx\n",
+            phase, cpu->cpu_index,
+            (unsigned long long)rip,
+            (unsigned long long)rsp,
+            ret,
+            ret == 0 ? (unsigned long long)ldq_le_p(stack) : 0ULL,
+            ret == 0 ? (unsigned long long)ldq_le_p(stack + 8) : 0ULL,
+            ret == 0 ? (unsigned long long)ldq_le_p(stack + 16) : 0ULL,
+            ret == 0 ? (unsigned long long)ldq_le_p(stack + 24) : 0ULL);
+}
+
 static void wvm_tcg_get_lapic_state(CPUState *cpu,
                                     wvm_tcg_lapic_state_t *dst)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
+    int64_t now;
 
     memset(dst, 0, sizeof(*dst));
     if (!x86_cpu->apic_state) {
@@ -39,6 +100,7 @@ static void wvm_tcg_get_lapic_state(CPUState *cpu,
     if (klass->pre_save) {
         klass->pre_save(apic);
     }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     dst->valid = 1;
     dst->apicbase = apic->apicbase;
@@ -53,9 +115,19 @@ static void wvm_tcg_get_lapic_state(CPUState *cpu,
     dst->divide_conf = apic->divide_conf;
     dst->initial_count = apic->initial_count;
     dst->count_shift = apic->count_shift;
-    dst->initial_count_load_time = apic->initial_count_load_time;
-    dst->next_time = apic->next_time;
-    dst->timer_expiry = apic->timer_expiry;
+    /*
+     * QEMU migration normally preserves the VM-wide virtual clock epoch.
+     * WaveVM's master and slave are separate QEMU processes, so transfer
+     * timer fields relative to the exporting clock and rebase on import.
+     */
+    dst->initial_count_load_time = apic->initial_count_load_time - now;
+    if (apic->timer_expiry == -1) {
+        dst->next_time = 0;
+        dst->timer_expiry = -1;
+    } else {
+        dst->next_time = apic->next_time - now;
+        dst->timer_expiry = apic->timer_expiry - now;
+    }
     dst->sipi_vector = apic->sipi_vector;
     dst->wait_for_sipi = apic->wait_for_sipi;
     dst->id = apic->id;
@@ -70,6 +142,7 @@ static void wvm_tcg_set_lapic_state(CPUState *cpu,
                                     const wvm_tcg_lapic_state_t *src)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
+    int64_t now;
 
     if (!src->valid || !x86_cpu->apic_state) {
         return;
@@ -77,6 +150,7 @@ static void wvm_tcg_set_lapic_state(CPUState *cpu,
 
     APICCommonState *apic = APIC_COMMON(x86_cpu->apic_state);
     APICCommonClass *klass = APIC_COMMON_GET_CLASS(apic);
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     apic->apicbase = src->apicbase;
     apic->initial_apic_id = src->initial_apic_id;
@@ -90,9 +164,14 @@ static void wvm_tcg_set_lapic_state(CPUState *cpu,
     apic->divide_conf = src->divide_conf;
     apic->initial_count = src->initial_count;
     apic->count_shift = src->count_shift;
-    apic->initial_count_load_time = src->initial_count_load_time;
-    apic->next_time = src->next_time;
-    apic->timer_expiry = src->timer_expiry;
+    apic->initial_count_load_time = now + src->initial_count_load_time;
+    if (src->timer_expiry == -1) {
+        apic->next_time = 0;
+        apic->timer_expiry = -1;
+    } else {
+        apic->next_time = now + src->next_time;
+        apic->timer_expiry = now + src->timer_expiry;
+    }
     apic->sipi_vector = src->sipi_vector;
     apic->wait_for_sipi = src->wait_for_sipi;
     apic->id = src->id;
@@ -106,6 +185,64 @@ static void wvm_tcg_set_lapic_state(CPUState *cpu,
         klass->post_load(apic);
     }
     apic_poll_irq(x86_cpu->apic_state);
+}
+
+/*
+ * The master remains the authority for device and APIC delivery while a TCG
+ * slice executes remotely.  Preserve vectors that arrived on the master
+ * after the request snapshot, but leave vectors already present in that
+ * snapshot owned by the returning remote execution state.
+ */
+void wvm_tcg_set_master_ack_state(CPUState *cpu, wvm_tcg_context_t *ctx,
+                                  const wvm_tcg_context_t *sent)
+{
+    wvm_tcg_lapic_state_t master_lapic;
+    X86CPU *x86_cpu = X86_CPU(cpu);
+    APICCommonState *apic;
+    uint32_t arrivals[ARRAY_SIZE(master_lapic.irr)] = {0};
+    bool merged = false;
+    unsigned int i;
+
+    wvm_tcg_get_lapic_state(cpu, &master_lapic);
+    wvm_tcg_set_state(cpu, ctx);
+
+    if (!sent || !sent->lapic.valid || !master_lapic.valid ||
+        !ctx->lapic.valid || !x86_cpu->apic_state) {
+        return;
+    }
+
+    apic = APIC_COMMON(x86_cpu->apic_state);
+    for (i = 0; i < ARRAY_SIZE(apic->irr); i++) {
+        arrivals[i] = master_lapic.irr[i] & ~sent->lapic.irr[i];
+        if (!arrivals[i]) {
+            continue;
+        }
+
+        /*
+         * TMR is meaningful only for vectors that remain pending.  Preserve
+         * the trigger mode recorded by the master for each newly arrived
+         * vector while retaining the slave's state for all other vectors.
+         */
+        apic->irr[i] |= arrivals[i];
+        apic->tmr[i] = (apic->tmr[i] & ~arrivals[i]) |
+                       (master_lapic.tmr[i] & arrivals[i]);
+        merged = true;
+    }
+
+    if (merged) {
+        static unsigned int merge_log_count;
+
+        if (merge_log_count++ < 32) {
+            fprintf(stderr,
+                    "[WVM-TCG-LAPIC-MERGE] cpu=%d sent_irr7=%#x "
+                    "master_irr7=%#x ack_irr7=%#x add_irr7=%#x "
+                    "merged_irr7=%#x\n",
+                    cpu->cpu_index, sent->lapic.irr[7],
+                    master_lapic.irr[7], ctx->lapic.irr[7], arrivals[7],
+                    apic->irr[7]);
+        }
+        apic_poll_irq(x86_cpu->apic_state);
+    }
 }
 
 // Export QEMU TCG state to network packet
@@ -184,7 +321,12 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     memcpy(ctx->dr, env->dr, sizeof(ctx->dr));
     ctx->vm_hsave      = env->vm_hsave;
     ctx->vm_vmcb       = env->vm_vmcb;
-    ctx->tsc_offset    = env->tsc_offset;
+    /*
+     * cpu_get_tsc() is local to each QEMU process.  Carry an absolute guest
+     * TSC anchor rather than the source process's additive offset, then
+     * derive the receiver-local offset during import.
+     */
+    ctx->tsc_offset    = cpu_get_tsc(env) + env->tsc_offset;
     ctx->intercept     = env->intercept;
     ctx->nested_cr3    = env->nested_cr3;
     ctx->nested_pg_mode = env->nested_pg_mode;
@@ -244,6 +386,20 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     ctx->error_code    = 0;
     ctx->exception_is_int = 0;
     wvm_tcg_get_lapic_state(cpu, &ctx->lapic);
+    {
+        static unsigned int tsc_export_count[16];
+        unsigned int slot = (unsigned int)cpu->cpu_index % ARRAY_SIZE(tsc_export_count);
+
+        if (tsc_export_count[slot]++ < 16) {
+            fprintf(stderr,
+                    "[WVM-TCG-TSC] phase=export cpu=%d local=%#llx "
+                    "offset=%#llx guest=%#llx\n",
+                    cpu->cpu_index,
+                    (unsigned long long)cpu_get_tsc(env),
+                    (unsigned long long)env->tsc_offset,
+                    (unsigned long long)ctx->tsc_offset);
+        }
+    }
     {
         X86XSaveArea xsave;
 
@@ -337,7 +493,26 @@ void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     cpu_x86_update_dr7(env, ctx->dr[7]);
     env->vm_hsave      = ctx->vm_hsave;
     env->vm_vmcb       = ctx->vm_vmcb;
-    env->tsc_offset    = ctx->tsc_offset;
+    {
+        uint64_t local_tsc = cpu_get_tsc(env);
+
+        env->tsc_offset = ctx->tsc_offset - local_tsc;
+        {
+            static unsigned int tsc_import_count[16];
+            unsigned int slot =
+                (unsigned int)cpu->cpu_index % ARRAY_SIZE(tsc_import_count);
+
+            if (tsc_import_count[slot]++ < 16) {
+                fprintf(stderr,
+                        "[WVM-TCG-TSC] phase=import cpu=%d local=%#llx "
+                        "guest=%#llx offset=%#llx\n",
+                        cpu->cpu_index,
+                        (unsigned long long)local_tsc,
+                        (unsigned long long)ctx->tsc_offset,
+                        (unsigned long long)env->tsc_offset);
+            }
+        }
+    }
     env->intercept     = ctx->intercept;
     env->nested_cr3    = ctx->nested_cr3;
     env->nested_pg_mode = ctx->nested_pg_mode;
@@ -465,6 +640,12 @@ void wvm_tcg_get_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
 void wvm_tcg_set_state(CPUState *cpu, wvm_tcg_context_t *ctx) {
     (void)cpu;
     (void)ctx;
+}
+
+void wavevm_tcg_log_stack(CPUState *cpu, const char *phase)
+{
+    (void)cpu;
+    (void)phase;
 }
 
 #endif

@@ -1092,6 +1092,18 @@ static void sigsegv_handler(int sig, siginfo_t *si, void *ucontext) {
     }
 
     if (is_write) {
+        if (get_local_page_version(gpa) == 0) {
+            /*
+             * A first touch may be a write fault.  Pull the directory copy
+             * before arming CBW; otherwise the slave writes on an implicit
+             * zero/old page and later commits version 1 over a newer owner
+             * version.
+             */
+            if (request_page_sync(addr, true) != 0) {
+                _exit(1);
+            }
+        }
+
         // 从预分配池中取，不要 malloc!
         int idx = atomic_fetch_add(&g_pool_idx, 1) % PAGE_POOL_SIZE;
         WritablePage *wp = &g_page_pool[idx];

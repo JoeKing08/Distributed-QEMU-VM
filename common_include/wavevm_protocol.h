@@ -309,6 +309,11 @@ typedef struct {
     uint32_t divide_conf;
     uint32_t initial_count;
     int32_t count_shift;
+    /*
+     * Offsets from the exporting QEMU_CLOCK_VIRTUAL.  WaveVM hands a TCG
+     * vCPU between independent QEMU processes, whose virtual clock epochs
+     * differ; raw APIC timer timestamps would otherwise expire immediately.
+     */
     int64_t initial_count_load_time;
     int64_t next_time;
     int64_t timer_expiry;
@@ -360,7 +365,13 @@ typedef struct {
     uint32_t a20_mask;
     uint32_t mp_state;
     uint64_t dr[8];
-    uint64_t vm_hsave, vm_vmcb, tsc_offset, intercept, nested_cr3;
+    uint64_t vm_hsave, vm_vmcb, intercept, nested_cr3;
+    /*
+     * TCG handoff encodes the current absolute guest TSC here.  Each QEMU
+     * process has its own elapsed-ticks epoch, so the receiver derives its
+     * local QEMU tsc_offset from this value.
+     */
+    uint64_t tsc_offset;
     uint64_t mtrr_fixed[WVM_TCG_MTRR_FIXED_NB];
     uint64_t mtrr_deftype;
     wvm_tcg_mtrr_var_t mtrr_var[WVM_TCG_MTRR_VAR_NB];
