@@ -14,7 +14,7 @@ mkdir -p "$ART_DIR"
 
 PROJECT_USER="${CIRCLE_PROJECT_USERNAME:-${WAVEVM_CI_ROLE:-}}"
 case "$PROJECT_USER" in
-  jktest020|020|node-a|a) ROLE="A" ;;
+  jktest019|019|jktest020|020|node-a|a) ROLE="A" ;;
   jktest021|021|node-b|b) ROLE="B" ;;
   *)
     echo "ERROR: cannot infer CI role from CIRCLE_PROJECT_USERNAME='$PROJECT_USER'" >&2
