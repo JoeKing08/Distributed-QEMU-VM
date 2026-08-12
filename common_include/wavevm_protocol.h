@@ -443,6 +443,16 @@ struct wvm_ipc_cpu_run_ack {
     } ctx;
 };
 
+/*
+ * Mode A transfers CPU_RUN through an ioctl.  The response is larger than
+ * the request, so it must use an explicit request/response container rather
+ * than overwriting a request-sized userspace object with an ACK.
+ */
+struct wvm_ioctl_remote_run {
+    struct wvm_ipc_cpu_run_req req;
+    struct wvm_ipc_cpu_run_ack ack;
+};
+
 static inline uint64_t wvm_get_u64_unaligned(const void *ptr) {
     uint64_t val;
     memcpy(&val, ptr, 8);

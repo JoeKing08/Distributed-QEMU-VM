@@ -35,8 +35,11 @@ mount -o remount,size=8G /dev/shm
 # === NODE config (for masters — g_gateways[] points to local sidecars) ===
 CFG="$ART_DIR/fract_2node.conf"
 cat > "$CFG" <<'EOCFG'
-NODE 0 127.0.0.1 19120 2 1
-NODE 1 127.0.0.1 19220 1 1
+# NODE <physical_id> <ip> <sidecar_port> <cpu_capacity> <memory_gib> <dht_slots>
+NODE 0 127.0.0.1 19120 2 2 1
+NODE 1 127.0.0.1 19220 1 1 1
+# VM <vm_id> <vcpus> <memory_mb> <compact|spread>
+VM 0 3 3072 compact
 EOCFG
 
 # === 3-level fractal gateway route configs ===
@@ -151,6 +154,53 @@ wait_for_remote_tcg() {
 
 QPATH="$ROOT/wavevm-qemu/build-native:$PATH"
 
+make -C "$ROOT/ctl_tool" >/dev/null
+"$ROOT/ctl_tool/wvm_ctl" --plan "$CFG" 0 >"$ART_DIR/resource_plan.txt"
+
+plan_value() {
+  sed -n "s/^$1=//p" "$ART_DIR/resource_plan.txt" | head -n1
+}
+
+NODE0_CORES=$(plan_value WVM_PLAN_VM0_NODE0_VCPUS)
+NODE1_CORES=$(plan_value WVM_PLAN_VM0_NODE1_VCPUS)
+NODE0_MEM_MB=$(plan_value WVM_PLAN_VM0_NODE0_MEMORY_MB)
+NODE1_MEM_MB=$(plan_value WVM_PLAN_VM0_NODE1_MEMORY_MB)
+NODE0_VNODE=$(plan_value WVM_PLAN_NODE0_VNODE)
+NODE1_VNODE=$(plan_value WVM_PLAN_NODE1_VNODE)
+TOTAL_VCPUS=$(plan_value WVM_PLAN_VM0_VCPUS)
+TOTAL_MEM_MB=$(plan_value WVM_PLAN_VM0_MEMORY_MB)
+
+for value in NODE0_CORES NODE1_CORES NODE0_MEM_MB NODE1_MEM_MB NODE0_VNODE NODE1_VNODE TOTAL_VCPUS TOTAL_MEM_MB; do
+  case "${!value}" in
+    ''|*[!0-9]*)
+      echo "ERROR: planner did not provide a numeric $value" >&2
+      exit 1
+      ;;
+  esac
+done
+for value in NODE0_CORES NODE1_CORES NODE0_MEM_MB NODE1_MEM_MB TOTAL_VCPUS TOTAL_MEM_MB; do
+  if [ "${!value}" -eq 0 ]; then
+    echo "ERROR: planner did not provide a positive $value" >&2
+    exit 1
+  fi
+done
+if [ "$TOTAL_VCPUS" -ne $((NODE0_CORES + NODE1_CORES)) ] ||
+   [ "$TOTAL_MEM_MB" -ne $((NODE0_MEM_MB + NODE1_MEM_MB)) ]; then
+  echo "ERROR: planner output is inconsistent" >&2
+  exit 1
+fi
+
+cpu_range() {
+  if [ "$1" -eq "$2" ]; then
+    printf '%s' "$1"
+  else
+    printf '%s-%s' "$1" "$2"
+  fi
+}
+
+NODE0_CPU_RANGE=$(cpu_range 0 $((NODE0_CORES - 1)))
+NODE1_CPU_RANGE=$(cpu_range "$NODE0_CORES" $((TOTAL_VCPUS - 1)))
+
 # === Start 5 gateways (top-down: L2 → L1a/L1b → sidecar_a/sidecar_b) ===
 
 echo "=== Starting L2 gateway (top, full table) ==="
@@ -175,34 +225,27 @@ GSA=$!
 GSB=$!
 
 echo "=== Starting slaves ==="
-(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB=3072 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19105 2 2048 0 19121) >"$ART_DIR/slave0.log" 2>&1 &
+(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB="$TOTAL_MEM_MB" WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19105 "$NODE0_CORES" "$NODE0_MEM_MB" "$NODE0_VNODE" 19121) >"$ART_DIR/slave0.log" 2>&1 &
 S0=$!
-(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB=3072 WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19205 1 1024 1 19221) >"$ART_DIR/slave1.log" 2>&1 &
+(env PATH="$QPATH" WVM_TCG_QEMU_MACHINE=q35 WVM_TCG_QEMU_MEM_MB="$TOTAL_MEM_MB" WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/slave_daemon/wavevm_node_slave" 19205 "$NODE1_CORES" "$NODE1_MEM_MB" "$NODE1_VNODE" 19221) >"$ART_DIR/slave1.log" 2>&1 &
 S1=$!
 
 echo "=== Starting masters ==="
-(env PATH="$QPATH" WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/master_core/wavevm_node_master" 2048 19100 "$CFG" 0 19121 19105 1) >"$ART_DIR/master0.log" 2>&1 &
+(env PATH="$QPATH" WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/master_core/wavevm_node_master" "$NODE0_MEM_MB" 19100 "$CFG" 0 19121 19105 1) >"$ART_DIR/master0.log" 2>&1 &
 M0=$!
-(env PATH="$QPATH" WVM_INSTANCE_ID=1 WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/master_core/wavevm_node_master" 1024 19200 "$CFG" 1 19221 19205 1) >"$ART_DIR/master1.log" 2>&1 &
+(env PATH="$QPATH" WVM_INSTANCE_ID=1 WVM_SHM_FILE=/wvm_fract_node1 stdbuf -oL -eL "$ROOT/master_core/wavevm_node_master" "$NODE1_MEM_MB" 19200 "$CFG" 1 19221 19205 1) >"$ART_DIR/master1.log" 2>&1 &
 M1=$!
 
 echo "=== Waiting 8s for convergence ==="
 sleep 8
 
 echo "=== Starting QEMU (TCG mode, no KVM) ==="
-NODE0_CORES=$(awk '$1 == "NODE" && $2 == 0 { print $5; exit }' "$CFG")
-case "$NODE0_CORES" in
-  ''|*[!0-9]*|0)
-    echo "ERROR: node 0 core count missing or invalid in $CFG" >&2
-    exit 1
-    ;;
-esac
 (env PATH="$QPATH" WVM_INSTANCE_ID=0 WVM_SHM_FILE=/wvm_fract_node0 stdbuf -oL -eL "$ROOT/wavevm-qemu/build-native/qemu-system-x86_64" \
-  -accel "wavevm,split=$NODE0_CORES" -machine q35 -m 3072 -smp 3 \
-  -object memory-backend-ram,id=ram0,size=2048M \
-  -object memory-backend-ram,id=ram1,size=1024M \
-  -numa node,memdev=ram0,cpus=0-1,nodeid=0 \
-  -numa node,memdev=ram1,cpus=2,nodeid=1 \
+  -accel "wavevm,split=$NODE0_CORES" -machine q35 -m "$TOTAL_MEM_MB" -smp "$TOTAL_VCPUS" \
+  -object memory-backend-ram,id=ram0,size="${NODE0_MEM_MB}M" \
+  -object memory-backend-ram,id=ram1,size="${NODE1_MEM_MB}M" \
+  -numa node,memdev=ram0,cpus="$NODE0_CPU_RANGE",nodeid=0 \
+  -numa node,memdev=ram1,cpus="$NODE1_CPU_RANGE",nodeid=1 \
   -drive file="$ROOT/artifacts/images/cirros-0.6.2-x86_64-disk.img",if=virtio,format=qcow2 \
   -netdev user,id=ne,hostfwd=tcp::2226-:22 -device e1000,netdev=ne \
   -display none -vga none \

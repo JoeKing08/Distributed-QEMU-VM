@@ -340,6 +340,8 @@ static void register_page_subscriber(page_meta_t *page, uint32_t node_id) {
 }
 
 static uint32_t g_cpu_route_table[WVM_CPU_ROUTE_TABLE_SIZE];
+static uint32_t g_memory_route_table[WVM_MEMORY_ROUTE_TABLE_SIZE];
+static uint8_t g_memory_route_valid[WVM_MEMORY_ROUTE_TABLE_SIZE];
 
 /* 
  * [物理意图] 建立 vCPU 索引与物理计算节点 ID 之间的静态/动态映射表。
@@ -350,6 +352,12 @@ void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id) {
     // 这里的边界检查现在是安全的，与全局配置一致
     if (vcpu_index >= 0 && vcpu_index < WVM_CPU_ROUTE_TABLE_SIZE) {
         g_cpu_route_table[vcpu_index] = slave_id;
+    }
+}
+
+void wvm_clear_cpu_mappings(void) {
+    for (int i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i++) {
+        g_cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
     }
 }
 
@@ -373,6 +381,24 @@ uint32_t wvm_get_compute_slave_id(int vcpu_index) {
 
 const uint32_t* wvm_get_cpu_route_table(void) {
     return g_cpu_route_table;
+}
+
+void wvm_set_memory_mapping(int chunk_index, uint32_t node_id) {
+    if (chunk_index >= 0 && chunk_index < WVM_MEMORY_ROUTE_TABLE_SIZE) {
+        g_memory_route_table[chunk_index] = node_id;
+        g_memory_route_valid[chunk_index] = 1;
+    }
+}
+
+void wvm_clear_memory_mappings(void) {
+    memset(g_memory_route_valid, 0, sizeof(g_memory_route_valid));
+    for (int i = 0; i < WVM_MEMORY_ROUTE_TABLE_SIZE; i++) {
+        g_memory_route_table[i] = WVM_NODE_AUTO_ROUTE;
+    }
+}
+
+const uint32_t* wvm_get_memory_route_table(void) {
+    return g_memory_route_table;
 }
 
 /* 
@@ -982,9 +1008,8 @@ int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint) {
     
     init_broadcast_shards();
 
-    for (int i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i++) {
-        g_cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
-    }
+    wvm_clear_cpu_mappings();
+    wvm_clear_memory_mappings();
     
     g_total_nodes = (total_nodes_hint > 0) ? total_nodes_hint : 1;
     return 0;
@@ -1005,6 +1030,16 @@ void wvm_set_my_node_id(int id) {
 
 // DHT 路由
 uint32_t wvm_get_directory_node_id(uint64_t gpa) {
+    uint64_t chunk = gpa >> WVM_ROUTING_SHIFT;
+    uint32_t target;
+
+    if (chunk < WVM_MEMORY_ROUTE_TABLE_SIZE &&
+        g_memory_route_valid[chunk]) {
+        target = g_memory_route_table[chunk];
+        if (target != WVM_NODE_AUTO_ROUTE) {
+            return WVM_ENCODE_ID(g_my_vm_id, target);
+        }
+    }
     // 在百万节点规模下，即使局部视图不一致，路由结果也能大概率收敛
     // [Multi-VM] 返回 composite ID (vm_id | node_id) 用于网络寻址
     return WVM_ENCODE_ID(g_my_vm_id, get_owner_node_id(gpa));

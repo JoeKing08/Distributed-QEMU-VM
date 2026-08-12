@@ -59,9 +59,13 @@ uint32_t wvm_get_cpu_mapping_raw(int vcpu_index);
 
 // 导出 CPU 路由表（供内核态注入）
 const uint32_t* wvm_get_cpu_route_table(void);
+const uint32_t* wvm_get_memory_route_table(void);
 
 void wvm_set_mem_mapping(int slot, uint32_t value);
+void wvm_set_memory_mapping(int chunk_index, uint32_t node_id);
+void wvm_clear_memory_mappings(void);
 
 void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
+void wvm_clear_cpu_mappings(void);
 
 #endif // LOGIC_CORE_H

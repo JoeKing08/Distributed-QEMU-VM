@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -O2 -msse4.2 -I../common_include -pthread
 TARGET = wavevm_node_master
-SRCS = logic_core.c user_backend.c main_wrapper.c
+SRCS = logic_core.c user_backend.c main_wrapper.c ../common_include/wavevm_resources.c
 
 all: $(TARGET)
 

@@ -71,7 +71,10 @@ typedef struct {
     bool track_dirty;
 } wvm_kvm_slot_t;
 
-static wvm_kvm_slot_t g_kvm_slots[4];
+#define WVM_KVM_MAX_MEMSLOTS 32
+#define WVM_KVM_MAX_VCPUS    WVM_CPU_ROUTE_TABLE_SIZE
+
+static wvm_kvm_slot_t g_kvm_slots[WVM_KVM_MAX_MEMSLOTS];
 static int g_kvm_slot_count = 0;
 static uint8_t *g_kvm_reserved_hva = NULL;
 static size_t g_kvm_reserved_size = 0;
@@ -83,12 +86,22 @@ static struct sockaddr_in g_master_addr;
 static char *g_vfio_config_path = NULL; 
 int g_ctrl_port = 9001; // 真实定义，供应给 wavevm_node_slave
 
-// --- KVM_RUN alarm timeout (thread-directed) ---
+// --- KVM_RUN slice preemption (thread-directed) ---
+static __thread struct kvm_run *t_kvm_run = NULL;
 static __thread volatile sig_atomic_t t_kvm_alarm_fired = 0;
+static int g_kvm_immediate_exit = 0;
 
 static void kvm_alarm_handler(int sig) {
     (void)sig;
     t_kvm_alarm_fired = 1;
+    /*
+     * KVM_CAP_IMMEDIATE_EXIT is the native way to interrupt KVM_RUN.  The
+     * signal remains necessary on older hosts, where it is expected to make
+     * the ioctl return EINTR instead.
+     */
+    if (g_kvm_immediate_exit && t_kvm_run) {
+        __atomic_store_n(&t_kvm_run->immediate_exit, 1, __ATOMIC_RELEASE);
+    }
 }
 
 // MPSC 队列数据结构
@@ -364,11 +377,15 @@ static struct {
 } g_numa_nodes[WVM_NUMA_MAX_NODES];
 static int g_numa_node_count = 0;
 static __thread int t_vcpu_fd = -1;
-static __thread struct kvm_run *t_kvm_run = NULL;
-static int g_boot_vcpu_fd = -1;
-static struct kvm_run *g_boot_kvm_run = NULL;
+static __thread int t_vcpu_id = -1;
+static struct {
+    int fd;
+    struct kvm_run *run;
+} g_kvm_vcpus[WVM_KVM_MAX_VCPUS];
+static pthread_mutex_t g_kvm_vcpu_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_spinlock_t g_master_lock;
 static int g_wvm_dev_fd = -1;
+static int g_wvm_device_ram_mapping = 0;
 static int g_base_id = 0;
 static uint8_t g_slave_vm_id = 0;
 static int g_vcpu_init_debug_once = 0;
@@ -465,17 +482,25 @@ void init_kvm_global() {
 
     g_wvm_dev_fd = open("/dev/wavevm", O_RDWR);
     
-    // MAP_SHARED 是必须的，否则 madvise 无法正确通知 KVM 释放页面
-    if (g_wvm_dev_fd >= 0) {
+    /*
+     * WVM_NUMA_MAP describes the complete guest physical address space.
+     * It takes precedence over the device mapping: /dev/wavevm remains open
+     * for Mode A control/dirty-page semantics, while each slave must still
+     * see every guest RAM region when it executes a remote vCPU.
+     */
+    const char *numa_map = getenv("WVM_NUMA_MAP");
+    if (g_wvm_dev_fd >= 0 && !numa_map) {
         printf("[Hybrid] KVM: Detected /dev/wavevm. Enabling On-Demand Paging (Fast Path).\n");
         g_phy_ram = mmap(NULL, g_slave_ram_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_wvm_dev_fd, 0);
+        if (g_phy_ram != MAP_FAILED) {
+            g_wvm_device_ram_mapping = 1;
+        }
     } else {
         /* [FIX] NUMA-aware multi-SHM mapping.
          * WVM_NUMA_MAP="size_mb:shm_path,size_mb:shm_path,..."
          * Entries are ordered by GPA. Each slave maps ALL regions so the
          * full guest physical address space is accessible.
          * Falls back to WVM_SHM_FILE (single region at GPA 0) if unset. */
-        const char *numa_map = getenv("WVM_NUMA_MAP");
         if (numa_map) {
             /* --- Phase 1: parse entries, compute total size --- */
             /* Parse WVM_NUMA_MAP: "gpa_hex:size_mb:shm_path,..."
@@ -612,30 +637,15 @@ void init_kvm_global() {
     }
     fprintf(stderr, "[Slave] No IRQCHIP (avoiding nested virt conflict)\n");
 
-    /* Create boot vCPU eagerly (fast path for init_thread_local_vcpu). */
-    errno = 0;
-    int boot_vcpu_id = 0;
-    g_boot_vcpu_fd = ioctl(g_vm_fd, KVM_CREATE_VCPU, boot_vcpu_id);
-    if (g_boot_vcpu_fd < 0 && errno == EEXIST) {
-        for (int try_id = 1; try_id < 8192; try_id++) {
-            g_boot_vcpu_fd = ioctl(g_vm_fd, KVM_CREATE_VCPU, try_id);
-            if (g_boot_vcpu_fd >= 0) {
-                boot_vcpu_id = try_id;
-                break;
-            }
-            if (errno != EEXIST) break;
-        }
+    for (int i = 0; i < WVM_KVM_MAX_VCPUS; i++) {
+        g_kvm_vcpus[i].fd = -1;
+        g_kvm_vcpus[i].run = NULL;
     }
-    fprintf(stderr, "[Slave BootVCPU] fd=%d errno=%d vm=%d kvm=%d id=%d\n",
-            g_boot_vcpu_fd, errno, g_vm_fd, g_kvm_fd, boot_vcpu_id);
-    if (g_boot_vcpu_fd >= 0) {
-        int mmap_size = ioctl(g_kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-        if (mmap_size > 0) {
-            g_boot_kvm_run = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE,
-                                  MAP_SHARED, g_boot_vcpu_fd, 0);
-            if (g_boot_kvm_run == MAP_FAILED) g_boot_kvm_run = NULL;
-        }
-    }
+    g_kvm_immediate_exit =
+        ioctl(g_kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) > 0;
+    fprintf(stderr, "[Slave KVM] immediate_exit=%d numa_nodes=%d device_ram=%d\n",
+            g_kvm_immediate_exit, g_numa_node_count,
+            g_wvm_device_ram_mapping);
 
     g_kvm_slot_count = 0;
 
@@ -770,10 +780,14 @@ void init_kvm_global() {
 }
 
 void init_thread_local_vcpu(int vcpu_id) {
-    if (t_vcpu_fd >= 0) return;
+    if (vcpu_id < 0 || vcpu_id >= WVM_KVM_MAX_VCPUS) {
+        fprintf(stderr, "[Slave VCPU Init] invalid guest vcpu=%d\n", vcpu_id);
+        return;
+    }
+    if (t_vcpu_fd >= 0 && t_vcpu_id == vcpu_id) return;
     if (__sync_bool_compare_and_swap(&g_vcpu_init_debug_once, 0, 1)) {
-        fprintf(stderr, "[Slave VCPU Init] enter vm=%d kvm=%d boot_fd=%d boot_run=%p req_vcpu=%d\n",
-                g_vm_fd, g_kvm_fd, g_boot_vcpu_fd, (void*)g_boot_kvm_run, vcpu_id);
+        fprintf(stderr, "[Slave VCPU Init] enter vm=%d kvm=%d req_vcpu=%d\n",
+                g_vm_fd, g_kvm_fd, vcpu_id);
     }
     if (g_vm_fd < 0 || g_kvm_fd < 0) {
         fprintf(stderr, "[Slave VCPU Init] invalid fds vm=%d kvm=%d vcpu=%d\n",
@@ -781,65 +795,45 @@ void init_thread_local_vcpu(int vcpu_id) {
         return;
     }
 
-    /* Preferred fast path: reuse boot vCPU 0 that was pre-created at init. */
-    if (g_boot_vcpu_fd >= 0) {
-        if (!g_boot_kvm_run) {
-            int mmap_size = ioctl(g_kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-            if (mmap_size > 0) {
-                g_boot_kvm_run = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, g_boot_vcpu_fd, 0);
-                if (g_boot_kvm_run == MAP_FAILED) {
-                    g_boot_kvm_run = NULL;
-                }
-            }
-        }
-        if (g_boot_kvm_run) {
-            t_vcpu_fd = g_boot_vcpu_fd;
-            t_kvm_run = g_boot_kvm_run;
-            return;
-        }
+    pthread_mutex_lock(&g_kvm_vcpu_lock);
+    if (g_kvm_vcpus[vcpu_id].fd >= 0 && g_kvm_vcpus[vcpu_id].run) {
+        t_vcpu_fd = g_kvm_vcpus[vcpu_id].fd;
+        t_kvm_run = g_kvm_vcpus[vcpu_id].run;
+        t_vcpu_id = vcpu_id;
+        pthread_mutex_unlock(&g_kvm_vcpu_lock);
+        return;
     }
 
-    int chosen_vcpu_id = vcpu_id;
     t_vcpu_fd = ioctl(g_vm_fd, KVM_CREATE_VCPU, vcpu_id);
-    if (t_vcpu_fd < 0 && errno == EEXIST) {
-        /* Some hosts reserve vcpu0 in-kernel. Probe a small contiguous range. */
-        for (int try_id = 1; try_id < 8192; try_id++) {
-            t_vcpu_fd = ioctl(g_vm_fd, KVM_CREATE_VCPU, try_id);
-            if (t_vcpu_fd >= 0) {
-                chosen_vcpu_id = try_id;
-                break;
-            }
-            if (errno != EEXIST) break;
-        }
-    }
-    if (t_vcpu_fd < 0 && errno == EEXIST && g_boot_vcpu_fd >= 0) {
-        chosen_vcpu_id = 0;
-        t_vcpu_fd = g_boot_vcpu_fd;
-    }
     if (t_vcpu_fd < 0) {
         fprintf(stderr, "[Slave VCPU Init] KVM_CREATE_VCPU failed vcpu=%d errno=%d\n",
                 vcpu_id, errno);
+        pthread_mutex_unlock(&g_kvm_vcpu_lock);
         return;
-    }
-    if (chosen_vcpu_id != vcpu_id) {
-        fprintf(stderr, "[Slave VCPU Init] fallback vcpu=%d (requested %d)\n",
-                chosen_vcpu_id, vcpu_id);
     }
     int mmap_size = ioctl(g_kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
     if (mmap_size <= 0) {
         fprintf(stderr, "[Slave VCPU Init] KVM_GET_VCPU_MMAP_SIZE failed errno=%d\n", errno);
-        if (t_vcpu_fd != g_boot_vcpu_fd) close(t_vcpu_fd);
+        close(t_vcpu_fd);
         t_vcpu_fd = -1;
+        pthread_mutex_unlock(&g_kvm_vcpu_lock);
         return;
     }
     t_kvm_run = mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, t_vcpu_fd, 0);
     if (t_kvm_run == MAP_FAILED) {
         fprintf(stderr, "[Slave VCPU Init] vcpu mmap failed errno=%d\n", errno);
-        if (t_vcpu_fd != g_boot_vcpu_fd) close(t_vcpu_fd);
+        close(t_vcpu_fd);
         t_vcpu_fd = -1;
         t_kvm_run = NULL;
+        pthread_mutex_unlock(&g_kvm_vcpu_lock);
         return;
     }
+    g_kvm_vcpus[vcpu_id].fd = t_vcpu_fd;
+    g_kvm_vcpus[vcpu_id].run = t_kvm_run;
+    t_vcpu_id = vcpu_id;
+    fprintf(stderr, "[Slave VCPU Init] guest_vcpu=%d fd=%d run=%p\n",
+            vcpu_id, t_vcpu_fd, (void *)t_kvm_run);
+    pthread_mutex_unlock(&g_kvm_vcpu_lock);
 }
 
 // [FIX] Thread-Local 缓存，避免高频 malloc/free
@@ -965,6 +959,14 @@ void* dirty_sync_sender_thread(void* arg) {
 void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm_header *hdr, void *payload, int vcpu_id) {
     struct wvm_ipc_cpu_run_req *req = (struct wvm_ipc_cpu_run_req *)payload;
     if (!req) return;
+    /*
+     * The receive worker is only a transport thread.  The guest execution
+     * identity is carried by the request envelope and must not be inferred
+     * from the worker/socket that happened to receive the datagram.
+     */
+    int guest_vcpu_id = (req->vcpu_index < WVM_KVM_MAX_VCPUS)
+                            ? (int)req->vcpu_index
+                            : vcpu_id;
     uint64_t run_req_id = hdr->req_id;
     uint32_t requester = hdr->slave_id;
     if (vcpu_exit_cache_begin(sockfd, client, run_req_id, requester)) {
@@ -973,7 +975,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     { static int __run=0;
       if (__run < 10) {
           fprintf(stderr, "[VCPU-RUN] mode=%u vcpu=%d req=%llu src=%s:%u target=%u slave=%u\n",
-                  req->mode_tcg, vcpu_id, (unsigned long long)hdr->req_id,
+                  req->mode_tcg, guest_vcpu_id, (unsigned long long)hdr->req_id,
                   inet_ntoa(client->sin_addr), ntohs(client->sin_port),
                   (unsigned)ntohl(hdr->target_id), (unsigned)ntohl(hdr->slave_id));
           __run++;
@@ -1020,8 +1022,8 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         return;
     }
 
-    if (t_vcpu_fd < 0) {
-        init_thread_local_vcpu(vcpu_id);
+    if (t_vcpu_fd < 0 || t_vcpu_id != guest_vcpu_id) {
+        init_thread_local_vcpu(guest_vcpu_id);
     }
     if (t_vcpu_fd < 0 || !t_kvm_run || t_kvm_run == MAP_FAILED) {
         struct wvm_header ack_hdr;
@@ -1271,9 +1273,11 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         }
     }
 
-    /* [REMOVED] HLT fast-return disabled: rely on alarm timeout instead.
-     * The fast-return was short-circuiting ALL subsequent KVM_RUNs after
-     * the first HLT, preventing the guest from ever making progress. */
+    /*
+     * Do not short-circuit guest HLT.  A bounded KVM_RUN is a host-side
+     * scheduling preemption, not a guest halt, and is returned as
+     * WVM_EXIT_PREEMPT below.
+     */
 
     int ret;
 
@@ -1300,6 +1304,9 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     timer_settime(ktimer, 0, &its, NULL);
 
     for (;;) {
+        if (g_kvm_immediate_exit) {
+            __atomic_store_n(&t_kvm_run->immediate_exit, 0, __ATOMIC_RELEASE);
+        }
         ret = ioctl(t_vcpu_fd, KVM_RUN, 0);
         if (ret == 0 && t_kvm_run->exit_reason == KVM_EXIT_MMIO) {
             /* Intercept LAPIC MMIO (0xfee00000-0xfee00fff).  Without in-kernel
@@ -1312,7 +1319,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                 static int lapic_dbg = 0;
                 if (lapic_dbg < 50) {
                     fprintf(stderr, "[Slave-LAPIC] vcpu=%d %s reg=0x%03x len=%u data=0x",
-                            vcpu_id,
+                            guest_vcpu_id,
                             t_kvm_run->mmio.is_write ? "WR" : "RD",
                             reg_off, t_kvm_run->mmio.len);
                     for (int bi = t_kvm_run->mmio.len - 1; bi >= 0; bi--)
@@ -1325,13 +1332,13 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                     uint32_t val = 0;
                     switch (reg_off) {
                     case 0x020: /* APIC ID (bits 31:24 = APIC ID in xAPIC) */
-                        val = ((uint32_t)vcpu_id) << 24;
+                        val = ((uint32_t)guest_vcpu_id) << 24;
                         break;
                     case 0x030: /* APIC Version */
                         val = 0x50014; /* version 0x14, max LVT 5 */
                         break;
                     case 0x0D0: /* Logical Destination Register */
-                        val = (1U << (vcpu_id & 7)) << 24;
+                        val = (1U << (guest_vcpu_id & 7)) << 24;
                         break;
                     case 0x0E0: /* Destination Format Register */
                         val = 0xFFFFFFFFU; /* flat model */
@@ -1391,19 +1398,23 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     timer_settime(ktimer, 0, &its, NULL);
     timer_delete(ktimer);
     sigaction(SIGALRM, &sa_old, NULL);
+    if (g_kvm_immediate_exit) {
+        __atomic_store_n(&t_kvm_run->immediate_exit, 0, __ATOMIC_RELEASE);
+    }
 
-    /* If alarm fired, synthesize HLT exit */
+    /* Host slice expiry is preemption, not a guest HLT. */
     if (t_kvm_alarm_fired) {
-        fprintf(stderr, "[Slave] KVM_RUN timeout (50ms) -- synthesizing HLT exit\n");
-        t_kvm_run->exit_reason = KVM_EXIT_HLT;
+        fprintf(stderr, "[Slave] KVM_RUN slice expired -- returning preempt exit\n");
+        t_kvm_run->exit_reason = WVM_EXIT_PREEMPT;
     }
 
     /* [DBG] Log KVM_EXIT_INTERNAL_ERROR and SHUTDOWN details */
     if (t_kvm_run->exit_reason == 17) {
         static int dbg_ie = 0;
         if (dbg_ie < 20) {
-            fprintf(stderr, "[DBG-INTERR] req=%u suberror=%u ndata=%u",
-                    hdr->req_id, t_kvm_run->internal.suberror, t_kvm_run->internal.ndata);
+            fprintf(stderr, "[DBG-INTERR] req=%llu suberror=%u ndata=%u",
+                    (unsigned long long)hdr->req_id,
+                    t_kvm_run->internal.suberror, t_kvm_run->internal.ndata);
             for (uint32_t di = 0; di < t_kvm_run->internal.ndata && di < 8; di++)
                 fprintf(stderr, " d[%u]=%llx", di, (unsigned long long)t_kvm_run->internal.data[di]);
             fprintf(stderr, "\n");
@@ -1419,7 +1430,8 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         }
     }
     if (t_kvm_run->exit_reason == 8) {
-        fprintf(stderr, "[DBG-SHUTDOWN] req=%u -- triple fault!\n", hdr->req_id);
+        fprintf(stderr, "[DBG-SHUTDOWN] req=%llu -- triple fault!\n",
+                (unsigned long long)hdr->req_id);
         struct kvm_regs kr2; struct kvm_sregs ks2;
         ioctl(t_vcpu_fd, KVM_GET_REGS, &kr2);
         ioctl(t_vcpu_fd, KVM_GET_SREGS, &ks2);
@@ -1456,8 +1468,12 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                 *(uint32_t*)(g_phy_ram + 0xF0000));
     }
 
-skip_kvm_run:
-    if (g_wvm_dev_fd < 0) {
+    /*
+     * A full WVM_NUMA_MAP uses shared-memory RAM even in Mode A.  Keep the
+     * device open for control/ioctl handling, but harvest KVM dirty pages
+     * whenever RAM is not actually backed by /dev/wavevm.
+     */
+    if (!g_wvm_device_ram_mapping) {
         // [V28.5 FIXED] KVM Dirty Log Sync (Full Implementation)
         // 完整实现：获取位图 -> 遍历 -> 封包 -> 发送
         struct kvm_dirty_log log = { .slot = 0 };

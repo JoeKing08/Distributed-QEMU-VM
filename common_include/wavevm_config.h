@@ -66,6 +66,13 @@
 #define MAX_VCPUS 4096
 #define WVM_CPU_ROUTE_TABLE_SIZE MAX_VCPUS
 
+/*
+ * Static placement routes memory in 1 GiB chunks.  The entry count is kept
+ * aligned with the CPU route table: 4096 GiB covers the current supported
+ * guest address range without changing any packet-level ID widths.
+ */
+#define WVM_MEMORY_ROUTE_TABLE_SIZE WVM_CPU_ROUTE_TABLE_SIZE
+
 // --- 内存粒度定义 ---
 /*
  * [一级：DHT 路由粒度] 1GB (2^30)。
@@ -91,4 +98,3 @@
 #define WVM_DEFAULT_SHM_PATH "/wavevm_ram"
 
 #endif // WAVEVM_CONFIG_H
-

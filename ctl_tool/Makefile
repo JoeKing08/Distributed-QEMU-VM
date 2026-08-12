@@ -4,9 +4,8 @@ TARGET = wvm_ctl
 
 all: $(TARGET)
 
-$(TARGET): main.c
-	$(CC) $(CFLAGS) -o $@ $<
+$(TARGET): main.c ../common_include/wavevm_resources.c
+	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
 	rm -f $(TARGET)
-

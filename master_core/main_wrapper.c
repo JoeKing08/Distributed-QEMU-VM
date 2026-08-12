@@ -3,12 +3,12 @@
  * ---------------------------------------------------------------------------
  * 物理角色：Daemon 的启动引擎与"身份翻译官"。
  * 职责边界：
- * 1. 解析 swarm_config，将物理异构资源 (RAM/Cores) 映射为虚拟 ID。
+ * 1. 解析 swarm_config，将物理资源容量、DHT 权重和 VM placement 分离。
  * 2. 初始化共享内存后端，建立 QEMU 与 Daemon 的 IPC 桥梁。
  * 3. 启动自治监控线程 (Gossip)，驱动节点生命周期演进。
  * 
  * [禁止事项]
- * - 严禁修改虚拟节点 ID 的分配算法 (ram / 4GB)，否则将破坏 DHT 的全局一致性。
+ * - 严禁在未显式配置 dht_slots 时改变兼容的 RAM/4GB DHT slot 规则。
  * - 严禁在 QEMU 建立连接前提前释放资源。
  * ---------------------------------------------------------------------------
  */
@@ -25,11 +25,13 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <string.h>
 
 #include "logic_core.h"
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_config.h"
+#include "../common_include/wavevm_resources.h"
 
 // --- 全局状态 ---
 extern struct dsm_driver_ops u_ops;
@@ -39,6 +41,8 @@ size_t g_shm_size = 0;
 int g_dev_fd = -1;
 extern int g_my_node_id;
 uint8_t g_my_vm_id = 0;  // Multi-VM: 默认 0，向后兼容
+static struct wvm_resource_plan g_resource_plan;
+static int g_resource_plan_ready = 0;
 
 #define MAX_QEMU_CLIENTS 8
 
@@ -72,6 +76,72 @@ static void inject_cpu_route_table(void) {
 
     fprintf(stderr, "[CPU-ROUTE] injected %u entries\n", (unsigned)WVM_CPU_ROUTE_TABLE_SIZE);
     free(payload);
+}
+
+static void inject_memory_route_table(void) {
+    const uint32_t *table;
+    const uint32_t chunk_size = 1024;
+    size_t buf_size;
+    struct wvm_ioctl_route_update *payload;
+
+    if (g_dev_fd < 0) return;
+    table = wvm_get_memory_route_table();
+    if (!table) return;
+
+    buf_size = sizeof(*payload) + chunk_size * sizeof(uint32_t);
+    payload = malloc(buf_size);
+    if (!payload) {
+        fprintf(stderr, "[MEM-ROUTE] malloc failed\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < WVM_MEMORY_ROUTE_TABLE_SIZE; i += chunk_size) {
+        uint32_t count = chunk_size;
+
+        if (i + count > WVM_MEMORY_ROUTE_TABLE_SIZE) {
+            count = WVM_MEMORY_ROUTE_TABLE_SIZE - i;
+        }
+        payload->start_index = i;
+        payload->count = count;
+        memcpy(payload->entries, &table[i], count * sizeof(uint32_t));
+        if (ioctl(g_dev_fd, IOCTL_UPDATE_MEMORY_PLACEMENT, payload) < 0) {
+            fprintf(stderr, "[MEM-ROUTE] inject failed at %u (errno=%d)\n",
+                    i, errno);
+            free(payload);
+            return;
+        }
+    }
+
+    fprintf(stderr, "[MEM-ROUTE] injected %u entries\n",
+            (unsigned)WVM_MEMORY_ROUTE_TABLE_SIZE);
+    free(payload);
+}
+
+static void inject_mem_global(uint32_t slot, uint32_t value) {
+    size_t buf_size = sizeof(struct wvm_ioctl_route_update) + sizeof(uint32_t);
+    struct wvm_ioctl_route_update *payload;
+
+    if (g_dev_fd < 0) return;
+    payload = malloc(buf_size);
+    if (!payload) {
+        fprintf(stderr, "[MEM-GLOBAL] malloc failed\n");
+        return;
+    }
+    payload->start_index = slot;
+    payload->count = 1;
+    payload->entries[0] = value;
+    if (ioctl(g_dev_fd, IOCTL_UPDATE_MEM_ROUTE, payload) < 0) {
+        fprintf(stderr, "[MEM-GLOBAL] inject slot %u failed (errno=%d)\n",
+                slot, errno);
+    }
+    free(payload);
+}
+
+static void inject_vm_id(uint8_t vm_id) {
+    if (g_dev_fd < 0) return;
+    if (ioctl(g_dev_fd, IOCTL_SET_VM_ID, &vm_id) < 0) {
+        fprintf(stderr, "[VM-ID] inject failed (errno=%d)\n", errno);
+    }
 }
 #define NUM_BCAST_WORKERS 8
 
@@ -111,11 +181,6 @@ static ssize_t write_exact(int fd, const void *buf, size_t len) {
     return (ssize_t)sent;
 }
 
-// 初始种子节点
-#define MAX_SEEDS 8
-static struct sockaddr_in g_seeds[MAX_SEEDS];
-static int g_seed_count = 0;
-
 static int g_qemu_clients[8];
 static int g_client_count = 0;
 static pthread_mutex_t g_client_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -129,116 +194,77 @@ extern void* autonomous_monitor_thread(void* arg);
 int g_sync_batch_size = 64;
 void handle_ipc_rpc_passthrough(int qemu_fd, void *data, uint32_t len) { (void)qemu_fd; (void)data; (void)len; }
 
-/* 
- * [物理意图] 实现“异构资源到逻辑维度的映射”，确立节点在 P2P 环上的权重。
- * [关键逻辑] 按照 (RAM / 4GB) 计算虚拟节点数，并顺序填充 CPU 路由表，将物理算力转化为逻辑插槽。
- * [后果] 这是整个集群一致性的物理起点。若解析算法在百万节点间不统一，DHT 环将发生碰撞，导致内存寻址彻底失效。
- */
 void load_swarm_config(const char *filename) {
-    FILE *fp = fopen(filename, "r");
-    if (!fp) { perror("Config Error"); exit(1); }
+    char error[256] = {0};
+    const struct wvm_resource_vm *vm;
 
-    char line[256];
-    
-    // 虚拟节点粒度: 4GB = 1 DHT Slot (必须与 ctl_tool 保持一致)
-    #define WVM_RAM_UNIT_GB 4 
+    if (!g_resource_plan_ready) {
+        if (wvm_resource_plan_load(filename, &g_resource_plan, error,
+                                   sizeof(error)) != 0) {
+            fprintf(stderr, "[Config] %s\n", error);
+            exit(1);
+        }
+        g_resource_plan_ready = 1;
+    }
 
-    int total_vnodes = 0; // DHT 环上的总虚拟节点数
-    int phys_node_count = 0;
-    
-    // 临时存储物理节点信息，用于构建 CPU 表
-    // 我们动态分配一下防止栈溢出
-    struct PhysNodeInfo {
-        int id;
-        int cores;
-        int vnode_start; // 该物理机对应的第一个虚拟 ID (Primary ID)
-    } *phys_nodes = malloc(sizeof(struct PhysNodeInfo) * WVM_MAX_SLAVES);
+    printf("[Config] DHT Ring Size: %u Virtual Nodes (from %u Physical).\n",
+           g_resource_plan.total_vnodes, g_resource_plan.node_count);
+    for (uint32_t i = 0; i < g_resource_plan.node_count; i++) {
+        const struct wvm_resource_node *node = &g_resource_plan.nodes[i];
 
-    if (!phys_nodes) { perror("malloc"); exit(1); }
-
-    printf("[Config] Parsing Swarm Topology (Heterogeneous Mode)...\n");
-
-    while (fgets(line, sizeof(line), fp)) {
-        // 跳过注释和空行
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
-
-        char keyword[16];
-        int bid, port, cores, ram;
-        char ip_str[64];
-
-        // 1. 尝试读取关键字
-        if (sscanf(line, "%15s", keyword) != 1) continue;
-
-        // [Multi-VM] 解析 VM 指令（仅记录，不影响 NODE 解析）
-        // 格式: VM <VmID> <StartVnode> <VnodeCount>
-        if (strcmp(keyword, "VM") == 0) continue; // VM 指令在此阶段跳过，仅用于文档
-
-        if (strcmp(keyword, "NODE") != 0) continue;
-
-        // 2. 解析: NODE <ID> <IP> <PORT> <CORES> <RAM>
-        // %*s 跳过第一个字符串(NODE)
-        int fields = sscanf(line, "%*s %d %63s %d %d %d", &bid, ip_str, &port, &cores, &ram);
-        
-        if (fields >= 5) { // 成功解析
-            // 默认值保护
-            if (cores < 1) cores = 1;
-            if (ram < 1) ram = 4;
-
-            // --- 核心逻辑不变 ---
-            // 1. 计算虚拟节点数量
-            int v_count = ram / WVM_RAM_UNIT_GB;
-            if (v_count < 1) v_count = 1;
-
-            // 2. 注入 Gateway IP 表 (使用 composite ID: vm_id | node_id)
-            for (int v = 0; v < v_count; v++) {
-                int v_id = total_vnodes + v;
-                uint32_t composite_id = WVM_ENCODE_ID(g_my_vm_id, v_id);
-                u_ops.set_gateway_ip(composite_id, inet_addr(ip_str), htons(port));
-            }
-
-            // 3. 记录物理节点信息
-            if (phys_node_count < WVM_MAX_SLAVES) {
-                // [关键] 这里强制使用配置文件里的 ID，而不是行号
-                phys_nodes[phys_node_count].id = bid; 
-                phys_nodes[phys_node_count].cores = cores;
-                phys_nodes[phys_node_count].vnode_start = total_vnodes;
-                phys_node_count++;
-            }
-
-            total_vnodes += v_count;
+        for (uint32_t slot = 0; slot < node->dht_slots; slot++) {
+            uint32_t vnode = node->vnode_start + slot;
+            u_ops.set_gateway_ip(WVM_ENCODE_ID(g_my_vm_id, vnode),
+                                 inet_addr(node->ip), htons(node->port));
         }
     }
-    fclose(fp);
+    wvm_set_mem_mapping(0, g_resource_plan.total_vnodes);
 
-    // 4. 注入 Total Nodes 到 Logic Core (用于 DHT 取模)
-    // 注意：这里传的是 total_vnodes，不是物理节点数！
-    wvm_set_mem_mapping(0, (uint32_t)total_vnodes);
-    printf("[Config] DHT Ring Size: %d Virtual Nodes (from %d Physical).\n", total_vnodes, phys_node_count);
+    wvm_clear_cpu_mappings();
+    wvm_clear_memory_mappings();
+    vm = wvm_resource_plan_get_vm(&g_resource_plan, g_my_vm_id);
+    if (g_resource_plan.vm_count > 0 && !vm) {
+        fprintf(stderr, "[Config] VM %u has no resource reservation\n",
+                (unsigned)g_my_vm_id);
+        exit(1);
+    }
 
-    // 5. 构建并注入 CPU 路由表 (Logic Core)
-    // 逻辑与 ctl_tool 完全一致：按 Cores 数量顺序分配
+    if (vm) {
+        for (uint32_t vcpu = 0; vcpu < vm->vcpu_count; vcpu++) {
+            wvm_set_cpu_mapping((int)vcpu, vm->vcpu_nodes[vcpu]);
+        }
+        for (uint32_t chunk = 0; chunk < vm->memory_chunk_count; chunk++) {
+            wvm_set_memory_mapping((int)chunk, vm->memory_nodes[chunk]);
+        }
+        printf("[Config] VM %u placement: %u vCPUs, %u x 1GiB memory chunks (%s).\n",
+               (unsigned)g_my_vm_id, vm->vcpu_count,
+               vm->memory_chunk_count,
+               vm->policy == WVM_RESOURCE_POLICY_COMPACT ? "compact" : "spread");
+        return;
+    }
+
+    /*
+     * No new VM request: retain the historic core-weighted table exactly so
+     * existing deployments and old VM directives keep their former routing.
+     */
     int current_vcpu = 0;
-    
-    // 第一轮：按物理核心数填充 (Core-Weighted)
-    for (int i = 0; i < phys_node_count; i++) {
-        for (int c = 0; c < phys_nodes[i].cores; c++) {
-            if (current_vcpu < 4096) { // WVM_CPU_ROUTE_TABLE_SIZE
-                // CPU 调度指向该物理机的 Primary Virtual ID
-                wvm_set_cpu_mapping(current_vcpu++, phys_nodes[i].vnode_start);
-            }
+    for (uint32_t i = 0; i < g_resource_plan.node_count; i++) {
+        const struct wvm_resource_node *node = &g_resource_plan.nodes[i];
+
+        for (uint32_t core = 0;
+             core < node->cpu_capacity &&
+             current_vcpu < WVM_CPU_ROUTE_TABLE_SIZE;
+             core++) {
+            wvm_set_cpu_mapping(current_vcpu++, node->vnode_start);
         }
     }
-    
-    // 第二轮：填补剩余空位 (Round-Robin)
-    int node_cursor = 0;
-    // [FIX-H9] 防止 phys_node_count==0 时除零
-    while (phys_node_count > 0 && current_vcpu < 4096) {
-        wvm_set_cpu_mapping(current_vcpu++, phys_nodes[node_cursor].vnode_start);
-        node_cursor = (node_cursor + 1) % phys_node_count;
+    for (uint32_t cursor = 0;
+         current_vcpu < WVM_CPU_ROUTE_TABLE_SIZE;
+         cursor = (cursor + 1) % g_resource_plan.node_count) {
+        wvm_set_cpu_mapping(current_vcpu++,
+                            g_resource_plan.nodes[cursor].vnode_start);
     }
-    
-    printf("[Config] CPU Routing Table Initialized (Weighted by Cores).\n");
-    free(phys_nodes);
+    printf("[Config] CPU Routing Table Initialized (legacy core-weighted mode).\n");
 }
 
 /* 
@@ -307,9 +333,13 @@ static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
                     req->ctx.kvm.tsc_valid);
             __ipc_kvm_ctx++;
         }
-        /* [FIX] KVM: rx_buffer = &ack (完整结构体)，修复 8 字节偏移。 */
-        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, &req->ctx,
-            sizeof(req->ctx.kvm),
+        /*
+         * KVM needs the same envelope as TCG.  The slave selects its KVM
+         * vCPU from vcpu_index; forwarding only ctx.kvm silently aliases
+         * every compact-path request to the receiver worker.
+         */
+        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, req,
+            sizeof(*req),
             req->slave_id, &ack, sizeof(ack));
         if (rpc_ret < 0) ack.status = rpc_ret;
     }
@@ -1005,30 +1035,28 @@ void* client_handler(void *socket_desc) {
  * [后果] 这是 P2P 网络的启动原点。若无此函数，节点将陷入“孤岛效应”，无法通过 Gossip 发现任何邻居。
  */
 void load_initial_seeds(const char *config_file) {
-    FILE *fp = fopen(config_file, "r");
-    if (!fp) return;
+    (void)config_file;
 
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && g_seed_count < MAX_SEEDS) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        
-        char keyword[16], ip[64];
-        int id, port, cores, ram;
-        if (sscanf(line, "%15s %d %63s %d %d %d", keyword, &id, ip, &port, &cores, &ram) == 6) {
-            if (strcmp(keyword, "NODE") == 0 && id != g_my_node_id) {
-                g_seeds[g_seed_count].sin_family = AF_INET;
-                g_seeds[g_seed_count].sin_addr.s_addr = inet_addr(ip);
-                g_seeds[g_seed_count].sin_port = htons(port);
+    if (!g_resource_plan_ready) {
+        return;
+    }
 
-                // 关键：将种子节点预埋入局部视图
-                // 初始状态设为 SHADOW，等待心跳激活
-                // [Multi-VM] 使用裸 node_id，topology view 内部用裸 ID
-                update_local_topology_view(id, 0, NODE_STATE_SHADOW, &g_seeds[g_seed_count], 0);
-                g_seed_count++;
+    for (uint32_t i = 0; i < g_resource_plan.node_count; i++) {
+        const struct wvm_resource_node *node = &g_resource_plan.nodes[i];
+        struct sockaddr_in seed = {0};
+
+        seed.sin_family = AF_INET;
+        seed.sin_addr.s_addr = inet_addr(node->ip);
+        seed.sin_port = htons(node->port);
+        for (uint32_t slot = 0; slot < node->dht_slots; slot++) {
+            uint32_t vnode = node->vnode_start + slot;
+
+            if (vnode == (uint32_t)g_my_node_id) {
+                continue;
             }
+            update_local_topology_view(vnode, 0, NODE_STATE_SHADOW, &seed, 0);
         }
     }
-    fclose(fp);
 }
 
 // --- Main Entry ---
@@ -1071,9 +1099,35 @@ int main(int argc, char **argv) {
 
     printf("[*] WaveVM Swarm V30.0 'Wavelet' Node Daemon (PhysID: %d, VM: %u)\n", my_phys_id, (unsigned)g_my_vm_id);
 
-    // 2. 初始化用户态后端 (User Backend)
-    // 注意：此时我们暂时用 PhysID 初始化，后续 load_swarm_config 会填充完整的路由表
-    if (user_backend_init(my_phys_id, local_port) != 0) {
+    /*
+     * Resolve identity before starting backend RX threads.  Physical IDs are
+     * placement keys; packet routing and local-sidecar selection use the
+     * primary DHT vnode.
+     */
+    {
+        char error[256] = {0};
+        const struct wvm_resource_node *my_node;
+
+        if (wvm_resource_plan_load(config_file, &g_resource_plan, error,
+                                   sizeof(error)) != 0) {
+            fprintf(stderr, "[Config] %s\n", error);
+            return 1;
+        }
+        g_resource_plan_ready = 1;
+        my_node = wvm_resource_plan_find_node(&g_resource_plan, my_phys_id);
+        if (!my_node) {
+            fprintf(stderr, "[Fatal] My Physical ID %d not found in config file!\n",
+                    my_phys_id);
+            return 1;
+        }
+        if (user_backend_init((int)my_node->vnode_start, local_port) != 0) {
+            fprintf(stderr, "[-] Failed to init user backend.\n");
+            return 1;
+        }
+    }
+
+    // 2. Initialize user backend after topology identity has been resolved.
+    if (!g_resource_plan_ready) {
         fprintf(stderr, "[-] Failed to init user backend.\n");
         return 1;
     }
@@ -1089,9 +1143,6 @@ int main(int argc, char **argv) {
     // 这会将所有物理 IP 展开为虚拟节点，并注入 Backend 和 Logic Core
     load_swarm_config(config_file);
 
-    // 4.1 将 CPU 路由表注入内核（Mode A）
-    inject_cpu_route_table();
-
     // 5. 启动 V29.5 核心推送引擎的多线程广播线程
     printf("[+] Starting %d Wavelet Broadcast Engines...\n", NUM_BCAST_WORKERS);
     for (long i = 0; i < NUM_BCAST_WORKERS; i++) { // 使用 long 避免指针转换警告
@@ -1105,78 +1156,56 @@ int main(int argc, char **argv) {
     }
     printf("[+] All Wavelet Broadcast Engines started.\n");
 
-    // 6. [V29 关键逻辑] 身份识别与资源自检
-    // 我们需要再次扫描配置文件，找到 my_phys_id 对应的 Virtual ID (vnode_start)
-    // 同时检查启动参数申请的 RAM 是否满足配置文件的要求
-    int my_virtual_id = -1;
-    int my_local_cores = 1;
-    
-    FILE *fp_check = fopen(config_file, "r");
-    if (fp_check) {
-        char line[256];
-        int current_phys_idx = 0;
-        int current_v_id_accumulator = 0;
-        
-        // 定义必须与 load_swarm_config 保持一致
-        #define WVM_RAM_UNIT_GB 4 
-        
-        while (fgets(line, sizeof(line), fp_check)) {
-            if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    // 6. Resolve physical identity and validate the local VM reservation.
+    const struct wvm_resource_node *my_node =
+        g_resource_plan_ready
+            ? wvm_resource_plan_find_node(&g_resource_plan, my_phys_id)
+            : NULL;
+    const struct wvm_resource_vm *my_vm =
+        g_resource_plan_ready
+            ? wvm_resource_plan_get_vm(&g_resource_plan, g_my_vm_id)
+            : NULL;
+    int my_virtual_id = my_node ? (int)my_node->vnode_start : -1;
+    uint32_t my_local_cores = my_node ? my_node->cpu_capacity : 1;
+    uint64_t required_memory_mb = my_node ? my_node->memory_mb : 0;
 
-            char keyword[16];
-            int bid, port, cores, ram_gb;
-            char ip_str[64];
-            
-            // 尝试解析: NODE IP PORT CORES RAM
-            if (sscanf(line, "%15s", keyword) != 1) continue;
-            if (strcmp(keyword, "NODE") != 0) continue;
-
-            if (sscanf(line, "%*s %d %63s %d %d %d", &bid, ip_str, &port, &cores, &ram_gb) == 5) {
-                if (ram_gb <= 0) ram_gb = 4;
-                
-                // 计算该节点占用的虚拟槽位
-                int v_count = ram_gb / WVM_RAM_UNIT_GB;
-                if (v_count < 1) v_count = 1;
-                
-                // 如果这就是我自己
-                if (current_phys_idx == my_phys_id) {
-                    // A. 身份确认
-                    my_virtual_id = current_v_id_accumulator;
-                    if (cores < 1) cores = 1;
-                    my_local_cores = cores;
-                    
-                    // B. [红队防御] 资源自检：防止配置撒谎导致 Crash
-                    size_t config_bytes = (size_t)ram_gb * 1024 * 1024 * 1024;
-                    if (g_shm_size < config_bytes) {
-                        fprintf(stderr, "\n[FATAL] Resource Mismatch!\n");
-                        fprintf(stderr, "  Config Node %d requires: %d GB\n", my_phys_id, ram_gb);
-                        fprintf(stderr, "  Launch arg provided:     %lu MB\n", ram_mb);
-                        fprintf(stderr, "  System will CRASH on OOB access. Aborting.\n");
-                        exit(1);
-                    }
-                    printf("[Check] Resource verified: Alloc %lu MB >= Config %d GB.\n", ram_mb, ram_gb);
-                    break;
-                }
-                
-                current_v_id_accumulator += v_count;
-                current_phys_idx++;
-            }
-        }
-        fclose(fp_check);
+    if (my_vm) {
+        my_local_cores =
+            wvm_resource_plan_local_vcpus(&g_resource_plan, g_my_vm_id,
+                                           my_phys_id);
+        required_memory_mb =
+            wvm_resource_plan_local_memory_mb(&g_resource_plan, g_my_vm_id,
+                                              my_phys_id);
     }
 
     if (my_virtual_id == -1) {
         fprintf(stderr, "[Fatal] My Physical ID %d not found in config file!\n", my_phys_id);
         return 1;
     }
+    if (g_shm_size < required_memory_mb * 1024U * 1024U) {
+        fprintf(stderr, "\n[FATAL] Resource Mismatch!\n");
+        fprintf(stderr, "  Config VM/node reservation requires: %llu MB\n",
+                (unsigned long long)required_memory_mb);
+        fprintf(stderr, "  Launch arg provided:                 %lu MB\n",
+                ram_mb);
+        return 1;
+    }
+    printf("[Check] Resource verified: Alloc %lu MB >= Reservation %llu MB.\n",
+           ram_mb, (unsigned long long)required_memory_mb);
 
     // 7. 将真实的虚拟 ID 注入 Logic Core
     // Logic Core 将根据此 ID 判断是否拥有某个 GPA 的管理权 (Directory Owner)
     wvm_set_my_node_id(my_virtual_id);
     printf("[Init] Identity Mapped: PhysID %d -> VirtualID %d (Primary)\n", my_phys_id, my_virtual_id);
+    // Mode A owns a separate Logic Core instance inside wavevm.ko.
+    inject_vm_id(g_my_vm_id);
+    inject_mem_global(0, g_resource_plan.total_vnodes);
+    inject_mem_global(1, (uint32_t)my_virtual_id);
+    inject_cpu_route_table();
+    inject_memory_route_table();
     {
         char split_buf[32];
-        snprintf(split_buf, sizeof(split_buf), "%d", my_local_cores);
+        snprintf(split_buf, sizeof(split_buf), "%u", my_local_cores);
         setenv("WVM_LOCAL_SPLIT", split_buf, 1);
     }
 

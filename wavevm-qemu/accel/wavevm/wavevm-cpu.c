@@ -1280,7 +1280,10 @@ static void wavevm_remote_exec(CPUState *cpu) {
                 dbg_kp_cnt++;
             }
         }
-        int ret = ioctl(s->dev_fd, IOCTL_WVM_REMOTE_RUN, &req);
+        struct wvm_ioctl_remote_run remote_run;
+        memset(&remote_run, 0, sizeof(remote_run));
+        remote_run.req = req;
+        int ret = ioctl(s->dev_fd, IOCTL_WVM_REMOTE_RUN, &remote_run);
 
         if (ret < 0) {
             static int dbg_fail_cnt = 0;
@@ -1292,9 +1295,8 @@ static void wavevm_remote_exec(CPUState *cpu) {
             return;
         }
 
-        // 4. 反序列化结果 (直接复用 req 的内存空间读取 ack，或者使用 memcpy)
-        // 注意：内核将 Ack 数据回写到了 req 指针所在的内存
-        memcpy(&ack, &req, sizeof(ack)); 
+        // 4. Read the explicit Mode A ioctl response container.
+        ack = remote_run.ack;
 
         if (ack.mode_tcg) {
             wavevm_tcg_import_remote_ack(cpu, &ack.ctx.tcg, &sent_tcg,

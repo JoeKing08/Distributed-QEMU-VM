@@ -13,7 +13,7 @@ struct wvm_ioctl_gateway {
 // Control Plane Injection
 #define IOCTL_SET_GATEWAY _IOW('G', 1, struct wvm_ioctl_gateway)
 
-#define IOCTL_WVM_REMOTE_RUN _IOWR('G', 2, struct wvm_ipc_cpu_run_req)
+#define IOCTL_WVM_REMOTE_RUN _IOWR('G', 2, struct wvm_ioctl_remote_run)
 
 // 路由表更新结构体
 struct wvm_ioctl_route_update {
@@ -45,6 +45,9 @@ struct wvm_ioctl_mem_layout {
 #define IOCTL_SET_MEM_LAYOUT   _IOW('G', 10, struct wvm_ioctl_mem_layout)
 #define IOCTL_RPC_SYNC_ACK     _IOW('G', 11, uint8_t)
 #define IOCTL_UPDATE_EPOCH _IOW('G', 20, uint32_t)
+/* 1 GiB guest-memory chunk -> raw directory vnode placement table. */
+#define IOCTL_UPDATE_MEMORY_PLACEMENT _IOW('G', 21, struct wvm_ioctl_route_update)
+/* Keep the kernel Logic Core's composite-ID namespace aligned with the master. */
+#define IOCTL_SET_VM_ID _IOW('G', 22, uint8_t)
 
 #endif // WAVEVM_IOCTL_H
-

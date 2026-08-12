@@ -1327,30 +1327,40 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         break;
     }
     case IOCTL_WVM_REMOTE_RUN: {
-        struct wvm_ipc_cpu_run_req req;
-        struct wvm_ipc_cpu_run_ack ack;
-        if (copy_from_user(&req, argp, sizeof(req))) return -EFAULT;
+        struct wvm_ioctl_remote_run remote_run;
+        struct wvm_ipc_cpu_run_req *req = &remote_run.req;
+        struct wvm_ipc_cpu_run_ack *ack = &remote_run.ack;
 
-        uint32_t target = req.slave_id;
+        if (copy_from_user(&remote_run, argp, sizeof(remote_run))) {
+            return -EFAULT;
+        }
+
+        uint32_t target = req->slave_id;
         if (!WVM_IS_VALID_TARGET(target)) {
-            target = wvm_get_compute_slave_id(req.vcpu_index);
+            target = wvm_get_compute_slave_id(req->vcpu_index);
         }
         if (!WVM_IS_VALID_TARGET(target)) {
             static int dbg_nodev = 0;
             if (dbg_nodev < 5) {
-                uint32_t raw = wvm_get_cpu_mapping_raw(req.vcpu_index);
+                uint32_t raw = wvm_get_cpu_mapping_raw(req->vcpu_index);
                 printk(KERN_WARNING "[wavevm] REMOTE_RUN cpu=%d raw_route=%u resolved=%u => ENODEV\n",
-                       req.vcpu_index, raw, target);
+                       req->vcpu_index, raw, target);
                 dbg_nodev++;
             }
             return -ENODEV;
         }
 
-        int ctx_len = req.mode_tcg ? sizeof(req.ctx.tcg) : sizeof(req.ctx.kvm);
-        int ret = wvm_rpc_call(MSG_VCPU_RUN, &req.ctx, ctx_len, target, &ack, sizeof(ack));
-        if (ret < 0) ack.status = ret;
-        /* mode_tcg comes from slave response now */
-        if (copy_to_user(argp, &ack, sizeof(ack))) return -EFAULT;
+        /*
+         * Preserve vcpu_index and routing metadata for KVM too.  A compact
+         * context payload cannot identify the guest vCPU on the slave.
+         */
+        memset(ack, 0, sizeof(*ack));
+        int ret = wvm_rpc_call(MSG_VCPU_RUN, req, sizeof(*req),
+                               target, ack, sizeof(*ack));
+        if (ret < 0) ack->status = ret;
+        if (copy_to_user(argp, &remote_run, sizeof(remote_run))) {
+            return -EFAULT;
+        }
         break;
     }
     case IOCTL_WAIT_IRQ: {
@@ -1368,9 +1378,6 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         return wvm_set_mem_layout(&layout);
     }
 
-    // 我们复用 MEM_ROUTE 协议来传输简单的全局整数参数
-    // Slot 0 = Total Nodes (用于 DHT 取模)
-    // Slot 1 = My Node ID (用于判断是否为 Directory)
     case IOCTL_UPDATE_MEM_ROUTE: {
         struct wvm_ioctl_route_update head;
         
@@ -1399,6 +1406,45 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         }
         
         vfree(buf);
+        break;
+    }
+
+    case IOCTL_UPDATE_MEMORY_PLACEMENT: {
+        struct wvm_ioctl_route_update head;
+        uint32_t *buf;
+        size_t bytes;
+
+        if (copy_from_user(&head, argp, sizeof(head))) return -EFAULT;
+        if (head.count > WVM_MEMORY_ROUTE_TABLE_SIZE ||
+            head.start_index >= WVM_MEMORY_ROUTE_TABLE_SIZE ||
+            head.start_index + head.count > WVM_MEMORY_ROUTE_TABLE_SIZE) {
+            return -EINVAL;
+        }
+
+        bytes = (size_t)head.count * sizeof(uint32_t);
+        if (head.count != 0 && bytes / sizeof(uint32_t) != head.count) {
+            return -EINVAL;
+        }
+        buf = vmalloc(bytes);
+        if (!buf && bytes != 0) return -ENOMEM;
+        if (bytes != 0 &&
+            copy_from_user(buf, (uint8_t *)argp + sizeof(head), bytes)) {
+            vfree(buf);
+            return -EFAULT;
+        }
+
+        for (uint32_t i = 0; i < head.count; i++) {
+            wvm_set_memory_mapping(head.start_index + i, buf[i]);
+        }
+        vfree(buf);
+        break;
+    }
+
+    case IOCTL_SET_VM_ID: {
+        uint8_t vm_id;
+
+        if (copy_from_user(&vm_id, argp, sizeof(vm_id))) return -EFAULT;
+        g_my_vm_id = vm_id;
         break;
     }
 
@@ -1524,7 +1570,12 @@ static int __init wavevm_init(void) {
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind_addr.sin_port = htons(service_port);
-    kernel_bind(g_socket, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+    /*
+     * kernel_bind() changed its typed sockaddr parameter in newer kernels.
+     * The concrete object is always sockaddr_in; void * preserves source
+     * compatibility with both the old sockaddr and new sockaddr_unsized APIs.
+     */
+    kernel_bind(g_socket, (void *)&bind_addr, sizeof(bind_addr));
     g_socket->sk->sk_data_ready = wavevm_udp_data_ready;
 
     k_log("WaveVM V29.5 'Wavelet' Kernel Backend Loaded (Mode A Active).");
@@ -1566,4 +1617,3 @@ static void __exit wavevm_exit(void) {
 module_init(wavevm_init);
 module_exit(wavevm_exit);
 MODULE_LICENSE("GPL");
-
