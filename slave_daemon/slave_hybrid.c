@@ -40,6 +40,8 @@
 #include "slave_vfio.h"
 
 #include "../common_include/wavevm_protocol.h"
+#include "../common_include/wavevm_ioctl.h"
+#include "../common_include/wavevm_runtime_gate.h"
 
 // --- 全局配置变量 ---
 static int g_service_port = 9000;
@@ -47,6 +49,8 @@ static int g_nonblock_recv = 0;
 static long g_num_cores = 0;
 static int g_ram_mb = 1024;
 static uint64_t g_slave_ram_size = 1024UL * 1024 * 1024;
+static int g_base_id = 0;
+static uint8_t g_slave_vm_id = 0;
 #define VCPU_EXIT_CACHE_SIZE 4096
 #define VCPU_EXIT_CACHE_MAX_PACKET (sizeof(struct wvm_header) + sizeof(struct wvm_ipc_cpu_run_ack))
 
@@ -84,12 +88,193 @@ static pthread_mutex_t g_master_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_master_ready = 0;
 static struct sockaddr_in g_master_addr;
 static char *g_vfio_config_path = NULL; 
-int g_ctrl_port = 9001; // 真实定义，供应给 wavevm_node_slave
+static int g_executor_ctrl_port = 9001;
+static struct wvm_runtime_manifest_storage g_executor_manifest_storage;
+static struct wvm_runtime_gate g_executor_runtime_gate;
+static uint64_t g_executor_connection_id;
+static int g_wvm_dev_fd = -1;
+static int g_kernel_context_bind_failed = 0;
+static int g_executor_local_only = 0;
 
 // --- KVM_RUN slice preemption (thread-directed) ---
 static __thread struct kvm_run *t_kvm_run = NULL;
 static __thread volatile sig_atomic_t t_kvm_alarm_fired = 0;
 static int g_kvm_immediate_exit = 0;
+
+static int executor_parse_u64(const char *text, uint64_t *value)
+{
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int executor_parse_legacy_vm_id(const char *text, uint8_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed > UINT8_MAX) {
+        return -1;
+    }
+    *value = (uint8_t)parsed;
+    return 0;
+}
+
+static int executor_runtime_gate_init(void)
+{
+    const char *active = getenv("WVM_RUNTIME_GATE_ACTIVE");
+    const char *manifest_path = getenv("WVM_RUNTIME_MANIFEST_PATH");
+    const char *node_instance_text = getenv("WVM_NODE_INSTANCE_ID");
+    const char *physical_id_text =
+        getenv("WVM_RUNTIME_PHYSICAL_NODE_ID");
+    uint64_t node_instance_id;
+    uint64_t physical_node_id;
+    struct wvm_runtime_registration registration;
+    uint8_t profile_digest[WVM_SHA256_DIGEST_BYTES];
+    char error[256] = {0};
+
+    if (!active || active[0] == '\0' || strcmp(active, "0") == 0) {
+        return 0;
+    }
+    /*
+     * An admitted executor is reached through its local node-runtime bridge.
+     * It must not expose the legacy UDP service as a cross-node endpoint.
+     */
+    g_executor_local_only = 1;
+    if (!manifest_path ||
+        executor_parse_u64(node_instance_text, &node_instance_id) != 0) {
+        fprintf(stderr,
+                "[RuntimeGate] executor missing manifest path/node instance\n");
+        return -1;
+    }
+    if (executor_parse_u64(physical_id_text, &physical_node_id) != 0 ||
+        physical_node_id > UINT32_MAX) {
+        fprintf(stderr,
+                "[RuntimeGate] executor physical node identity is missing\n");
+        return -1;
+    }
+    wvm_runtime_manifest_storage_init(&g_executor_manifest_storage);
+    wvm_runtime_gate_init(&g_executor_runtime_gate);
+    if (wvm_runtime_manifest_load_file(
+            manifest_path, &g_executor_manifest_storage, error,
+            sizeof(error)) != 0 ||
+        g_executor_manifest_storage.manifest.vm_id != g_slave_vm_id ||
+        wvm_runtime_gate_prepare(
+            &g_executor_runtime_gate, &g_executor_manifest_storage.manifest,
+            (uint32_t)physical_node_id, node_instance_id, error,
+            sizeof(error)) != 0 ||
+        wvm_runtime_gate_activate(
+            &g_executor_runtime_gate,
+            g_executor_manifest_storage.manifest.activation_fence, error,
+            sizeof(error)) != 0 ||
+        wvm_runtime_manifest_profile_digest(
+            &g_executor_manifest_storage.manifest, profile_digest, error,
+            sizeof(error)) != 0) {
+        fprintf(stderr, "[RuntimeGate] executor rejected manifest: %s\n",
+                error[0] ? error : "manifest identity mismatch");
+        wvm_runtime_manifest_storage_free(&g_executor_manifest_storage);
+        return -1;
+    }
+
+    memset(&registration, 0, sizeof(registration));
+    registration.connection_role = WVM_MANIFEST_ROLE_EXECUTOR;
+    registration.vm_id = g_executor_manifest_storage.manifest.vm_id;
+    registration.vm_incarnation =
+        g_executor_manifest_storage.manifest.vm_incarnation;
+    registration.manifest_generation =
+        g_executor_manifest_storage.manifest.manifest_generation;
+    memcpy(registration.candidate_manifest_digest,
+           g_executor_manifest_storage.manifest.candidate_manifest_digest,
+           sizeof(registration.candidate_manifest_digest));
+    registration.local_runtime_instance_id = node_instance_id;
+    registration.caller_process_instance_id = (uint64_t)getpid();
+    memcpy(registration.capability_profile_digest, profile_digest,
+           sizeof(registration.capability_profile_digest));
+    snprintf(registration.requested_endpoint_name,
+             sizeof(registration.requested_endpoint_name), "%s",
+             g_executor_manifest_storage.manifest.local_names.namespace_name);
+    if (wvm_runtime_gate_register(&g_executor_runtime_gate, &registration,
+                                  &g_executor_connection_id, error,
+                                  sizeof(error)) != 0) {
+        fprintf(stderr, "[RuntimeGate] executor registration rejected: %s\n",
+                error[0] ? error : "registration mismatch");
+        wvm_runtime_manifest_storage_free(&g_executor_manifest_storage);
+        return -1;
+    }
+    fprintf(stderr,
+            "[RuntimeGate] executor registered connection=%" PRIu64 "\n",
+            g_executor_connection_id);
+    return 0;
+}
+
+static int executor_bind_kernel_context(void)
+{
+    struct wvm_ioctl_context_bind request;
+    uint8_t profile_digest[WVM_KERNEL_DIGEST_BYTES];
+    char error[256] = {0};
+    const char *gate_active = getenv("WVM_RUNTIME_GATE_ACTIVE");
+
+    if (g_wvm_dev_fd < 0 || !gate_active || strcmp(gate_active, "0") == 0) {
+        return 0;
+    }
+    if (!g_executor_manifest_storage.manifest.has_activation_fence ||
+        wvm_runtime_manifest_profile_digest(
+            &g_executor_manifest_storage.manifest, profile_digest, error,
+            sizeof(error)) != 0) {
+        fprintf(stderr,
+                "[KernelContext] executor manifest has no valid "
+                "activation/profile identity: %s\n",
+                error[0] ? error : "invalid manifest");
+        return -1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.magic = WVM_KERNEL_CONTEXT_MAGIC;
+    request.version = WVM_KERNEL_CONTEXT_ABI_VERSION;
+    request.vm_id = g_executor_manifest_storage.manifest.vm_id;
+    request.physical_node_id =
+        g_executor_manifest_storage.manifest.physical_node_id;
+    request.vm_incarnation =
+        g_executor_manifest_storage.manifest.vm_incarnation;
+    request.manifest_generation =
+        g_executor_manifest_storage.manifest.manifest_generation;
+    memcpy(request.candidate_manifest_digest,
+           g_executor_manifest_storage.manifest.candidate_manifest_digest,
+           sizeof(request.candidate_manifest_digest));
+    memcpy(request.capability_profile_digest, profile_digest,
+           sizeof(request.capability_profile_digest));
+    memcpy(request.activation_fence,
+           g_executor_manifest_storage.manifest.activation_fence,
+           sizeof(request.activation_fence));
+
+    if (ioctl(g_wvm_dev_fd, IOCTL_WVM_BIND_CONTEXT, &request) < 0) {
+        fprintf(stderr,
+                "[KernelContext] executor Mode A context bind failed: "
+                "errno=%d (%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr,
+            "[KernelContext] executor bound VM=%u incarnation=%" PRIu64
+            " node=%u\n",
+            request.vm_id, request.vm_incarnation, request.physical_node_id);
+    return 0;
+}
 
 static void kvm_alarm_handler(int sig) {
     (void)sig;
@@ -384,10 +569,7 @@ static struct {
 } g_kvm_vcpus[WVM_KVM_MAX_VCPUS];
 static pthread_mutex_t g_kvm_vcpu_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_spinlock_t g_master_lock;
-static int g_wvm_dev_fd = -1;
 static int g_wvm_device_ram_mapping = 0;
-static int g_base_id = 0;
-static uint8_t g_slave_vm_id = 0;
 static int g_vcpu_init_debug_once = 0;
 
 #define WVM_PAGE_SIZE            4096ULL
@@ -481,6 +663,12 @@ void init_kvm_global() {
     if (g_kvm_fd < 0) return; 
 
     g_wvm_dev_fd = open("/dev/wavevm", O_RDWR);
+    if (g_wvm_dev_fd >= 0 && executor_bind_kernel_context() != 0) {
+        g_kernel_context_bind_failed = 1;
+        close(g_wvm_dev_fd);
+        g_wvm_dev_fd = -1;
+        return;
+    }
     
     /*
      * WVM_NUMA_MAP describes the complete guest physical address space.
@@ -1896,7 +2084,12 @@ static void handle_block_io_phys(int sockfd, struct sockaddr_in *client, struct 
 void* kvm_worker_thread(void *arg) {
     long core = (long)arg;
     int s = socket(AF_INET, SOCK_DGRAM, 0); int opt=1; setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    struct sockaddr_in a = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_ANY), .sin_port=htons(g_service_port) };
+    struct sockaddr_in a = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr =
+            htonl(g_executor_local_only ? INADDR_LOOPBACK : INADDR_ANY),
+        .sin_port = htons(g_service_port)
+    };
     if (bind(s, (struct sockaddr*)&a, sizeof(a)) != 0) {
         fprintf(stderr, "[SLAVE-BIND] port=%d failed errno=%d\n", g_service_port, errno);
     } else if (core == 0) {
@@ -2184,7 +2377,12 @@ void spawn_tcg_processes(int base_id) {
 void* tcg_proxy_thread(void *arg) {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     int opt = 1; setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
-    struct sockaddr_in addr = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_ANY), .sin_port=htons(g_service_port) };
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr =
+            htonl(g_executor_local_only ? INADDR_LOOPBACK : INADDR_ANY),
+        .sin_port = htons(g_service_port)
+    };
     if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         fprintf(stderr, "[SLAVE-BIND] port=%d failed errno=%d\n", g_service_port, errno);
     } else {
@@ -2345,8 +2543,18 @@ int main(int argc, char **argv) {
     if (argc >= 5) {
         g_base_id = atoi(argv[4]);
     }
-    if (argc >= 6) g_ctrl_port = atoi(argv[5]);
-    if (argc >= 7) g_slave_vm_id = (uint8_t)atoi(argv[6]);
+    if (argc >= 6) g_executor_ctrl_port = atoi(argv[5]);
+    if (argc >= 7 &&
+        executor_parse_legacy_vm_id(argv[6], &g_slave_vm_id) != 0) {
+        fprintf(stderr,
+                "[VM-ID] legacy executor header supports VM IDs only in "
+                "[0, %u]; V1_U32 dispatch is not implemented here\n",
+                UINT8_MAX);
+        return 1;
+    }
+    if (executor_runtime_gate_init() != 0) {
+        return 1;
+    }
 
     printf("[Init] WaveVM Hybrid Slave V28.0 (Swarm Edition)\n");
     printf("[Init] Config: Port=%d, Cores=%ld, RAM=%d MB, BaseID=%d, VM=%u\n",
@@ -2359,9 +2567,17 @@ int main(int argc, char **argv) {
         }
     }
     init_kvm_global();
+    if (g_kernel_context_bind_failed) {
+        fprintf(stderr,
+                "[KernelContext] refusing executor startup after a "
+                "manifest/context mismatch\n");
+        return 1;
+    }
 
     if (g_kvm_available) {
-        printf("[Hybrid] Mode: KVM FAST PATH. Listening on 0.0.0.0:%d\n", g_service_port);
+        printf("[Hybrid] Mode: KVM FAST PATH. Listening on %s:%d\n",
+               g_executor_local_only ? "127.0.0.1" : "0.0.0.0",
+               g_service_port);
         pthread_t sender_thread_id;
         if (pthread_create(&sender_thread_id, NULL, dirty_sync_sender_thread, NULL) != 0) {
             perror("Failed to create dirty page sender thread");
@@ -2380,7 +2596,9 @@ int main(int argc, char **argv) {
         for(long i=0; i<total_threads; i++) pthread_create(&threads[i], NULL, kvm_worker_thread, (void*)i);
         for(long i=0; i<total_threads; i++) pthread_join(threads[i], NULL);
     } else {
-        printf("[Hybrid] Mode: TCG PROXY (Tri-Channel). Listening on 0.0.0.0:%d\n", g_service_port);
+        printf("[Hybrid] Mode: TCG PROXY (Tri-Channel). Listening on %s:%d\n",
+               g_executor_local_only ? "127.0.0.1" : "0.0.0.0",
+               g_service_port);
         spawn_tcg_processes(g_base_id);
         sleep(1);
         int proxy_threads = g_num_cores / 2; 

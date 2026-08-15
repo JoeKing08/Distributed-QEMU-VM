@@ -49,7 +49,8 @@ static int select_compact_cpu_node(const struct wvm_resource_plan *plan,
     for (i = 0; i < plan->node_count; i++) {
         const struct wvm_resource_node *node = &plan->nodes[i];
 
-        if (used_cpu[i] + vm_cpu[i] >= node->cpu_capacity) {
+        if (used_cpu[i] >= node->cpu_capacity ||
+            vm_cpu[i] >= node->cpu_capacity - used_cpu[i]) {
             continue;
         }
         if (best < 0 || node->phys_id < plan->nodes[best].phys_id) {
@@ -94,7 +95,8 @@ static int select_spread_cpu_node(const struct wvm_resource_plan *plan,
         uint64_t lhs;
         uint64_t rhs;
 
-        if (used_cpu[i] + vm_cpu[i] >= node->cpu_capacity) {
+        if (used_cpu[i] >= node->cpu_capacity ||
+            vm_cpu[i] >= node->cpu_capacity - used_cpu[i]) {
             continue;
         }
         if (best < 0) {
@@ -283,6 +285,20 @@ static int reserve_vm(struct wvm_resource_plan *plan,
             }
         }
         vm->memory_chunk_count = memory_chunk;
+
+        /*
+         * The compatibility runtime currently treats the first vCPU route as
+         * the QEMU-host local prefix.  Publish that deterministic choice
+         * explicitly so later manifest work can consume it without guessing.
+         */
+        for (i = 0; i < ordered_count; i++) {
+            uint32_t node_index = ordered_indices[i];
+
+            if (vm_cpu[node_index] != 0) {
+                vm->host_phys_id = plan->nodes[node_index].phys_id;
+                break;
+            }
+        }
     }
 
     for (i = 0; i < plan->node_count; i++) {
@@ -294,6 +310,164 @@ static int reserve_vm(struct wvm_resource_plan *plan,
 
     plan->vm_present[request->vm_id] = 1;
     plan->vm_count++;
+    return 0;
+}
+
+int wvm_resource_plan_validate(const struct wvm_resource_plan *plan,
+                               char *error, size_t error_len)
+{
+    uint32_t used_cpu[WVM_MAX_SLAVES] = {0};
+    uint64_t used_memory[WVM_MAX_SLAVES] = {0};
+    uint32_t observed_vm_count = 0;
+    uint32_t i;
+
+    if (!plan || plan->node_count == 0 ||
+        plan->node_count > WVM_MAX_SLAVES) {
+        set_error(error, error_len, "resource plan has invalid node count");
+        return -1;
+    }
+
+    for (i = 0; i < plan->node_count; i++) {
+        const struct wvm_resource_node *node = &plan->nodes[i];
+
+        if (node->phys_id >= WVM_MAX_SLAVES || node->port == 0 ||
+            node->cpu_capacity == 0 || node->memory_mb == 0 ||
+            node->dht_slots == 0) {
+            set_error(error, error_len,
+                      "resource plan has invalid node at index %u", i);
+            return -1;
+        }
+        if (node_index_by_id(plan, node->phys_id) != (int)i) {
+            set_error(error, error_len,
+                      "resource plan has duplicate node id %u", node->phys_id);
+            return -1;
+        }
+    }
+
+    for (i = 0; i < WVM_MAX_VMS; i++) {
+        const struct wvm_resource_vm *vm;
+        uint32_t per_vm_cpu[WVM_MAX_SLAVES] = {0};
+        uint64_t per_vm_memory[WVM_MAX_SLAVES] = {0};
+        uint64_t assigned_memory = 0;
+        uint32_t vcpu;
+        uint32_t chunk;
+        int host_index;
+
+        if (plan->vm_present[i] != 0 && plan->vm_present[i] != 1) {
+            set_error(error, error_len,
+                      "resource plan has invalid VM presence flag at %u", i);
+            return -1;
+        }
+        if (!plan->vm_present[i]) {
+            continue;
+        }
+        observed_vm_count++;
+        vm = &plan->vms[i];
+
+        if (vm->vm_id != i || vm->vcpu_count == 0 ||
+            vm->vcpu_count > WVM_CPU_ROUTE_TABLE_SIZE ||
+            vm->memory_mb == 0 ||
+            vm->memory_chunk_count == 0 ||
+            vm->memory_chunk_count > WVM_RESOURCE_MAX_MEMORY_CHUNKS ||
+            (vm->policy != WVM_RESOURCE_POLICY_COMPACT &&
+             vm->policy != WVM_RESOURCE_POLICY_SPREAD)) {
+            set_error(error, error_len, "VM %u has invalid plan metadata", i);
+            return -1;
+        }
+
+        host_index = node_index_by_id(plan, vm->host_phys_id);
+        if (host_index < 0) {
+            set_error(error, error_len, "VM %u has no valid host node", i);
+            return -1;
+        }
+
+        for (vcpu = 0; vcpu < vm->vcpu_count; vcpu++) {
+            int node_index = -1;
+
+            for (uint32_t n = 0; n < plan->node_count; n++) {
+                if (plan->nodes[n].vnode_start == vm->vcpu_nodes[vcpu]) {
+                    node_index = (int)n;
+                    break;
+                }
+            }
+            if (node_index < 0) {
+                set_error(error, error_len,
+                          "VM %u vCPU %u has no registered executor node",
+                          i, vcpu);
+                return -1;
+            }
+            per_vm_cpu[node_index]++;
+        }
+        if (per_vm_cpu[host_index] == 0) {
+            set_error(error, error_len,
+                      "VM %u host node has no local vCPU assignment", i);
+            return -1;
+        }
+
+        for (chunk = 0; chunk < vm->memory_chunk_count; chunk++) {
+            uint64_t chunk_mb =
+                vm->memory_mb - assigned_memory > WVM_RESOURCE_MEMORY_CHUNK_MB
+                    ? WVM_RESOURCE_MEMORY_CHUNK_MB
+                    : vm->memory_mb - assigned_memory;
+            int node_index = -1;
+
+            if (chunk_mb == 0) {
+                set_error(error, error_len,
+                          "VM %u has excess memory chunks", i);
+                return -1;
+            }
+            for (uint32_t n = 0; n < plan->node_count; n++) {
+                if (plan->nodes[n].vnode_start == vm->memory_nodes[chunk]) {
+                    node_index = (int)n;
+                    break;
+                }
+            }
+            if (node_index < 0) {
+                set_error(error, error_len,
+                          "VM %u memory chunk %u has no registered owner",
+                          i, chunk);
+                return -1;
+            }
+            per_vm_memory[node_index] += chunk_mb;
+            assigned_memory += chunk_mb;
+        }
+        if (assigned_memory != vm->memory_mb) {
+            set_error(error, error_len,
+                      "VM %u memory chunks cover %llu MB, expected %llu MB",
+                      i, (unsigned long long)assigned_memory,
+                      (unsigned long long)vm->memory_mb);
+            return -1;
+        }
+
+        for (uint32_t n = 0; n < plan->node_count; n++) {
+            if (vm->vcpus_per_node[n] != per_vm_cpu[n] ||
+                vm->memory_mb_per_node[n] != per_vm_memory[n]) {
+                set_error(error, error_len,
+                          "VM %u per-node summary does not match assignments",
+                          i);
+                return -1;
+            }
+            used_cpu[n] += per_vm_cpu[n];
+            used_memory[n] += per_vm_memory[n];
+        }
+    }
+
+    if (observed_vm_count != plan->vm_count) {
+        set_error(error, error_len,
+                  "resource plan VM count does not match presence map");
+        return -1;
+    }
+
+    for (i = 0; i < plan->node_count; i++) {
+        if (used_cpu[i] > plan->nodes[i].cpu_capacity ||
+            used_memory[i] > plan->nodes[i].memory_mb) {
+            set_error(error, error_len,
+                      "resource plan overcommits node %u",
+                      plan->nodes[i].phys_id);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -442,7 +616,7 @@ int wvm_resource_plan_load(const char *path, struct wvm_resource_plan *plan,
         }
     }
 
-    return 0;
+    return wvm_resource_plan_validate(plan, error, error_len);
 
 fail:
     fclose(fp);
@@ -497,6 +671,14 @@ uint64_t wvm_resource_plan_local_memory_mb(
     return index < 0 ? 0 : vm->memory_mb_per_node[index];
 }
 
+uint32_t wvm_resource_plan_host_node(const struct wvm_resource_plan *plan,
+                                     uint8_t vm_id)
+{
+    const struct wvm_resource_vm *vm = wvm_resource_plan_get_vm(plan, vm_id);
+
+    return vm ? vm->host_phys_id : 0;
+}
+
 void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
                              int vm_id_filter)
 {
@@ -522,6 +704,7 @@ void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
     for (i = 0; i < WVM_MAX_VMS; i++) {
         const struct wvm_resource_vm *vm;
         uint32_t node_index;
+        int host_index;
 
         if (!plan->vm_present[i] ||
             (vm_id_filter >= 0 && i != (uint32_t)vm_id_filter)) {
@@ -529,6 +712,7 @@ void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
         }
 
         vm = &plan->vms[i];
+        host_index = node_index_by_id(plan, vm->host_phys_id);
         printf("VM id=%u policy=%s vcpus=%u memory_mb=%llu chunks=%u\n",
                vm->vm_id,
                vm->policy == WVM_RESOURCE_POLICY_COMPACT ? "compact" : "spread",
@@ -537,6 +721,8 @@ void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
         printf("WVM_PLAN_VM%u_VCPUS=%u\n", vm->vm_id, vm->vcpu_count);
         printf("WVM_PLAN_VM%u_MEMORY_MB=%llu\n", vm->vm_id,
                (unsigned long long)vm->memory_mb);
+        printf("WVM_PLAN_VM%u_HOST_NODE=%u\n", vm->vm_id,
+               vm->host_phys_id);
         for (node_index = 0; node_index < plan->node_count; node_index++) {
             if (vm->vcpus_per_node[node_index] == 0 &&
                 vm->memory_mb_per_node[node_index] == 0) {
@@ -553,18 +739,9 @@ void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
                    plan->nodes[node_index].phys_id,
                    (unsigned long long)vm->memory_mb_per_node[node_index]);
         }
-        if (vm->vcpu_count > 0) {
-            uint32_t host_vnode = vm->vcpu_nodes[0];
-
-            for (node_index = 0; node_index < plan->node_count; node_index++) {
-                if (plan->nodes[node_index].vnode_start == host_vnode) {
-                    printf("WVM_PLAN_VM%u_HOST_NODE=%u\n", vm->vm_id,
-                           plan->nodes[node_index].phys_id);
-                    printf("WVM_PLAN_VM%u_LOCAL_VCPUS=%u\n", vm->vm_id,
-                           vm->vcpus_per_node[node_index]);
-                    break;
-                }
-            }
+        if (host_index >= 0) {
+            printf("WVM_PLAN_VM%u_LOCAL_VCPUS=%u\n", vm->vm_id,
+                   vm->vcpus_per_node[host_index]);
         }
     }
 }

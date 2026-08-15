@@ -183,6 +183,31 @@ typedef struct wvm_ipc_header_t {
 #define WVM_IPC_ROLE_ASYNC_PUSH       1
 #define WVM_IPC_ROLE_SYNC             2
 
+/*
+ * Manifest-bound local registration.  The legacy four-byte role payload is
+ * accepted only by compatibility launches that do not activate the runtime
+ * gate.  A gated node runtime requires every QEMU connection to present the
+ * same VM lifetime, candidate manifest, and capability profile.
+ */
+#define WVM_IPC_REGISTRATION_MAGIC   0x57565247U /* "WVRG" */
+#define WVM_IPC_REGISTRATION_VERSION 1U
+#define WVM_IPC_ENDPOINT_NAME_BYTES  128U
+
+struct wvm_ipc_runtime_registration {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t ipc_role;
+    uint32_t connection_role;
+    uint32_t vm_id;
+    uint64_t vm_incarnation;
+    uint64_t manifest_generation;
+    uint8_t candidate_manifest_digest[32];
+    uint64_t local_runtime_instance_id;
+    uint64_t caller_process_instance_id;
+    uint8_t capability_profile_digest[32];
+    char requested_endpoint_name[WVM_IPC_ENDPOINT_NAME_BYTES];
+};
+
 // [V29 Fix] 正式定义 RPC 透传类型
 #define WVM_IPC_TYPE_RPC_PASSTHROUGH 99
 

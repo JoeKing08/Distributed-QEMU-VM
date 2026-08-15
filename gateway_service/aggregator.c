@@ -26,10 +26,16 @@
 #include <poll.h>
 #include <sys/sysinfo.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <inttypes.h>
 
 #include "aggregator.h"
+#include "../common_include/wavevm_control.h"
+#include "../common_include/wavevm_membership.h"
 #include "../common_include/wavevm_protocol.h"
+#include "../common_include/wavevm_route_runtime.h"
+#include "../common_include/wavevm_runtime_gate.h"
 #include "uthash.h"
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -52,6 +58,10 @@ typedef struct {
 static gateway_node_t *g_node_map = NULL; // IMPORTANT: Must be initialized to NULL
 // [REVISED PATCH] 使用读写锁替代互斥锁，保障数据面性能
 static pthread_rwlock_t g_map_lock = PTHREAD_RWLOCK_INITIALIZER; // A global lock to protect the hash map itself (for creation/deletion)
+static struct wvm_route_runtime g_route_runtime;
+static int g_route_runtime_ready = 0;
+static uint32_t g_route_vm_id = 0;
+static int g_route_authority_active = 0;
 #define BATCH_SIZE 64
 #define WVM_BIG_PKT_THRESHOLD 200
 #define WVM_RXQ_DROP_HEARTBEAT (512 * 1024)
@@ -172,6 +182,58 @@ static int g_use_recvfrom = 0;
 static int g_nonblock_recv = 0;
 static int g_force_single_fd = 0;
 static int g_multi_queue = 1;
+
+static int parse_u64_env(const char *name, uint64_t *value)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int parse_hex_digest_env(const char *name, uint8_t digest[32])
+{
+    const char *text = getenv(name);
+    size_t i;
+
+    if (!text || strlen(text) != 64 || !digest) {
+        return -1;
+    }
+    for (i = 0; i < 32; i++) {
+        unsigned int value;
+
+        if (sscanf(text + i * 2U, "%2x", &value) != 1 ||
+            value > 0xffU) {
+            return -1;
+        }
+        digest[i] = (uint8_t)value;
+    }
+    return 0;
+}
+
+static int route_entry_compare(const void *left, const void *right)
+{
+    const struct wvm_route_runtime_entry *a = left;
+    const struct wvm_route_runtime_entry *b = right;
+
+    if (a->destination_id < b->destination_id) {
+        return -1;
+    }
+    if (a->destination_id > b->destination_id) {
+        return 1;
+    }
+    return 0;
+}
 
 static inline gateway_node_t* find_node(uint32_t slave_id);
 static void learn_route(uint32_t slave_id, struct sockaddr_in *addr);
@@ -424,6 +486,201 @@ static gateway_node_t* find_or_create_node(uint32_t slave_id) {
     return node;
 }
 
+static int read_route_snapshot_file(
+    const char *path, struct wvm_route_snapshot_record *snapshot,
+    struct wvm_route_rule_record *rules, size_t rule_capacity,
+    struct wvm_required_ack_entry *ack_entries, size_t ack_capacity,
+    char *error, size_t error_len)
+{
+    struct stat st;
+    uint8_t *bytes;
+    size_t offset = 0;
+    int fd;
+    int result = -1;
+
+    if (!path || !snapshot || !rules || rule_capacity == 0 ||
+        !ack_entries || ack_capacity == 0 || stat(path, &st) != 0 ||
+        st.st_size <= 0 || (uintmax_t)st.st_size > WVM_RUNTIME_MANIFEST_MAX_BYTES) {
+        snprintf(error, error_len, "route snapshot file is invalid");
+        return -1;
+    }
+    bytes = malloc((size_t)st.st_size);
+    if (!bytes) {
+        snprintf(error, error_len, "cannot allocate route snapshot buffer");
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(error, error_len, "cannot open route snapshot: %s",
+                 strerror(errno));
+        free(bytes);
+        return -1;
+    }
+    while (offset < (size_t)st.st_size) {
+        ssize_t received = read(fd, bytes + offset,
+                                (size_t)st.st_size - offset);
+
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0) {
+            snprintf(error, error_len, "cannot read route snapshot: %s",
+                     received == 0 ? "unexpected EOF" : strerror(errno));
+            goto out;
+        }
+        offset += (size_t)received;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->next_hop_rules.entries = rules;
+    snapshot->next_hop_rules.capacity = rule_capacity;
+    snapshot->required_ack_set.entries.entries = ack_entries;
+    snapshot->required_ack_set.entries.capacity = ack_capacity;
+    if (wvm_route_snapshot_record_decode(bytes, offset, snapshot, error,
+                                         error_len) != 0) {
+        goto out;
+    }
+    result = 0;
+out:
+    close(fd);
+    free(bytes);
+    return result;
+}
+
+static int init_route_runtime_from_snapshot_file(const char *path)
+{
+    struct wvm_route_snapshot_record snapshot;
+    struct wvm_route_runtime_entry *entries = NULL;
+    struct wvm_route_rule_record *rules = NULL;
+    struct wvm_required_ack_entry *ack_entries = NULL;
+    struct wvm_route_snapshot_key key;
+    size_t count;
+    size_t i;
+    char error[256] = {0};
+    uint64_t vm_id;
+
+    if (!path || parse_u64_env("WVM_VM_ID", &vm_id) != 0 ||
+        vm_id == 0 || vm_id > 0xffU || g_route_vm_id != (uint32_t)vm_id) {
+        fprintf(stderr, "[Gateway] admitted route identity is incomplete\n");
+        return -EINVAL;
+    }
+    rules = calloc(WVM_ROUTE_RUNTIME_MAX_ENTRIES, sizeof(*rules));
+    ack_entries = calloc(WVM_ROUTE_RUNTIME_MAX_ENTRIES, sizeof(*ack_entries));
+    if (!rules || !ack_entries) {
+        free(rules);
+        free(ack_entries);
+        return -ENOMEM;
+    }
+    if (read_route_snapshot_file(
+            path, &snapshot, rules, WVM_ROUTE_RUNTIME_MAX_ENTRIES,
+            ack_entries, WVM_ROUTE_RUNTIME_MAX_ENTRIES, error,
+            sizeof(error)) != 0) {
+        fprintf(stderr, "[Gateway] route snapshot rejected: %s\n",
+                error[0] ? error : "invalid snapshot");
+        free(rules);
+        free(ack_entries);
+        return -EINVAL;
+    }
+    key = snapshot.route_snapshot_key;
+    if (key.scope_key.vm_id != g_route_vm_id ||
+        key.scope_key.vm_incarnation == 0 ||
+        snapshot.topology_kind != WVM_ROUTE_TOPOLOGY_FLAT) {
+        fprintf(stderr,
+                "[Gateway] route snapshot is not representable by the "
+                "compatibility data-plane\n");
+        free(rules);
+        free(ack_entries);
+        return -ENOTSUP;
+    }
+
+    count = snapshot.next_hop_rules.count;
+    entries = calloc(count ? count : 1, sizeof(*entries));
+    if (!entries) {
+        free(rules);
+        free(ack_entries);
+        return -ENOMEM;
+    }
+    for (i = 0; i < count; i++) {
+        const struct wvm_route_rule_record *rule =
+            &snapshot.next_hop_rules.entries[i];
+        const struct wvm_endpoint *endpoint = &rule->next_hop_endpoint;
+        gateway_node_t *node;
+        uint32_t destination;
+
+        /*
+         * The current wire carries one 24-bit node field.  Only exact vnode
+         * rules with an IPv4 UDP endpoint can be projected into it.  Prefix
+         * rules remain a control-plane concern until the versioned route
+         * envelope carries their scope explicitly.
+         */
+        if (rule->destination_kind != WVM_ROUTE_DESTINATION_EXACT_VNODE ||
+            rule->destination_scope != 0 ||
+            rule->destination_vnode_or_endpoint > WVM_NODEID_MASK ||
+            endpoint->data_transport != WVM_DATA_TRANSPORT_UDP ||
+            endpoint->data_address_bytes != 4 || endpoint->data_port == 0) {
+            fprintf(stderr,
+                    "[Gateway] route rule %zu needs a versioned scoped "
+                    "data-plane identity\n", i);
+            free(entries);
+            free(rules);
+            free(ack_entries);
+            return -ENOTSUP;
+        }
+        destination = WVM_ENCODE_ID(
+            g_route_vm_id, rule->destination_vnode_or_endpoint);
+        entries[i].destination_id = destination;
+        entries[i].next_hop.sin_family = AF_INET;
+        memcpy(&entries[i].next_hop.sin_addr.s_addr, endpoint->data_address, 4);
+        entries[i].next_hop.sin_port = htons(endpoint->data_port);
+
+        node = find_or_create_node(destination);
+        if (!node) {
+            free(entries);
+            free(rules);
+            free(ack_entries);
+            return -ENOMEM;
+        }
+        pthread_mutex_lock(&node->lock);
+        node->addr = entries[i].next_hop;
+        node->static_pinned = 1;
+        pthread_mutex_unlock(&node->lock);
+    }
+
+    wvm_route_runtime_init(&g_route_runtime);
+    g_route_runtime_ready = 1;
+    if (wvm_route_runtime_prepare(&g_route_runtime, &key, entries, count,
+                                  error, sizeof(error)) != 0 ||
+        wvm_route_runtime_activate(&g_route_runtime, &key, error,
+                                   sizeof(error)) != 0) {
+        fprintf(stderr, "[Gateway] route snapshot activation rejected: %s\n",
+                error[0] ? error : "invalid snapshot");
+        free(entries);
+        free(rules);
+        free(ack_entries);
+        wvm_route_runtime_destroy(&g_route_runtime);
+        g_route_runtime_ready = 0;
+        return -EINVAL;
+    }
+    free(entries);
+    free(rules);
+    free(ack_entries);
+    g_route_authority_active = 1;
+    fprintf(stderr,
+            "[Gateway] active route snapshot vm=%u scope=%" PRIu64
+            " topology=%" PRIu64 " generation=%" PRIu64 "\n",
+            g_route_vm_id, key.scope_key.route_scope_id,
+            key.topology_revision, key.route_generation);
+    return 0;
+}
+
+static int init_route_runtime_from_environment(void)
+{
+    const char *path = getenv("WVM_RUNTIME_ROUTE_SNAPSHOT_PATH");
+
+    if (path && path[0] != '\0')
+        return init_route_runtime_from_snapshot_file(path);
+    return 0;
+}
+
 /* 
  * [物理意图] 注入“静态初始坐标”，作为 P2P 网络启动时的引航灯。
  * [关键逻辑] 解析配置文件中的 ROUTE 范围指令，一次性预热数千个虚拟节点的路由条目，避免运行时的哈希抖动。
@@ -453,6 +710,9 @@ static int load_slave_config(const char *path) {
                 // 展开路由聚合
                 for (uint32_t i = 0; i < count; i++) {
                     uint32_t current_id = start_id + i;
+                    if (g_route_vm_id != 0) {
+                        current_id = WVM_ENCODE_ID(g_route_vm_id, current_id);
+                    }
                     gateway_node_t *node = find_or_create_node(current_id);
                     if (node) {
                         node->addr.sin_family = AF_INET;
@@ -548,18 +808,21 @@ static void smart_backoff(int attempts) {
  * [后果] 这一步保证了包序的“因果一致性”。它确保了全量更新包不会被后续的小增量包在网关缓冲区内超越。
  */
 static int internal_push(int fd, uint32_t slave_id, void *data, int len) {
+    if (g_route_authority_active) {
+        struct sockaddr_in route_next_hop;
+
+        if (wvm_route_runtime_lookup(&g_route_runtime, slave_id,
+                                     &route_next_hop, NULL) != 0) {
+        /*
+         * A V1 route miss is a scoped miss.  Do not strip a nonzero VM ID and
+         * accidentally deliver another VM's packet to the same raw vnode.
+         */
+            return -EHOSTUNREACH;
+        }
+    }
     // 1. 读锁保护查找，防止与动态路由更新冲突
     pthread_rwlock_rdlock(&g_map_lock);
     gateway_node_t *node = find_node(slave_id);
-    // [Multi-VM Fallback] composite ID 查不到时，strip vm_id 用裸 node_id 再查一次
-    // 兼容 routes.conf 只写裸 ID、实际流量带 composite ID 的分形集群场景
-    // vm_id=0 时 WVM_GET_NODEID(id)==id，fallback 等价于 no-op 不影响性能
-    if (!node) {
-        uint32_t raw_id = WVM_GET_NODEID(slave_id);
-        if (raw_id != slave_id) {
-            node = find_node(raw_id);
-        }
-    }
     if (!node) {
         pthread_rwlock_unlock(&g_map_lock);
         { static int __nf=0; if (__nf < 10) { fprintf(stderr, "[GW-PUSH] node NOT FOUND sid=%u\n", slave_id); __nf++; } }
@@ -705,6 +968,9 @@ void flush_all_buffers(void) {
  * [后果] 这是 WaveVM 能够支撑百万节点的奥秘。它不再依赖人工配置，而是通过“谁发包，我认识谁”实现拓扑的自动收敛。
  */
 static void learn_route(uint32_t slave_id, struct sockaddr_in *addr) {
+    if (g_route_authority_active) {
+        return;
+    }
     // [FIX] 环境变量禁用 learn_route（用于 L2 等中间网关，防止转发包覆写静态路由）
     static int disabled = -1;
     if (disabled == -1) disabled = (getenv("WVM_GATEWAY_DISABLE_LEARN_ROUTE") != NULL);
@@ -984,6 +1250,12 @@ typedef struct {
  * [后果] 实现了分形架构的层级级联。通过此接口，自动化运维工具可以将分散的 Pod 编织成一个巨大的戴森球算力网。
  */
 void dynamic_add_route(uint32_t node_id, uint32_t ip, uint16_t port) {
+    if (g_route_authority_active) {
+        fprintf(stderr,
+                "[Gateway] rejected legacy dynamic route for active snapshot "
+                "node=%u\n", node_id);
+        return;
+    }
     // 1. 获取写锁 (独占，会暂停所有数据转发微秒级时间)
     pthread_rwlock_wrlock(&g_map_lock);
     
@@ -1055,10 +1327,33 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
     g_use_recvfrom = (getenv("WVM_GATEWAY_USE_RECVFROM") != NULL);
     g_nonblock_recv = (getenv("WVM_NONBLOCK_RECV") != NULL);
     {
+        uint64_t vm_id;
+
+        if (parse_u64_env("WVM_VM_ID", &vm_id) == 0 &&
+            vm_id <= UINT32_MAX) {
+            g_route_vm_id = (uint32_t)vm_id;
+        }
+    }
+    {
         const char *mq = getenv("WVM_GATEWAY_MULTI_QUEUE");
         if (mq && mq[0] == '0') g_multi_queue = 0;
     }
-    if (load_slave_config(config_path) != 0) return -ENOENT;
+    if (getenv("WVM_RUNTIME_GATE_ACTIVE") &&
+        strcmp(getenv("WVM_RUNTIME_GATE_ACTIVE"), "0") != 0) {
+        const char *snapshot_path =
+            getenv("WVM_RUNTIME_ROUTE_SNAPSHOT_PATH");
+
+        if (!snapshot_path || snapshot_path[0] == '\0' ||
+            init_route_runtime_from_snapshot_file(snapshot_path) != 0) {
+            fprintf(stderr,
+                    "[Gateway] active runtime requires a valid route "
+                    "snapshot path\n");
+            return -EINVAL;
+        }
+    } else {
+        if (load_slave_config(config_path) != 0) return -ENOENT;
+        if (init_route_runtime_from_environment() != 0) return -EINVAL;
+    }
 
     g_upstream_addr.sin_family = AF_INET;
     g_upstream_addr.sin_addr.s_addr = inet_addr(upstream_ip);

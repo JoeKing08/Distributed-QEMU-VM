@@ -26,12 +26,16 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "logic_core.h"
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_config.h"
 #include "../common_include/wavevm_resources.h"
+#include "../common_include/wavevm_route_delivery.h"
+#include "../common_include/wavevm_runtime_dispatch.h"
+#include "../common_include/wavevm_runtime_gate.h"
 
 // --- 全局状态 ---
 extern struct dsm_driver_ops u_ops;
@@ -43,8 +47,452 @@ extern int g_my_node_id;
 uint8_t g_my_vm_id = 0;  // Multi-VM: 默认 0，向后兼容
 static struct wvm_resource_plan g_resource_plan;
 static int g_resource_plan_ready = 0;
+static struct wvm_runtime_manifest_storage g_runtime_storage;
+static struct wvm_runtime_gate g_runtime_gate;
+static int g_runtime_gate_active = 0;
+static struct wvm_runtime_dispatch_storage g_runtime_dispatch_storage;
+static int g_runtime_dispatch_active = 0;
+static int g_runtime_dispatch_kernel_memory_cache = 0;
+static pthread_mutex_t g_runtime_gate_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_runtime_operation_sequence = 1;
 
 #define MAX_QEMU_CLIENTS 8
+
+static int parse_runtime_u64(const char *text, uint64_t *value)
+{
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int parse_legacy_vm_id(const char *text, uint8_t *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed > UINT8_MAX) {
+        return -1;
+    }
+    *value = (uint8_t)parsed;
+    return 0;
+}
+
+static int runtime_gate_enabled_by_environment(void)
+{
+    const char *value = getenv("WVM_RUNTIME_GATE_ACTIVE");
+
+    return value && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int runtime_route_key_equal(const struct wvm_route_snapshot_key *left,
+                                   const struct wvm_route_snapshot_key *right)
+{
+    return left && right &&
+           left->scope_key.vm_id == right->scope_key.vm_id &&
+           left->scope_key.vm_incarnation == right->scope_key.vm_incarnation &&
+           left->scope_key.route_scope_id == right->scope_key.route_scope_id &&
+           left->topology_revision == right->topology_revision &&
+           left->route_generation == right->route_generation &&
+           memcmp(left->snapshot_digest, right->snapshot_digest,
+                  WVM_SHA256_DIGEST_BYTES) == 0;
+}
+
+static int init_runtime_dispatch_from_environment(void)
+{
+    const char *dispatch_path;
+    const struct wvm_runtime_dispatch_projection *dispatch;
+    char error[256] = {0};
+
+    if (!runtime_gate_enabled_by_environment()) {
+        return 0;
+    }
+    dispatch_path = getenv("WVM_RUNTIME_DISPATCH_PATH");
+    if (!dispatch_path || !g_runtime_storage.manifest.has_activation_fence) {
+        fprintf(stderr,
+                "[RuntimeDispatch] active runtime is missing dispatch input\n");
+        return -1;
+    }
+
+    wvm_runtime_dispatch_storage_init(&g_runtime_dispatch_storage);
+    if (wvm_runtime_dispatch_file_load(dispatch_path,
+                                       &g_runtime_dispatch_storage, error,
+                                       sizeof(error)) != 0) {
+        fprintf(stderr, "[RuntimeDispatch] cannot load dispatch: %s\n",
+                error[0] ? error : "invalid dispatch artifact");
+        wvm_runtime_dispatch_storage_free(&g_runtime_dispatch_storage);
+        return -1;
+    }
+    dispatch = &g_runtime_dispatch_storage.projection;
+    if (memcmp(dispatch->candidate_manifest_digest,
+               g_runtime_storage.manifest.candidate_manifest_digest,
+               sizeof(dispatch->candidate_manifest_digest)) != 0 ||
+        dispatch->vm_id != g_runtime_storage.manifest.vm_id ||
+        dispatch->vm_incarnation != g_runtime_storage.manifest.vm_incarnation ||
+        dispatch->manifest_generation !=
+            g_runtime_storage.manifest.manifest_generation ||
+        dispatch->physical_node_id !=
+            g_runtime_storage.manifest.physical_node_id ||
+        dispatch->expected_node_instance_id !=
+            g_runtime_storage.manifest.expected_node_instance_id ||
+        memcmp(dispatch->activation_fence,
+               g_runtime_storage.manifest.activation_fence,
+               sizeof(dispatch->activation_fence)) != 0 ||
+        !runtime_route_key_equal(
+            &dispatch->required_route_snapshot_key,
+            &g_runtime_storage.manifest.required_route_snapshot_key)) {
+        fprintf(stderr,
+                "[RuntimeDispatch] dispatch does not match admitted manifest\n");
+        wvm_runtime_dispatch_storage_free(&g_runtime_dispatch_storage);
+        return -1;
+    }
+    g_runtime_dispatch_active = 1;
+    return 0;
+}
+
+static int runtime_dispatch_populate_legacy_memory_cache(
+    const struct wvm_runtime_dispatch_projection *dispatch)
+{
+    const uint64_t legacy_chunk_bytes = UINT64_C(1) << WVM_ROUTING_SHIFT;
+    size_t i;
+
+    for (i = 0; i < dispatch->memory_dispatch.count; i++) {
+        const struct wvm_runtime_memory_dispatch *entry =
+            &dispatch->memory_dispatch.entries[i];
+        uint64_t first_chunk;
+        uint64_t chunk_count;
+
+        if (entry->gpa_start % legacy_chunk_bytes != 0 ||
+            entry->bytes % legacy_chunk_bytes != 0) {
+            return 0;
+        }
+        first_chunk = entry->gpa_start / legacy_chunk_bytes;
+        chunk_count = entry->bytes / legacy_chunk_bytes;
+        if (first_chunk >= WVM_MEMORY_ROUTE_TABLE_SIZE ||
+            chunk_count > WVM_MEMORY_ROUTE_TABLE_SIZE - first_chunk) {
+            return 0;
+        }
+    }
+    for (i = 0; i < dispatch->memory_dispatch.count; i++) {
+        const struct wvm_runtime_memory_dispatch *entry =
+            &dispatch->memory_dispatch.entries[i];
+        uint64_t first_chunk = entry->gpa_start / legacy_chunk_bytes;
+        uint64_t chunk_count = entry->bytes / legacy_chunk_bytes;
+        uint64_t chunk;
+
+        for (chunk = 0; chunk < chunk_count; chunk++) {
+            wvm_set_memory_mapping((int)(first_chunk + chunk),
+                                   entry->directory_vnode);
+        }
+    }
+    return 1;
+}
+
+static int apply_runtime_dispatch(void)
+{
+    const struct wvm_runtime_dispatch_projection *dispatch;
+    uint32_t sidecar_ip = 0;
+    size_t i;
+
+    if (!g_runtime_dispatch_active) {
+        return -1;
+    }
+    dispatch = &g_runtime_dispatch_storage.projection;
+    memcpy(&sidecar_ip, dispatch->local_sidecar_endpoint.data_address,
+           sizeof(sidecar_ip));
+
+    /*
+     * The node runtime has exactly one fabric peer: its local sidecar.  Each
+     * compatibility target entry deliberately resolves to that peer; the
+     * immutable route snapshot remains the cross-node routing authority.
+     */
+    for (i = 0; i < dispatch->route_vnode_count; i++) {
+        u_ops.set_gateway_ip(WVM_ENCODE_ID(g_my_vm_id, (uint32_t)i),
+                             sidecar_ip,
+                             htons(dispatch->local_sidecar_endpoint.data_port));
+    }
+
+    wvm_set_mem_mapping(0, dispatch->route_vnode_count);
+    wvm_clear_cpu_mappings();
+    wvm_clear_memory_mappings();
+    for (i = 0; i < dispatch->cpu_dispatch.count; i++) {
+        if (wvm_get_cpu_mapping_raw(
+                (int)dispatch->cpu_dispatch.entries[i].guest_vcpu_index) !=
+            WVM_NODE_AUTO_ROUTE) {
+            return -1;
+        }
+        wvm_set_cpu_mapping(
+            (int)dispatch->cpu_dispatch.entries[i].guest_vcpu_index,
+            dispatch->cpu_dispatch.entries[i].executor_vnode);
+    }
+    for (i = 0; i < dispatch->memory_dispatch.count; i++) {
+        const struct wvm_runtime_memory_dispatch *entry =
+            &dispatch->memory_dispatch.entries[i];
+
+        if (wvm_set_memory_range_mapping(entry->gpa_start, entry->bytes,
+                                         entry->directory_vnode) != 0) {
+            return -1;
+        }
+    }
+    g_runtime_dispatch_kernel_memory_cache =
+        runtime_dispatch_populate_legacy_memory_cache(dispatch);
+    return 0;
+}
+
+static int runtime_dispatch_local_reservation(uint32_t *local_vcpus,
+                                              uint64_t *local_memory_bytes)
+{
+    const struct wvm_memory_chunk_assignment_list *memory;
+    uint64_t bytes = 0;
+    size_t i;
+
+    if (!g_runtime_dispatch_active || !local_vcpus || !local_memory_bytes) {
+        return -1;
+    }
+    memory = &g_runtime_storage.manifest.local_memory_assignments;
+    for (i = 0; i < memory->count; i++) {
+        if (bytes > UINT64_MAX - memory->entries[i].bytes) {
+            return -1;
+        }
+        bytes += memory->entries[i].bytes;
+    }
+    *local_vcpus =
+        (uint32_t)g_runtime_storage.manifest.local_vcpu_assignments.count;
+    *local_memory_bytes = bytes;
+    return 0;
+}
+
+static int init_runtime_gate_from_environment(int physical_node_id)
+{
+    const char *manifest_path;
+    const char *node_instance_text;
+    struct wvm_route_snapshot_file_storage route_storage;
+    char route_path[WVM_ROUTE_DELIVERY_PATH_MAX];
+    uint64_t node_instance_id;
+    char error[256] = {0};
+
+    if (!runtime_gate_enabled_by_environment()) {
+        return 0;
+    }
+    manifest_path = getenv("WVM_RUNTIME_MANIFEST_PATH");
+    node_instance_text = getenv("WVM_NODE_INSTANCE_ID");
+    if (!manifest_path ||
+        parse_runtime_u64(node_instance_text, &node_instance_id) != 0) {
+        fprintf(stderr,
+                "[RuntimeGate] active but manifest path/node instance is "
+                "missing\n");
+        return -1;
+    }
+
+    wvm_route_snapshot_file_storage_init(&route_storage);
+    wvm_runtime_manifest_storage_init(&g_runtime_storage);
+    wvm_runtime_gate_init(&g_runtime_gate);
+    if (wvm_runtime_manifest_load_file(manifest_path, &g_runtime_storage,
+                                       error, sizeof(error)) != 0 ||
+        g_runtime_storage.manifest.vm_id != g_my_vm_id ||
+        wvm_runtime_gate_prepare(&g_runtime_gate, &g_runtime_storage.manifest,
+                                 (uint32_t)physical_node_id, node_instance_id,
+                                 error, sizeof(error)) != 0 ||
+        wvm_runtime_gate_activate(&g_runtime_gate,
+                                  g_runtime_storage.manifest.activation_fence,
+                                  error, sizeof(error)) != 0) {
+        fprintf(stderr, "[RuntimeGate] master role rejected manifest: %s\n",
+                error[0] ? error : "manifest VM identity mismatch");
+        wvm_runtime_manifest_storage_free(&g_runtime_storage);
+        wvm_route_snapshot_file_storage_free(&route_storage);
+        return -1;
+    }
+    if (wvm_route_snapshot_path_from_manifest(
+            manifest_path, route_path, sizeof(route_path), error,
+            sizeof(error)) != 0 ||
+        wvm_route_snapshot_file_load(route_path, &route_storage, error,
+                                     sizeof(error)) != 0 ||
+        wvm_route_snapshot_file_matches(
+            &route_storage,
+            &g_runtime_storage.manifest.required_route_snapshot_key, error,
+            sizeof(error)) != 0) {
+        fprintf(stderr, "[RuntimeGate] master role rejected route snapshot: %s\n",
+                error[0] ? error : "route snapshot identity mismatch");
+        wvm_runtime_manifest_storage_free(&g_runtime_storage);
+        wvm_route_snapshot_file_storage_free(&route_storage);
+        return -1;
+    }
+    setenv("WVM_RUNTIME_ROUTE_SNAPSHOT_PATH", route_path, 1);
+    wvm_route_snapshot_file_storage_free(&route_storage);
+    g_runtime_gate_active = 1;
+    if (init_runtime_dispatch_from_environment() != 0) {
+        g_runtime_gate_active = 0;
+        wvm_runtime_manifest_storage_free(&g_runtime_storage);
+        return -1;
+    }
+    return 0;
+}
+
+static int runtime_gate_register_qemu(
+    const struct wvm_ipc_runtime_registration *wire_registration,
+    uint64_t *connection_id_out)
+{
+    struct wvm_runtime_registration registration;
+    char error[256] = {0};
+    int result;
+
+    if (!wire_registration ||
+        wire_registration->magic != WVM_IPC_REGISTRATION_MAGIC ||
+        wire_registration->version != WVM_IPC_REGISTRATION_VERSION ||
+        wire_registration->connection_role != WVM_MANIFEST_ROLE_QEMU_FRONTEND) {
+        return -1;
+    }
+    memset(&registration, 0, sizeof(registration));
+    registration.connection_role =
+        (enum wvm_manifest_role_type)wire_registration->connection_role;
+    registration.vm_id = wire_registration->vm_id;
+    registration.vm_incarnation = wire_registration->vm_incarnation;
+    registration.manifest_generation = wire_registration->manifest_generation;
+    memcpy(registration.candidate_manifest_digest,
+           wire_registration->candidate_manifest_digest,
+           sizeof(registration.candidate_manifest_digest));
+    registration.local_runtime_instance_id =
+        wire_registration->local_runtime_instance_id;
+    registration.caller_process_instance_id =
+        wire_registration->caller_process_instance_id;
+    memcpy(registration.capability_profile_digest,
+           wire_registration->capability_profile_digest,
+           sizeof(registration.capability_profile_digest));
+    memcpy(registration.requested_endpoint_name,
+           wire_registration->requested_endpoint_name,
+           sizeof(registration.requested_endpoint_name));
+
+    pthread_mutex_lock(&g_runtime_gate_lock);
+    result = wvm_runtime_gate_register(&g_runtime_gate, &registration,
+                                       connection_id_out, error,
+                                       sizeof(error));
+    pthread_mutex_unlock(&g_runtime_gate_lock);
+    if (result != 0) {
+        fprintf(stderr, "[RuntimeGate] QEMU registration rejected: %s\n",
+                error[0] ? error : "identity mismatch");
+    }
+    return result;
+}
+
+static int runtime_gate_authorize_connection(uint64_t connection_id)
+{
+    struct wvm_runtime_operation operation;
+    uint64_t operation_id;
+    char error[256] = {0};
+    int result;
+
+    if (!g_runtime_gate_active) {
+        return 0;
+    }
+    memset(&operation, 0, sizeof(operation));
+    operation_id = __sync_fetch_and_add(&g_runtime_operation_sequence, 1);
+    if (operation_id == 0) {
+        operation_id = 1;
+    }
+    operation.connection_id = connection_id;
+    operation.vm_id = g_runtime_storage.manifest.vm_id;
+    operation.vm_incarnation = g_runtime_storage.manifest.vm_incarnation;
+    operation.manifest_generation =
+        g_runtime_storage.manifest.manifest_generation;
+    memcpy(operation.candidate_manifest_digest,
+           g_runtime_storage.manifest.candidate_manifest_digest,
+           sizeof(operation.candidate_manifest_digest));
+    operation.route_snapshot_key =
+        g_runtime_storage.manifest.required_route_snapshot_key;
+    memcpy(operation.activation_fence,
+           g_runtime_storage.manifest.activation_fence,
+           sizeof(operation.activation_fence));
+    memcpy(operation.operation_id, &operation_id, sizeof(operation_id));
+
+    pthread_mutex_lock(&g_runtime_gate_lock);
+    result = wvm_runtime_gate_authorize(&g_runtime_gate, &operation, error,
+                                        sizeof(error));
+    pthread_mutex_unlock(&g_runtime_gate_lock);
+    if (result != 0) {
+        fprintf(stderr, "[RuntimeGate] IPC operation rejected: %s\n",
+                error[0] ? error : "authorization failure");
+    }
+    return result;
+}
+
+static int bind_kernel_context_from_manifest(uint32_t physical_node_id)
+{
+    struct wvm_ioctl_context_bind request;
+    uint8_t profile_digest[WVM_KERNEL_DIGEST_BYTES];
+    char error[256] = {0};
+
+    if (g_dev_fd < 0 || !g_runtime_gate_active) return 0;
+    if (!g_runtime_storage.manifest.has_activation_fence ||
+        wvm_runtime_manifest_profile_digest(&g_runtime_storage.manifest,
+                                            profile_digest, error,
+                                            sizeof(error)) != 0) {
+        fprintf(stderr,
+                "[KernelContext] manifest has no valid activation/profile "
+                "identity: %s\n",
+                error[0] ? error : "invalid manifest");
+        return -1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.magic = WVM_KERNEL_CONTEXT_MAGIC;
+    request.version = WVM_KERNEL_CONTEXT_ABI_VERSION;
+    request.vm_id = g_runtime_storage.manifest.vm_id;
+    request.physical_node_id = physical_node_id;
+    request.vm_incarnation = g_runtime_storage.manifest.vm_incarnation;
+    request.manifest_generation =
+        g_runtime_storage.manifest.manifest_generation;
+    memcpy(request.candidate_manifest_digest,
+           g_runtime_storage.manifest.candidate_manifest_digest,
+           sizeof(request.candidate_manifest_digest));
+    memcpy(request.capability_profile_digest, profile_digest,
+           sizeof(request.capability_profile_digest));
+    memcpy(request.activation_fence,
+           g_runtime_storage.manifest.activation_fence,
+           sizeof(request.activation_fence));
+    request.route_snapshot_key.scope_key.vm_id =
+        g_runtime_storage.manifest.required_route_snapshot_key.scope_key.vm_id;
+    request.route_snapshot_key.scope_key.vm_incarnation =
+        g_runtime_storage.manifest.required_route_snapshot_key.scope_key
+            .vm_incarnation;
+    request.route_snapshot_key.scope_key.route_scope_id =
+        g_runtime_storage.manifest.required_route_snapshot_key.scope_key
+            .route_scope_id;
+    request.route_snapshot_key.topology_revision =
+        g_runtime_storage.manifest.required_route_snapshot_key.topology_revision;
+    request.route_snapshot_key.route_generation =
+        g_runtime_storage.manifest.required_route_snapshot_key.route_generation;
+    memcpy(request.route_snapshot_key.snapshot_digest,
+           g_runtime_storage.manifest.required_route_snapshot_key
+               .snapshot_digest,
+           sizeof(request.route_snapshot_key.snapshot_digest));
+
+    if (ioctl(g_dev_fd, IOCTL_WVM_BIND_CONTEXT, &request) < 0) {
+        fprintf(stderr,
+                "[KernelContext] manifest-bound Mode A context rejected: "
+                "errno=%d (%s)\n",
+                errno, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr,
+            "[KernelContext] bound VM=%u incarnation=%" PRIu64
+            " node=%u (single-context Mode A gate)\n",
+            request.vm_id, request.vm_incarnation, request.physical_node_id);
+    return 0;
+}
 
 static void inject_cpu_route_table(void) {
     if (g_dev_fd < 0) return;
@@ -772,6 +1220,7 @@ void* client_handler(void *socket_desc) {
     fprintf(stderr, "[IPC] client connected fd=%d\n", qemu_fd);
 
     int is_push_client = 0;
+    uint64_t runtime_connection_id = 0;
 
     wvm_ipc_header_t ipc_hdr;
     uint8_t payload_buf[WVM_MAX_PACKET_SIZE];
@@ -807,16 +1256,60 @@ void* client_handler(void *socket_desc) {
             break;
         }
 
+        if (g_runtime_gate_active &&
+            ipc_hdr.type != WVM_IPC_TYPE_REGISTER &&
+            runtime_connection_id == 0) {
+            fprintf(stderr,
+                    "[RuntimeGate] rejecting unregistered IPC fd=%d type=%u\n",
+                    qemu_fd, (unsigned)ipc_hdr.type);
+            break;
+        }
+        if (g_runtime_gate_active &&
+            ipc_hdr.type != WVM_IPC_TYPE_REGISTER &&
+            runtime_gate_authorize_connection(runtime_connection_id) != 0) {
+            break;
+        }
+
         switch (ipc_hdr.type) {
             case WVM_IPC_TYPE_REGISTER: {
-                if (ipc_hdr.len != sizeof(uint32_t)) {
-                    fprintf(stderr, "[IPC] invalid registration fd=%d len=%u\n",
-                            qemu_fd, (unsigned)ipc_hdr.len);
-                    break;
-                }
+                uint32_t role = 0;
 
-                uint32_t role;
-                memcpy(&role, payload_buf, sizeof(role));
+                if (g_runtime_gate_active) {
+                    if (ipc_hdr.len !=
+                            sizeof(struct wvm_ipc_runtime_registration) ||
+                        runtime_gate_register_qemu(
+                            (const struct wvm_ipc_runtime_registration *)
+                                payload_buf,
+                            &runtime_connection_id) != 0) {
+                        fprintf(stderr,
+                                "[IPC] manifest-bound registration failed "
+                                "fd=%d len=%u\n",
+                                qemu_fd, (unsigned)ipc_hdr.len);
+                        break;
+                    }
+                    role = ((const struct wvm_ipc_runtime_registration *)
+                                payload_buf)->ipc_role;
+                    if (role != WVM_IPC_ROLE_ASYNC_PUSH &&
+                        role != WVM_IPC_ROLE_SYNC) {
+                        fprintf(stderr,
+                                "[IPC] invalid manifest-bound channel role "
+                                "fd=%d role=%u\n",
+                                qemu_fd, (unsigned)role);
+                        break;
+                    }
+                    fprintf(stderr,
+                            "[IPC] fd=%d registered against runtime "
+                            "connection=%" PRIu64 "\n",
+                            qemu_fd, runtime_connection_id);
+                } else {
+                    if (ipc_hdr.len != sizeof(uint32_t)) {
+                        fprintf(stderr,
+                                "[IPC] invalid registration fd=%d len=%u\n",
+                                qemu_fd, (unsigned)ipc_hdr.len);
+                        break;
+                    }
+                    memcpy(&role, payload_buf, sizeof(role));
+                }
                 if (role == WVM_IPC_ROLE_ASYNC_PUSH) {
                     pthread_mutex_lock(&g_client_lock);
                     if (!is_push_client && g_client_count < (int)(sizeof(g_qemu_clients) /
@@ -1009,6 +1502,18 @@ void* client_handler(void *socket_desc) {
     }
     fprintf(stderr, "[IPC] client disconnected fd=%d\n", qemu_fd);
     close(qemu_fd);
+
+    if (g_runtime_gate_active && runtime_connection_id != 0) {
+        char error[256] = {0};
+
+        pthread_mutex_lock(&g_runtime_gate_lock);
+        if (wvm_runtime_gate_revoke(&g_runtime_gate, runtime_connection_id,
+                                    error, sizeof(error)) != 0) {
+            fprintf(stderr, "[RuntimeGate] revoke failed fd=%d: %s\n", qemu_fd,
+                    error[0] ? error : "unknown error");
+        }
+        pthread_mutex_unlock(&g_runtime_gate_lock);
+    }
     
     // 移除客户端并压缩数组，防止 Slot 耗尽
     if (is_push_client) {
@@ -1093,18 +1598,54 @@ int main(int argc, char **argv) {
         g_sync_batch_size = atoi(argv[7]);
     }
     // 可选参数：VM ID (Multi-VM 资源池化)
-    if (argc >= 9) {
-        g_my_vm_id = (uint8_t)atoi(argv[8]);
+    if (argc >= 9 &&
+        parse_legacy_vm_id(argv[8], &g_my_vm_id) != 0) {
+        fprintf(stderr,
+                "[VM-ID] legacy data-plane header supports VM IDs only in "
+                "[0, %u]; V1_U32 dispatch is not implemented here\n",
+                UINT8_MAX);
+        return 1;
+    }
+    if (init_runtime_gate_from_environment(my_phys_id) != 0) {
+        return 1;
+    }
+    if (g_runtime_gate_active &&
+        wvm_logic_bind_route_snapshot(
+            &g_runtime_storage.manifest.required_route_snapshot_key) != 0) {
+        fprintf(stderr, "[Route] admitted manifest route snapshot rejected\n");
+        return 1;
+    }
+    if (bind_kernel_context_from_manifest((uint32_t)my_phys_id) != 0) {
+        return 1;
     }
 
     printf("[*] WaveVM Swarm V30.0 'Wavelet' Node Daemon (PhysID: %d, VM: %u)\n", my_phys_id, (unsigned)g_my_vm_id);
 
     /*
      * Resolve identity before starting backend RX threads.  Physical IDs are
-     * placement keys; packet routing and local-sidecar selection use the
-     * primary DHT vnode.
+     * placement keys; admitted launches derive packet routing and the local
+     * sidecar from their immutable runtime dispatch projection.  The static
+     * resource plan remains available only for ungated legacy startup.
      */
-    {
+    int my_virtual_id;
+    uint32_t my_local_cores;
+    uint64_t required_memory_bytes;
+    uint32_t total_vnodes;
+
+    if (g_runtime_gate_active) {
+        const struct wvm_runtime_dispatch_projection *dispatch =
+            &g_runtime_dispatch_storage.projection;
+
+        my_virtual_id = (int)dispatch->local_primary_vnode;
+        total_vnodes = dispatch->route_vnode_count;
+        if (runtime_dispatch_local_reservation(&my_local_cores,
+                                               &required_memory_bytes) != 0 ||
+            user_backend_init(my_virtual_id, local_port) != 0) {
+            fprintf(stderr,
+                    "[-] Failed to initialize admitted user backend.\n");
+            return 1;
+        }
+    } else {
         char error[256] = {0};
         const struct wvm_resource_node *my_node;
 
@@ -1120,6 +1661,10 @@ int main(int argc, char **argv) {
                     my_phys_id);
             return 1;
         }
+        my_virtual_id = (int)my_node->vnode_start;
+        my_local_cores = my_node->cpu_capacity;
+        required_memory_bytes = my_node->memory_mb * 1024U * 1024U;
+        total_vnodes = g_resource_plan.total_vnodes;
         if (user_backend_init((int)my_node->vnode_start, local_port) != 0) {
             fprintf(stderr, "[-] Failed to init user backend.\n");
             return 1;
@@ -1127,7 +1672,7 @@ int main(int argc, char **argv) {
     }
 
     // 2. Initialize user backend after topology identity has been resolved.
-    if (!g_resource_plan_ready) {
+    if (!g_runtime_gate_active && !g_resource_plan_ready) {
         fprintf(stderr, "[-] Failed to init user backend.\n");
         return 1;
     }
@@ -1139,9 +1684,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     
-    // 4. 加载 Swarm 拓扑
-    // 这会将所有物理 IP 展开为虚拟节点，并注入 Backend 和 Logic Core
-    load_swarm_config(config_file);
+    // 4. Initialize routing only from the active authority for this launch.
+    if (g_runtime_gate_active) {
+        if (apply_runtime_dispatch() != 0) {
+            fprintf(stderr,
+                    "[-] Failed to apply admitted runtime dispatch.\n");
+            return 1;
+        }
+    } else {
+        load_swarm_config(config_file);
+    }
 
     // 5. 启动 V29.5 核心推送引擎的多线程广播线程
     printf("[+] Starting %d Wavelet Broadcast Engines...\n", NUM_BCAST_WORKERS);
@@ -1156,42 +1708,31 @@ int main(int argc, char **argv) {
     }
     printf("[+] All Wavelet Broadcast Engines started.\n");
 
-    // 6. Resolve physical identity and validate the local VM reservation.
-    const struct wvm_resource_node *my_node =
-        g_resource_plan_ready
-            ? wvm_resource_plan_find_node(&g_resource_plan, my_phys_id)
-            : NULL;
-    const struct wvm_resource_vm *my_vm =
-        g_resource_plan_ready
-            ? wvm_resource_plan_get_vm(&g_resource_plan, g_my_vm_id)
-            : NULL;
-    int my_virtual_id = my_node ? (int)my_node->vnode_start : -1;
-    uint32_t my_local_cores = my_node ? my_node->cpu_capacity : 1;
-    uint64_t required_memory_mb = my_node ? my_node->memory_mb : 0;
+    // 6. Validate the local reservation after routing has been initialized.
+    if (!g_runtime_gate_active) {
+        const struct wvm_resource_vm *my_vm =
+            wvm_resource_plan_get_vm(&g_resource_plan, g_my_vm_id);
 
-    if (my_vm) {
-        my_local_cores =
-            wvm_resource_plan_local_vcpus(&g_resource_plan, g_my_vm_id,
-                                           my_phys_id);
-        required_memory_mb =
-            wvm_resource_plan_local_memory_mb(&g_resource_plan, g_my_vm_id,
-                                              my_phys_id);
+        if (my_vm) {
+            my_local_cores =
+                wvm_resource_plan_local_vcpus(&g_resource_plan, g_my_vm_id,
+                                               my_phys_id);
+            required_memory_bytes =
+                wvm_resource_plan_local_memory_mb(&g_resource_plan, g_my_vm_id,
+                                                  my_phys_id) *
+                1024U * 1024U;
+        }
     }
-
-    if (my_virtual_id == -1) {
-        fprintf(stderr, "[Fatal] My Physical ID %d not found in config file!\n", my_phys_id);
-        return 1;
-    }
-    if (g_shm_size < required_memory_mb * 1024U * 1024U) {
+    if ((uint64_t)g_shm_size < required_memory_bytes) {
         fprintf(stderr, "\n[FATAL] Resource Mismatch!\n");
-        fprintf(stderr, "  Config VM/node reservation requires: %llu MB\n",
-                (unsigned long long)required_memory_mb);
+        fprintf(stderr, "  Local reservation requires:          %llu bytes\n",
+                (unsigned long long)required_memory_bytes);
         fprintf(stderr, "  Launch arg provided:                 %lu MB\n",
                 ram_mb);
         return 1;
     }
-    printf("[Check] Resource verified: Alloc %lu MB >= Reservation %llu MB.\n",
-           ram_mb, (unsigned long long)required_memory_mb);
+    printf("[Check] Resource verified: Alloc %lu MB >= Reservation %llu bytes.\n",
+           ram_mb, (unsigned long long)required_memory_bytes);
 
     // 7. 将真实的虚拟 ID 注入 Logic Core
     // Logic Core 将根据此 ID 判断是否拥有某个 GPA 的管理权 (Directory Owner)
@@ -1199,10 +1740,16 @@ int main(int argc, char **argv) {
     printf("[Init] Identity Mapped: PhysID %d -> VirtualID %d (Primary)\n", my_phys_id, my_virtual_id);
     // Mode A owns a separate Logic Core instance inside wavevm.ko.
     inject_vm_id(g_my_vm_id);
-    inject_mem_global(0, g_resource_plan.total_vnodes);
+    inject_mem_global(0, total_vnodes);
     inject_mem_global(1, (uint32_t)my_virtual_id);
     inject_cpu_route_table();
-    inject_memory_route_table();
+    if (!g_runtime_gate_active || g_runtime_dispatch_kernel_memory_cache) {
+        inject_memory_route_table();
+    } else if (g_dev_fd >= 0) {
+        fprintf(stderr,
+                "[RuntimeDispatch] skipped legacy Mode A memory cache for "
+                "non-1GiB manifest ranges\n");
+    }
     {
         char split_buf[32];
         snprintf(split_buf, sizeof(split_buf), "%u", my_local_cores);
@@ -1283,17 +1830,20 @@ int main(int argc, char **argv) {
     // 10. Backend/Logic Core 已在前面初始化并注入拓扑。
     // 此处严禁重复初始化，否则会重置 CPU 路由表为 AUTO_ROUTE。
 
-    // 11. [自治扩展] 加载种子节点，不要求全量配置
-    load_initial_seeds(config_file);
+    /*
+     * An admitted runtime already has an immutable membership and route
+     * snapshot.  Legacy seed gossip must not mutate or replace that authority.
+     */
+    if (!g_runtime_gate_active) {
+        pthread_t monitor_tid;
 
-    // 12. 启动自治监控引擎 (Part 3 中定义的线程)
-    pthread_t monitor_tid;
-    pthread_create(&monitor_tid, NULL, autonomous_monitor_thread, NULL);
-    pthread_detach(monitor_tid);
-
-    // 13. [Bootstrap] 视图主动拉取逻辑暂时禁用（需跨模块可见 peer 结构体）。
-
-    printf("[Autonomous] Node started in SHADOW mode. Auto-scaling into cluster...\n");
+        load_initial_seeds(config_file);
+        pthread_create(&monitor_tid, NULL, autonomous_monitor_thread, NULL);
+        pthread_detach(monitor_tid);
+        printf("[Autonomous] Node started in SHADOW mode. Auto-scaling into cluster...\n");
+    } else {
+        printf("[RuntimeDispatch] admitted route snapshot active; legacy gossip disabled.\n");
+    }
 
     // 14. 主循环：接受 QEMU 连接
     while (1) {

@@ -120,8 +120,6 @@ int g_total_nodes = 1;
 int g_my_node_id = 0;
 int g_ctrl_port = 0; // 这里的定义同时供应给 wavevm_node_master 和 wavevm.ko
 uint32_t g_curr_epoch = 0;
-extern uint8_t g_my_vm_id; // Multi-VM: 定义在 main_wrapper.c
-
 #ifndef __KERNEL__
 extern int broadcast_push_to_qemu(uint16_t msg_type, void *payload, int len);
 extern int broadcast_push_to_qemu_fenced(uint16_t msg_type, void *payload,
@@ -339,9 +337,101 @@ static void register_page_subscriber(page_meta_t *page, uint32_t node_id) {
 #endif
 }
 
-static uint32_t g_cpu_route_table[WVM_CPU_ROUTE_TABLE_SIZE];
-static uint32_t g_memory_route_table[WVM_MEMORY_ROUTE_TABLE_SIZE];
-static uint8_t g_memory_route_valid[WVM_MEMORY_ROUTE_TABLE_SIZE];
+/*
+ * Placement and route identity are one VM-scoped derived cache.  The
+ * accelerator may still expose only one active context per module instance,
+ * but the semantic state is no longer a collection of unqualified globals.
+ * A later multi-context kernel implementation can register additional
+ * instances without changing the lookup contract below.
+ */
+struct wvm_logic_route_context {
+    uint32_t vm_id;
+    uint64_t vm_incarnation;
+    uint32_t cpu_route_table[WVM_CPU_ROUTE_TABLE_SIZE];
+    uint32_t memory_route_table[WVM_MEMORY_ROUTE_TABLE_SIZE];
+    uint8_t memory_route_valid[WVM_MEMORY_ROUTE_TABLE_SIZE];
+    struct {
+        uint64_t gpa_start;
+        uint64_t bytes;
+        uint32_t node_id;
+    } memory_range_routes[WVM_MEMORY_ROUTE_TABLE_SIZE];
+    size_t memory_range_route_count;
+    int memory_range_routes_active;
+    struct wvm_route_snapshot_key route_snapshot_key;
+    int route_snapshot_bound;
+};
+
+static struct wvm_logic_route_context g_logic_route_context;
+
+static struct wvm_logic_route_context *logic_route_context(void)
+{
+    return &g_logic_route_context;
+}
+
+int wvm_logic_bind_route_snapshot(
+    const struct wvm_route_snapshot_key *snapshot_key)
+{
+    struct wvm_logic_route_context *context = logic_route_context();
+    char error[128] = {0};
+    int key_valid;
+
+    /*
+     * The kernel module deliberately does not link the user-space canonical
+     * manifest library.  Keep its admission check structural here; user
+     * space performs the full canonical validation before calling this API.
+     */
+#ifdef __KERNEL__
+    key_valid = snapshot_key && snapshot_key->scope_key.vm_id != 0 &&
+                snapshot_key->scope_key.vm_incarnation != 0 &&
+                snapshot_key->scope_key.route_scope_id != 0 &&
+                snapshot_key->topology_revision != 0 &&
+                snapshot_key->route_generation != 0;
+#else
+    key_valid = snapshot_key &&
+                wvm_route_snapshot_key_validate(snapshot_key, error,
+                                                sizeof(error)) == 0;
+#endif
+    if (!key_valid ||
+        (WVM_CURRENT_VM_ID() != 0 &&
+         snapshot_key->scope_key.vm_id != WVM_CURRENT_VM_ID())) {
+        WVM_LOG_ERR("[Route] rejected route snapshot binding: %s\n",
+                    error[0] ? error : "VM namespace mismatch");
+        return -1;
+    }
+    context->vm_id = snapshot_key->scope_key.vm_id;
+    context->vm_incarnation = snapshot_key->scope_key.vm_incarnation;
+    context->route_snapshot_key = *snapshot_key;
+    context->route_snapshot_bound = 1;
+    return 0;
+}
+
+int wvm_logic_route_snapshot_valid(void)
+{
+    return logic_route_context()->route_snapshot_bound;
+}
+
+int wvm_logic_get_route_snapshot_key(
+    struct wvm_route_snapshot_key *snapshot_key)
+{
+    struct wvm_logic_route_context *context = logic_route_context();
+
+    if (!snapshot_key || !context->route_snapshot_bound) {
+        return -1;
+    }
+    *snapshot_key = context->route_snapshot_key;
+    return 0;
+}
+
+void wvm_logic_unbind_route_snapshot(void)
+{
+    struct wvm_logic_route_context *context = logic_route_context();
+
+    memset(&context->route_snapshot_key, 0,
+           sizeof(context->route_snapshot_key));
+    context->vm_id = 0;
+    context->vm_incarnation = 0;
+    context->route_snapshot_bound = 0;
+}
 
 /* 
  * [物理意图] 建立 vCPU 索引与物理计算节点 ID 之间的静态/动态映射表。
@@ -349,56 +439,104 @@ static uint8_t g_memory_route_valid[WVM_MEMORY_ROUTE_TABLE_SIZE];
  * [后果] 若此表配置错误，vCPU 将被路由到不存在的节点，导致超级虚拟机的指令流瞬间断裂。
  */
 void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id) {
+    struct wvm_logic_route_context *context = logic_route_context();
+
     // 这里的边界检查现在是安全的，与全局配置一致
     if (vcpu_index >= 0 && vcpu_index < WVM_CPU_ROUTE_TABLE_SIZE) {
-        g_cpu_route_table[vcpu_index] = slave_id;
+        context->cpu_route_table[vcpu_index] = slave_id;
     }
 }
 
 void wvm_clear_cpu_mappings(void) {
+    struct wvm_logic_route_context *context = logic_route_context();
+
     for (int i = 0; i < WVM_CPU_ROUTE_TABLE_SIZE; i++) {
-        g_cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
+        context->cpu_route_table[i] = WVM_NODE_AUTO_ROUTE;
     }
 }
 
 uint32_t wvm_get_cpu_mapping_raw(int vcpu_index) {
+    struct wvm_logic_route_context *context = logic_route_context();
+
     if (vcpu_index >= 0 && vcpu_index < WVM_CPU_ROUTE_TABLE_SIZE) {
-        return g_cpu_route_table[vcpu_index];
+        return context->cpu_route_table[vcpu_index];
     }
     return WVM_NODE_AUTO_ROUTE;
 }
 
 uint32_t wvm_get_compute_slave_id(int vcpu_index) {
+    struct wvm_logic_route_context *context = logic_route_context();
+
+    if (WVM_CURRENT_VM_ID() != 0 && !context->route_snapshot_bound) {
+        return WVM_NODE_AUTO_ROUTE;
+    }
     if (vcpu_index >= 0 && vcpu_index < WVM_CPU_ROUTE_TABLE_SIZE) {
-        uint32_t raw = g_cpu_route_table[vcpu_index];
+        uint32_t raw = context->cpu_route_table[vcpu_index];
         // [Fix #3] AUTO_ROUTE 是 sentinel，不能做 ENCODE_ID 操作
         if (raw == WVM_NODE_AUTO_ROUTE) return raw;
         // [Multi-VM] 返回 composite ID
-        return WVM_ENCODE_ID(g_my_vm_id, raw);
+        return WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), raw);
     }
     return WVM_NODE_AUTO_ROUTE;
 }
 
 const uint32_t* wvm_get_cpu_route_table(void) {
-    return g_cpu_route_table;
+    return logic_route_context()->cpu_route_table;
 }
 
 void wvm_set_memory_mapping(int chunk_index, uint32_t node_id) {
+    struct wvm_logic_route_context *context = logic_route_context();
+
     if (chunk_index >= 0 && chunk_index < WVM_MEMORY_ROUTE_TABLE_SIZE) {
-        g_memory_route_table[chunk_index] = node_id;
-        g_memory_route_valid[chunk_index] = 1;
+        context->memory_route_table[chunk_index] = node_id;
+        context->memory_route_valid[chunk_index] = 1;
     }
+}
+
+int wvm_set_memory_range_mapping(uint64_t gpa_start, uint64_t bytes,
+                                 uint32_t node_id)
+{
+    struct wvm_logic_route_context *context = logic_route_context();
+    size_t count = context->memory_range_route_count;
+
+    if (bytes == 0 || gpa_start > UINT64_MAX - bytes ||
+        node_id == WVM_NODE_AUTO_ROUTE ||
+        count >= WVM_MEMORY_ROUTE_TABLE_SIZE) {
+        return -1;
+    }
+    if (count != 0) {
+        uint64_t previous_end =
+            context->memory_range_routes[count - 1].gpa_start +
+            context->memory_range_routes[count - 1].bytes;
+
+        if (previous_end > gpa_start) {
+            return -1;
+        }
+    }
+    context->memory_range_routes[count].gpa_start = gpa_start;
+    context->memory_range_routes[count].bytes = bytes;
+    context->memory_range_routes[count].node_id = node_id;
+    context->memory_range_route_count = count + 1;
+    context->memory_range_routes_active = 1;
+    return 0;
 }
 
 void wvm_clear_memory_mappings(void) {
-    memset(g_memory_route_valid, 0, sizeof(g_memory_route_valid));
+    struct wvm_logic_route_context *context = logic_route_context();
+
+    memset(context->memory_route_valid, 0,
+           sizeof(context->memory_route_valid));
     for (int i = 0; i < WVM_MEMORY_ROUTE_TABLE_SIZE; i++) {
-        g_memory_route_table[i] = WVM_NODE_AUTO_ROUTE;
+        context->memory_route_table[i] = WVM_NODE_AUTO_ROUTE;
     }
+    memset(context->memory_range_routes, 0,
+           sizeof(context->memory_range_routes));
+    context->memory_range_route_count = 0;
+    context->memory_range_routes_active = 0;
 }
 
 const uint32_t* wvm_get_memory_route_table(void) {
-    return g_memory_route_table;
+    return logic_route_context()->memory_route_table;
 }
 
 /* 
@@ -719,7 +857,7 @@ uint32_t wvm_get_storage_node_id(uint64_t lba) {
     target = g_hash_ring_cache[slot];
     pthread_rwlock_unlock(&g_ring_lock);
     // [Multi-VM] 返回 composite ID
-    return WVM_ENCODE_ID(g_my_vm_id, target);
+    return WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), target);
 }
 
 /* --- 逻辑入口：处理接收到的心跳与视图更新 --- */
@@ -889,7 +1027,7 @@ void* autonomous_monitor_thread(void* arg) {
                     uint32_t ridx = 0;
                     g_ops->get_random(&ridx);
                     peer_entry_t *p = &g_peer_view[ridx % g_peer_count];
-                    add_gossip_to_aggregator(WVM_ENCODE_ID(g_my_vm_id, p->node_id), g_my_node_state, g_curr_epoch);
+                    add_gossip_to_aggregator(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), p->node_id), g_my_node_state, g_curr_epoch);
                 }
             }
             pthread_rwlock_unlock(&g_view_lock);
@@ -911,7 +1049,7 @@ static void request_view_from_neighbor(uint32_t peer_id) {
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = htonl(WVM_MAGIC);
     hdr.msg_type = htons(MSG_VIEW_PULL);
-    hdr.slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr.slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
     hdr.epoch = htonl(g_curr_epoch);
     hdr.payload_len = 0;
 
@@ -939,7 +1077,7 @@ static void handle_view_pull(struct wvm_header *rx_hdr, uint32_t src_id) {
     // 基础包头填充
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_VIEW_ACK);
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
     hdr->payload_len = htons(payload_len);
     hdr->epoch = htonl(g_curr_epoch);
     hdr->node_state = g_my_node_state;
@@ -956,7 +1094,7 @@ static void handle_view_pull(struct wvm_header *rx_hdr, uint32_t src_id) {
     pthread_rwlock_unlock(&g_view_lock);
 
     // [Fix #2] src_id 是裸 node_id（内部逻辑），发包时需要编码为 composite ID
-    g_ops->send_packet(buf, pkt_len, WVM_ENCODE_ID(g_my_vm_id, src_id));
+    g_ops->send_packet(buf, pkt_len, WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), src_id));
     g_ops->free_packet(buf);
 }
 
@@ -1030,19 +1168,50 @@ void wvm_set_my_node_id(int id) {
 
 // DHT 路由
 uint32_t wvm_get_directory_node_id(uint64_t gpa) {
+    struct wvm_logic_route_context *context = logic_route_context();
     uint64_t chunk = gpa >> WVM_ROUTING_SHIFT;
     uint32_t target;
 
+    if (WVM_CURRENT_VM_ID() != 0 && !context->route_snapshot_bound) {
+        return WVM_NODE_AUTO_ROUTE;
+    }
+    if (context->memory_range_routes_active) {
+        size_t left = 0;
+        size_t right = context->memory_range_route_count;
+
+        while (left < right) {
+            size_t middle = left + (right - left) / 2U;
+            const uint64_t start =
+                context->memory_range_routes[middle].gpa_start;
+            const uint64_t bytes =
+                context->memory_range_routes[middle].bytes;
+
+            if (gpa < start) {
+                right = middle;
+            } else if (gpa - start < bytes) {
+                return WVM_ENCODE_ID(
+                    WVM_CURRENT_VM_ID(),
+                    context->memory_range_routes[middle].node_id);
+            } else {
+                left = middle + 1U;
+            }
+        }
+        /*
+         * An admitted range projection is complete for the guest.  Do not
+         * silently fall back to topology/DHT inference outside that contract.
+         */
+        return WVM_NODE_AUTO_ROUTE;
+    }
     if (chunk < WVM_MEMORY_ROUTE_TABLE_SIZE &&
-        g_memory_route_valid[chunk]) {
-        target = g_memory_route_table[chunk];
+        context->memory_route_valid[chunk]) {
+        target = context->memory_route_table[chunk];
         if (target != WVM_NODE_AUTO_ROUTE) {
-            return WVM_ENCODE_ID(g_my_vm_id, target);
+            return WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), target);
         }
     }
     // 在百万节点规模下，即使局部视图不一致，路由结果也能大概率收敛
     // [Multi-VM] 返回 composite ID (vm_id | node_id) 用于网络寻址
-    return WVM_ENCODE_ID(g_my_vm_id, get_owner_node_id(gpa));
+    return WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), get_owner_node_id(gpa));
 }
 
 // 本地缺页快速路径
@@ -1129,7 +1298,7 @@ void* broadcast_worker_thread(void* arg) {
                 hdr->magic = htonl(WVM_MAGIC);
                 hdr->msg_type = htons(task_copy.msg_type);
                 hdr->payload_len = htons(task_copy.len);
-                hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
                 hdr->target_id = htonl(task_copy.target_id);
                 hdr->req_id = 0;
                 // 全页推送走慢车道，Diff 走快车道
@@ -1202,7 +1371,7 @@ static void enqueue_broadcast_to_target(uint32_t target_id, uint16_t msg_type,
     // 4. 将任务放入目标分片队列
     broadcast_task_t *t = &target_shard->queue[current_tail & BCAST_Q_MASK];
     t->msg_type = msg_type;
-    t->target_id = WVM_ENCODE_ID(g_my_vm_id, target_id); // [Multi-VM] composite ID for network
+    t->target_id = WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), target_id); // [Multi-VM] composite ID for network
     t->len = len;
     t->data_ptr = data_copy;
     t->flags = flags;
@@ -1293,7 +1462,7 @@ static void force_sync_client(uint64_t gpa, page_meta_t* page, uint32_t client_i
         hdr->magic = htonl(WVM_MAGIC);
         hdr->msg_type = htons(MSG_FORCE_SYNC);
         hdr->payload_len = htons(pl_size);
-        hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+        hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
         hdr->req_id = 0;
         hdr->qos_level = 1;
 
@@ -1302,7 +1471,7 @@ static void force_sync_client(uint64_t gpa, page_meta_t* page, uint32_t client_i
         push->version = WVM_HTONLL(safe_version);
         memcpy(push->data, safe_data, 4096);
 
-        g_ops->send_packet(buffer, pkt_len, WVM_ENCODE_ID(g_my_vm_id, client_id));
+        g_ops->send_packet(buffer, pkt_len, WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), client_id));
         g_ops->free_packet(buffer);
         return;
     }
@@ -1331,7 +1500,7 @@ static void force_sync_client(uint64_t gpa, page_meta_t* page, uint32_t client_i
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_FORCE_SYNC);
     hdr->payload_len = htons(pl_size);
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
     hdr->req_id = 0;
     hdr->qos_level = 1; // High priority correction
 
@@ -1342,7 +1511,7 @@ static void force_sync_client(uint64_t gpa, page_meta_t* page, uint32_t client_i
     memcpy(push->data, page->base_page_data, 4096);
 
     // [Fix #2] client_id 是裸 node_id，发包时需要编码为 composite ID
-    g_ops->send_packet(buffer, pkt_len, WVM_ENCODE_ID(g_my_vm_id, client_id));
+    g_ops->send_packet(buffer, pkt_len, WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), client_id));
     g_ops->free_packet(buffer);
 }
 
@@ -1394,7 +1563,7 @@ int wvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer, uint64_t *versi
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_MEM_READ);
     hdr->payload_len = htons(8);
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
     hdr->target_id = htonl(dir_node);
     hdr->req_id = WVM_HTONLL(rid);
     hdr->qos_level = 1; // 缺页必须走快车道
@@ -1532,7 +1701,7 @@ static void wvm_prophet_abi_scanner(wvm_kvm_context_t *ctx) {
         rpc_hdr->magic = htonl(WVM_MAGIC);
         rpc_hdr->msg_type = htons(MSG_RPC_BATCH_MEMSET);
         rpc_hdr->payload_len = htons((uint16_t)pl_size);
-        rpc_hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+        rpc_hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
 
         wvm_logic_broadcast_rpc(buf, sizeof(buf), MSG_RPC_BATCH_MEMSET);
 
@@ -1591,7 +1760,7 @@ int wvm_rpc_call(uint16_t msg_type, void *payload, int len, uint32_t target_id, 
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id)); // Source ID
+    hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id)); // Source ID
     // Preserve logical destination so fractal gateways can route correctly.
     hdr->target_id = htonl(target_id);
     hdr->req_id = WVM_HTONLL(rid);
@@ -1744,7 +1913,7 @@ void wvm_declare_interest_in_neighborhood(uint64_t gpa) {
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(MSG_DECLARE_INTEREST);
     hdr->payload_len = htons(sizeof(uint64_t));
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id)); // 告诉对方我是谁
+    hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id)); // 告诉对方我是谁
     hdr->req_id = 0;                     // 异步消息，不需要 ACK
     hdr->qos_level = 1;                  // 订阅是元数据操作，走 Fast Lane
 
@@ -1797,7 +1966,7 @@ static void send_commit_ack_if_needed(struct wvm_header *req_hdr,
     ack->magic = htonl(WVM_MAGIC);
     ack->msg_type = htons(MSG_MEM_ACK);
     ack->payload_len = htons(1);
-    ack->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    ack->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
     ack->target_id = req_hdr->slave_id;
     ack->req_id = req_hdr->req_id;
     ack->qos_level = 1;
@@ -1859,7 +2028,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
     uint8_t  src_state = hdr->node_state;
 
     // [Multi-VM] 丢弃其他 VM 的包
-    if (src_vm_id != g_my_vm_id) return;
+    if (src_vm_id != WVM_CURRENT_VM_ID()) return;
 
     if (type == MSG_HEARTBEAT && g_ops && g_ops->log) {
         g_ops->log("[HB LOGIC] src=%u vm=%u state=%u epoch=%u", src_id, src_vm_id, src_state, src_epoch);
@@ -1868,7 +2037,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
     // 1. [核心安全检查] 任何消息都必须透传 Epoch 和 State
     // 如果收到的消息 Epoch 大于本地太远，说明本地视图已严重落后，强制触发视图拉取
     if (src_epoch > g_curr_epoch + 1) {
-        request_view_from_neighbor(WVM_ENCODE_ID(g_my_vm_id, src_id));
+        request_view_from_neighbor(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), src_id));
     }
 
     uint16_t r_ctrl_port = 0;
@@ -1915,7 +2084,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
             ack->magic = htonl(WVM_MAGIC);
             ack->msg_type = htons(MSG_MEM_ACK);
             ack->payload_len = htons(pl_size);
-            ack->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+            ack->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
             ack->target_id = hdr->slave_id;
             ack->req_id = hdr->req_id; // 必须回传请求ID
             ack->qos_level = 0; // 大包走慢车道
@@ -2267,7 +2436,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                     ack_hdr->magic = htonl(WVM_MAGIC);
                     ack_hdr->msg_type = htons(MSG_MEM_ACK);
                     ack_hdr->payload_len = 0;
-                    ack_hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                    ack_hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
                     ack_hdr->target_id = hdr->slave_id;
                     ack_hdr->req_id = hdr->req_id; // 关键：回传请求 ID
                     ack_hdr->qos_level = 1;        // 控制信令走快车道
@@ -2331,7 +2500,7 @@ void wvm_logic_process_packet(struct wvm_header *hdr, void *payload, uint32_t so
                 ack_hdr->magic = htonl(WVM_MAGIC);
                 ack_hdr->msg_type = htons(MSG_MEM_ACK); // 回复类型
                 ack_hdr->payload_len = 0;
-                ack_hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                ack_hdr->slave_id = htonl(WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), g_my_node_id));
                 ack_hdr->target_id = hdr->slave_id;
                 ack_hdr->req_id = hdr->req_id; // 关键：原样回传 SYNC_MAGIC
                 ack_hdr->qos_level = 1;        // 必须走快车道，否则 AIMD 会误判延迟
@@ -2408,7 +2577,7 @@ void wvm_logic_broadcast_rpc(void *full_pkt_data, int full_pkt_len, uint16_t msg
             memcpy(data_copy, payload, payload_len);
             broadcast_task_t *t = &shard->queue[shard->tail & BCAST_Q_MASK];
             t->msg_type = msg_type;
-            t->target_id = WVM_ENCODE_ID(g_my_vm_id, target_id);
+            t->target_id = WVM_ENCODE_ID(WVM_CURRENT_VM_ID(), target_id);
             t->len = payload_len;
             t->data_ptr = data_copy;
             

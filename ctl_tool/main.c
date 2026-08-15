@@ -214,6 +214,12 @@ int main(int argc, char **argv)
 
     if (vm) {
         build_vm_tables(vm, cpu_table, memory_table);
+        if (!wvm_resource_plan_find_node(
+                plan, wvm_resource_plan_host_node(plan, (uint8_t)vm_id))) {
+            fprintf(stderr, "wvm_ctl: VM %d has no resolved host node\n", vm_id);
+            free(plan);
+            return 1;
+        }
     } else {
         build_legacy_cpu_table(plan, cpu_table);
         for (uint32_t i = 0; i < WVM_MEMORY_ROUTE_TABLE_SIZE; i++) {

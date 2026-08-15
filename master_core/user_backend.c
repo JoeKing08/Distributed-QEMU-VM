@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/un.h>
 #include <stdarg.h>
 #include <sys/time.h>
 #include <sys/sysinfo.h>
@@ -34,6 +35,9 @@
 #include "unified_driver.h"
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
+#include "../common_include/wavevm_executor_abi.h"
+
+extern int wvm_logic_route_snapshot_valid(void);
 
 // --- 配置常量 ---
 #define MAX_INFLIGHT_REQS 65536
@@ -163,6 +167,193 @@ static int g_pool_top = -1;
 static int u_send_packet(void *data, int len, uint32_t target_id);
 static void u_log(const char *fmt, ...);
 static pthread_spinlock_t g_pool_lock;
+
+static int parse_env_u64(const char *name, uint64_t *value)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int parse_hex_nibble(char character)
+{
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return -1;
+}
+
+static int parse_env_hex(const char *name, uint8_t *bytes, size_t byte_count)
+{
+    const char *text = getenv(name);
+    size_t i;
+
+    if (!text || !bytes || strlen(text) != byte_count * 2U) {
+        return -1;
+    }
+    for (i = 0; i < byte_count; i++) {
+        int high = parse_hex_nibble(text[i * 2U]);
+        int low = parse_hex_nibble(text[i * 2U + 1U]);
+
+        if (high < 0 || low < 0) {
+            return -1;
+        }
+        bytes[i] = (uint8_t)((high << 4) | low);
+    }
+    return 0;
+}
+
+static void write_be64_local(uint8_t *bytes, uint64_t value)
+{
+    size_t i;
+
+    for (i = 0; i < 8; i++) {
+        bytes[7U - i] = (uint8_t)(value >> (i * 8U));
+    }
+}
+
+/*
+ * Transitional local executor path.  It carries the existing semantic
+ * packet through a manifest-bound ABI bridge; the executor response returns
+ * through the normal RX socket, so request correlation and QoS stay in one
+ * place.  A failed bridge is not retried through the gateway because that
+ * could execute one vCPU interval twice.
+ */
+static int try_local_executor_bridge(void *data, int len, uint32_t target_id)
+{
+    const char *socket_path = getenv("WVM_LOCAL_EXECUTOR_SOCKET");
+    const char *gate_active = getenv("WVM_RUNTIME_GATE_ACTIVE");
+    struct wvm_header *header;
+    struct wvm_executor_abi_frame frame;
+    struct wvm_executor_abi_frame result;
+    struct sockaddr_un address;
+    uint8_t *encoded;
+    uint8_t result_bytes[WVM_EXECUTOR_ABI_HEADER_BYTES];
+    uint64_t runtime_id;
+    uint64_t manifest_generation;
+    uint64_t route_generation;
+    uint64_t route_scope_id;
+    uint64_t topology_revision;
+    uint64_t request_id;
+    size_t encoded_bytes;
+    ssize_t received;
+    int fd;
+    char error[256] = {0};
+
+    if (!socket_path || !gate_active || strcmp(gate_active, "0") == 0 ||
+        !data || len < (int)sizeof(struct wvm_header) ||
+        !WVM_IS_VALID_TARGET(target_id) ||
+        WVM_GET_NODEID(target_id) != (uint32_t)g_my_node_id) {
+        return 0;
+    }
+    header = (struct wvm_header *)data;
+    if (ntohs(header->msg_type) != MSG_VCPU_RUN) {
+        return 0;
+    }
+    if (parse_env_u64("WVM_RUNTIME_LOCAL_INSTANCE_ID", &runtime_id) != 0 ||
+        parse_env_u64("WVM_MANIFEST_GENERATION", &manifest_generation) != 0 ||
+        parse_env_u64("WVM_ROUTE_SCOPE_ID", &route_scope_id) != 0 ||
+        parse_env_u64("WVM_TOPOLOGY_REVISION", &topology_revision) != 0 ||
+        parse_env_u64("WVM_ROUTE_GENERATION", &route_generation) != 0) {
+        return -EPROTO;
+    }
+    request_id = WVM_NTOHLL(header->req_id);
+    if (request_id == 0) {
+        return -EPROTO;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.identity.vm_id = g_my_vm_id;
+    frame.identity.vm_incarnation = 0;
+    if (parse_env_u64("WVM_VM_INCARNATION",
+                      &frame.identity.vm_incarnation) != 0) {
+        return -EPROTO;
+    }
+    frame.identity.manifest_generation = manifest_generation;
+    frame.identity.local_runtime_instance_id = runtime_id;
+    frame.identity.route_snapshot_key.scope_key.vm_id = g_my_vm_id;
+    frame.identity.route_snapshot_key.scope_key.vm_incarnation =
+        frame.identity.vm_incarnation;
+    frame.identity.route_snapshot_key.scope_key.route_scope_id = route_scope_id;
+    frame.identity.route_snapshot_key.topology_revision = topology_revision;
+    frame.identity.route_snapshot_key.route_generation = route_generation;
+    if (parse_env_hex("WVM_CANDIDATE_MANIFEST_DIGEST",
+                      frame.identity.candidate_manifest_digest,
+                      sizeof(frame.identity.candidate_manifest_digest)) != 0 ||
+        parse_env_hex("WVM_ROUTE_SNAPSHOT_DIGEST",
+                      frame.identity.route_snapshot_key.snapshot_digest,
+                      sizeof(frame.identity.route_snapshot_key.snapshot_digest)) !=
+            0 ||
+        parse_env_hex("WVM_ACTIVATION_FENCE", frame.identity.activation_fence,
+                      sizeof(frame.identity.activation_fence)) != 0) {
+        return -EPROTO;
+    }
+    write_be64_local(frame.identity.operation_id, runtime_id);
+    write_be64_local(frame.identity.operation_id + 8, request_id);
+    frame.message_type = WVM_EXECUTOR_ABI_CPU_RUN;
+    frame.payload = data;
+    frame.payload_bytes = (size_t)len;
+
+    encoded = malloc(WVM_EXECUTOR_ABI_HEADER_BYTES + (size_t)len);
+    if (!encoded ||
+        wvm_executor_abi_encode(&frame, encoded,
+                                WVM_EXECUTOR_ABI_HEADER_BYTES + (size_t)len,
+                                &encoded_bytes, error, sizeof(error)) != 0) {
+        free(encoded);
+        return -ENOMEM;
+    }
+    fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (fd < 0) {
+        free(encoded);
+        return -errno;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    if (strlen(socket_path) >= sizeof(address.sun_path)) {
+        close(fd);
+        free(encoded);
+        return -ENAMETOOLONG;
+    }
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
+    if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        send(fd, encoded, encoded_bytes, MSG_NOSIGNAL) !=
+            (ssize_t)encoded_bytes) {
+        int result_code = -errno;
+        close(fd);
+        free(encoded);
+        return result_code;
+    }
+    free(encoded);
+    received = recv(fd, result_bytes, sizeof(result_bytes), 0);
+    close(fd);
+    if (received <= 0 ||
+        wvm_executor_abi_decode(result_bytes, (size_t)received, &result,
+                                error, sizeof(error)) != 0 ||
+        wvm_executor_abi_validate_result(&frame, &result, error,
+                                         sizeof(error)) != 0 ||
+        result.message_type != WVM_EXECUTOR_ABI_RESULT ||
+        result.status != WVM_EXECUTOR_ABI_SUCCESS) {
+        return -EIO;
+    }
+    return 1;
+}
 
 static uint32_t local_slave_req_idx(uint64_t req_id) {
     return (uint32_t)((req_id >> 12) % LOCAL_SLAVE_REQS);
@@ -853,6 +1044,29 @@ static void* tx_worker_thread(void *arg) {
 // --- 驱动接口实现：发送 ---
 static int u_send_packet(void *data, int len, uint32_t target_id) {
     if (g_tx_socket < 0) return -1;
+    if (getenv("WVM_RUNTIME_GATE_ACTIVE") &&
+        g_my_vm_id != 0 &&
+        (!wvm_logic_route_snapshot_valid() ||
+         (WVM_IS_VALID_TARGET(target_id) &&
+          WVM_GET_VMID(target_id) != g_my_vm_id))) {
+        fprintf(stderr,
+                "[Route] refusing packet without matching admitted snapshot "
+                "target=%u vm=%u\n",
+                target_id, (unsigned)g_my_vm_id);
+        return -EPROTO;
+    }
+    {
+        int bridge_result = try_local_executor_bridge(data, len, target_id);
+
+        if (bridge_result != 0) {
+            /*
+             * 1 means the request was handed to the local executor bridge.
+             * A negative result is a real delivery failure and must not fall
+             * through to the gateway as a second executable handoff.
+             */
+            return bridge_result > 0 ? 0 : bridge_result;
+        }
+    }
     
     struct wvm_header *hdr = (struct wvm_header *)data;
     tx_queue_t *q;

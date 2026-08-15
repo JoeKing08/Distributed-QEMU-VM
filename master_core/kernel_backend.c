@@ -52,6 +52,7 @@
 #include <linux/rcupdate.h>
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
+#include <linux/mutex.h>
 
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_protocol.h"
@@ -61,42 +62,89 @@
 #define DRIVER_NAME "wavevm"
 #define TX_RING_SIZE 2048
 #define TX_SLOT_SIZE 65535
+#define MAX_WVM_SLOTS 32
+
+struct wvm_mem_slot {
+    uint64_t start_gpa;
+    uint64_t size;
+    uint64_t host_offset;
+    bool active;
+};
 
 // [Fix] Multi-VM: 引用全局 vm_id，用于 composite ID 编码
 // In kernel module context, define it here (main_wrapper.c is userspace-only)
 uint8_t g_my_vm_id = 0;
 EXPORT_SYMBOL(g_my_vm_id);
 
-// 定义并初始化 mapping 锁
-static struct rw_semaphore g_mapping_sem; 
+static int module_service_port = 9000;
+module_param(module_service_port, int, 0644);
+static int module_local_slave_port = 9001;
+module_param(module_local_slave_port, int, 0644);
 
-static int service_port = 9000;
-module_param(service_port, int, 0644);
-static int local_slave_port = 9001; 
-module_param(local_slave_port, int, 0644);
-
-static struct socket *g_socket = NULL;
-static struct sockaddr_in gateway_table[WVM_MAX_GATEWAYS]; 
 static struct kmem_cache *wvm_pkt_cache = NULL;
+
+/*
+ * Transitional context boundary.
+ *
+ * The data-plane state below is still being migrated away from module
+ * globals.  Until that migration is complete, the registry deliberately
+ * admits only one manifest identity per module instance.  This prevents a
+ * second VM from silently overwriting the first VM's kernel state.
+ */
+struct wvm_kernel_context_identity {
+    uint32_t vm_id;
+    uint32_t physical_node_id;
+    uint64_t vm_incarnation;
+    uint64_t manifest_generation;
+    uint8_t candidate_manifest_digest[WVM_KERNEL_DIGEST_BYTES];
+    uint8_t capability_profile_digest[WVM_KERNEL_DIGEST_BYTES];
+    uint8_t activation_fence[WVM_KERNEL_FENCE_BYTES];
+    struct wvm_ioctl_route_snapshot_key route_snapshot_key;
+};
+
+struct id_pool_t;
+struct req_ctx_t;
+struct wvm_kernel_transport;
+
+struct wvm_kernel_context {
+    struct wvm_kernel_context_identity identity;
+    int active;
+    atomic_t refs;
+    uint32_t kernel_epoch;
+    struct rw_semaphore mapping_sem;
+    struct address_space *mapping;
+    struct wvm_mem_slot mem_slots[MAX_WVM_SLOTS];
+    wait_queue_head_t irq_wait_queue;
+    atomic_t irq_pending;
+    struct id_pool_t __percpu *id_pool;
+    struct req_ctx_t *req_ctx;
+    size_t req_ctx_count;
+    struct radix_tree_root page_tree;
+    spinlock_t page_tree_lock;
+    struct wvm_kernel_transport *transport;
+};
+
+struct wvm_kernel_file_context {
+    int bound;
+    struct wvm_kernel_context *context;
+    struct address_space *mapping;
+    struct wvm_kernel_context_identity identity;
+};
+
+static DEFINE_MUTEX(g_context_mutex);
+static struct wvm_kernel_context g_kernel_context;
 
 // --- [V29 Wavelet] 内核态脏区捕获与Diff提交结构 ---
 
 // 记录一个正在被写入的页面
 struct diff_task_t {
     struct list_head list;
+    struct wvm_kernel_context *context;
     struct page *page;      // 目标物理页
     void *pre_image;        // 4KB 快照 (修改前的数据)
     uint64_t gpa;           // Guest Physical Address
     uint64_t timestamp;     // 记录时间，用于防抖
 };
-
-static LIST_HEAD(g_diff_queue);
-static spinlock_t g_diff_lock;
-static struct task_struct *g_committer_thread = NULL;
-static wait_queue_head_t g_diff_wq;
-
-// 引用：我们需要知道 VMA 的 mapping 才能触发 unmap
-static struct address_space *g_mapping = NULL;
 
 // --- ID 管理系统 ---
 #define BITS_PER_CPU_ID 16
@@ -109,7 +157,6 @@ struct id_pool_t {
     uint32_t tail;
     spinlock_t lock;
 };
-static DEFINE_PER_CPU(struct id_pool_t, g_id_pool);
 
 // 请求上下文：增加等待队列以支持异步休眠
 struct req_ctx_t {
@@ -120,10 +167,6 @@ struct req_ctx_t {
     wait_queue_head_t wq; // [New] 内核任务在此休眠
     struct task_struct *waiter; // [New] 记录等待的任务 (用于调试或唤醒检查)
 };
-static struct req_ctx_t *g_req_ctx = NULL;
-// Runtime-sized: nr_cpu_ids * MAX_IDS_PER_CPU. The original fixed sizing
-// (1024 * 65536) is too large for most test environments and can stall insmod.
-static size_t g_req_ctx_count = 0;
 
 // [V29 Final Fix] 内核态页面元数据
 // 用于在 Radix Tree 中同时存储物理页指针和版本号
@@ -135,10 +178,6 @@ typedef struct {
     // 内核原生 sk_buff 队列，自带 spinlock，用于缓存乱序到达的包
     struct sk_buff_head reorder_q; 
 } kvm_page_meta_t;
-
-// 修改树的定义，名字保持不变，但存储的内容变了
-static RADIX_TREE(g_page_tree, GFP_ATOMIC);
-static DEFINE_SPINLOCK(g_page_tree_lock);
 
 // --- QoS 发送队列 ---
 struct tx_slot_t {
@@ -155,48 +194,138 @@ struct wvm_tx_ring_t {
     atomic_t pending_count;
 };
 
-static struct wvm_tx_ring_t g_fast_ring;
-static struct wvm_tx_ring_t g_slow_ring;
-
-static struct task_struct *g_tx_thread = NULL;
-static wait_queue_head_t g_tx_wq;
-
-static wait_queue_head_t g_irq_wait_queue;
-static atomic_t g_irq_pending = ATOMIC_INIT(0);
+struct wvm_kernel_transport {
+    int service_port;
+    int local_slave_port;
+    struct socket *socket;
+    struct sockaddr_in gateway_table[WVM_MAX_GATEWAYS];
+    struct wvm_tx_ring_t fast_ring;
+    struct wvm_tx_ring_t slow_ring;
+    struct task_struct *tx_thread;
+    wait_queue_head_t tx_wq;
+    struct list_head diff_queue;
+    spinlock_t diff_lock;
+    struct task_struct *committer_thread;
+    wait_queue_head_t diff_wq;
+};
 
 // 定义工作项结构，用于把参数带到 Workqueue 里
 struct wvm_inval_work {
     struct work_struct work;
+    struct wvm_kernel_context *context;
     uint64_t gpa;
 };
 
-static void init_ring(struct wvm_tx_ring_t *ring) {
+static struct wvm_kernel_context *wvm_active_context(void)
+{
+    return &g_kernel_context;
+}
+
+static struct wvm_kernel_transport *wvm_active_transport(void)
+{
+    struct wvm_kernel_context *context = wvm_active_context();
+
+    return context ? context->transport : NULL;
+}
+
+static struct wvm_kernel_context *wvm_context_for_file(
+    const struct wvm_kernel_file_context *file_context)
+{
+    if (file_context && file_context->context)
+        return file_context->context;
+    return wvm_active_context();
+}
+
+static struct wvm_kernel_context *wvm_context_from_vma(
+    const struct vm_area_struct *vma)
+{
+    struct wvm_kernel_file_context *file_context;
+
+    if (!vma || !vma->vm_file)
+        return NULL;
+    file_context = vma->vm_file->private_data;
+    return wvm_context_for_file(file_context);
+}
+
+uint8_t wvm_kernel_current_vm_id(void)
+{
+    uint32_t vm_id = READ_ONCE(g_kernel_context.identity.vm_id);
+
+    if (vm_id == 0)
+        vm_id = READ_ONCE(g_my_vm_id);
+    return (uint8_t)vm_id;
+}
+EXPORT_SYMBOL_GPL(wvm_kernel_current_vm_id);
+
+static int init_ring(struct wvm_tx_ring_t *ring) {
     ring->slots = vmalloc(sizeof(struct tx_slot_t) * TX_RING_SIZE);
+    if (!ring->slots)
+        return -ENOMEM;
     ring->head = ring->tail = 0;
     spin_lock_init(&ring->lock);
     atomic_set(&ring->pending_count, 0);
+    return 0;
+}
+
+static void wvm_transport_stop(struct wvm_kernel_transport *transport)
+{
+    struct diff_task_t *task, *next;
+
+    if (!transport)
+        return;
+    if (transport->tx_thread && !IS_ERR(transport->tx_thread)) {
+        kthread_stop(transport->tx_thread);
+        transport->tx_thread = NULL;
+    }
+    if (transport->committer_thread &&
+        !IS_ERR(transport->committer_thread)) {
+        kthread_stop(transport->committer_thread);
+        transport->committer_thread = NULL;
+    }
+    list_for_each_entry_safe(task, next, &transport->diff_queue, list) {
+        list_del(&task->list);
+        vfree(task->pre_image);
+        put_page(task->page);
+        kfree(task);
+    }
+    if (transport->fast_ring.slots) {
+        vfree(transport->fast_ring.slots);
+        transport->fast_ring.slots = NULL;
+    }
+    if (transport->slow_ring.slots) {
+        vfree(transport->slow_ring.slots);
+        transport->slow_ring.slots = NULL;
+    }
+    if (transport->socket) {
+        transport->socket->sk->sk_data_ready = NULL;
+        transport->socket->sk->sk_user_data = NULL;
+        sock_release(transport->socket);
+        transport->socket = NULL;
+    }
 }
 
 // --- 工作线程回调（运行在进程上下文，安全！）---
 static void wvm_inval_work_fn(struct work_struct *work) {
     struct wvm_inval_work *iw = container_of(work, struct wvm_inval_work, work);
     
-    down_read(&g_mapping_sem);
-    if (g_mapping) {
+    down_read(&iw->context->mapping_sem);
+    if (iw->context->mapping) {
         loff_t offset = (loff_t)iw->gpa;
-        unmap_mapping_range(g_mapping, offset, PAGE_SIZE, 1);
+        unmap_mapping_range(iw->context->mapping, offset, PAGE_SIZE, 1);
     }
-    up_read(&g_mapping_sem);
+    up_read(&iw->context->mapping_sem);
     
     kfree(iw); // 任务完成，释放工作项本身
 }
 
 // --- 调度函数（可以在原子上下文中调用）---
-static void schedule_async_unmap(uint64_t gpa) {
+static void schedule_async_unmap(struct wvm_kernel_context *context,
+                                 uint64_t gpa) {
     // 必须使用 GFP_ATOMIC，因为我们在软中断里
     struct wvm_inval_work *iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
     if (iw) {
         INIT_WORK(&iw->work, wvm_inval_work_fn);
+        iw->context = context;
         iw->gpa = gpa;
         schedule_work(&iw->work); // 扔给系统默认队列，内核会择机执行
     } else {
@@ -254,10 +383,12 @@ static void k_fetch_page(uint64_t gpa, void *buf) {} // Deprecated by logic_core
  * [关键逻辑] 在原子上下文中将页面从 Radix-Tree 中摘除，并使用 kfree_rcu 安全回收乱序缓冲区。
  * [后果] 这是 MESI 协议在内核态落地的第一步，它切断了后续 PUSH 包对该物理页的自动更新链路。
  */
-static void k_invalidate_meta_atomic(uint64_t gpa) {
-    spin_lock(&g_page_tree_lock);
-    kvm_page_meta_t *meta = radix_tree_delete(&g_page_tree, gpa >> PAGE_SHIFT);
-    spin_unlock(&g_page_tree_lock);
+static void k_invalidate_meta_atomic(struct wvm_kernel_context *context,
+                                     uint64_t gpa) {
+    spin_lock(&context->page_tree_lock);
+    kvm_page_meta_t *meta =
+        radix_tree_delete(&context->page_tree, gpa >> PAGE_SHIFT);
+    spin_unlock(&context->page_tree_lock);
     
     if (meta) {
         // 必须释放队列中所有积压的 skb，否则内存泄漏
@@ -276,8 +407,15 @@ static void k_invalidate_meta_atomic(uint64_t gpa) {
 static uint64_t k_alloc_req_id(void *rx_buffer, uint32_t buffer_size) {
     uint64_t id = (uint64_t)-1;
     unsigned long flags;
+    struct wvm_kernel_context *context = wvm_active_context();
     int cpu = get_cpu();
-    struct id_pool_t *pool = this_cpu_ptr(&g_id_pool);
+    struct id_pool_t *pool;
+
+    if (!context->id_pool || !context->req_ctx) {
+        put_cpu();
+        return id;
+    }
+    pool = this_cpu_ptr(context->id_pool);
 
     spin_lock_irqsave(&pool->lock, flags);
     if (unlikely(!pool->ids)) goto out;
@@ -285,13 +423,15 @@ static uint64_t k_alloc_req_id(void *rx_buffer, uint32_t buffer_size) {
         uint32_t raw_idx = pool->ids[pool->head & (MAX_IDS_PER_CPU - 1)];
         pool->head++;
         uint32_t combined_idx = ((uint32_t)cpu << CPU_ID_SHIFT) | raw_idx;
-        if (likely((size_t)combined_idx < g_req_ctx_count)) {
-            g_req_ctx[combined_idx].generation++;
-            if (g_req_ctx[combined_idx].generation == 0) g_req_ctx[combined_idx].generation = 1;
-            id = ((uint64_t)g_req_ctx[combined_idx].generation << 32) | combined_idx;
-            WRITE_ONCE(g_req_ctx[combined_idx].rx_buffer, rx_buffer);
-            g_req_ctx[combined_idx].max_len = buffer_size; // [FIX-G3]
-            WRITE_ONCE(g_req_ctx[combined_idx].done, 0);
+        if (likely((size_t)combined_idx < context->req_ctx_count)) {
+            context->req_ctx[combined_idx].generation++;
+            if (context->req_ctx[combined_idx].generation == 0)
+                context->req_ctx[combined_idx].generation = 1;
+            id = ((uint64_t)context->req_ctx[combined_idx].generation << 32) |
+                 combined_idx;
+            WRITE_ONCE(context->req_ctx[combined_idx].rx_buffer, rx_buffer);
+            context->req_ctx[combined_idx].max_len = buffer_size; // [FIX-G3]
+            WRITE_ONCE(context->req_ctx[combined_idx].done, 0);
             smp_wmb(); 
         } else { pool->head--; }
     }
@@ -303,19 +443,22 @@ out:
 
 static void k_free_req_id(uint64_t full_id) {
     unsigned long flags;
+    struct wvm_kernel_context *context = wvm_active_context();
     uint32_t generation = (uint32_t)(full_id >> 32);
     uint32_t combined_idx = (uint32_t)(full_id & 0xFFFFFFFF);
     int owner_cpu = (combined_idx >> CPU_ID_SHIFT);
     uint32_t raw_idx = combined_idx & (MAX_IDS_PER_CPU - 1);
     struct id_pool_t *pool;
 
-    if (unlikely((size_t)combined_idx >= g_req_ctx_count || owner_cpu >= nr_cpu_ids)) return;
-    if (g_req_ctx[combined_idx].generation != generation) return; 
+    if (unlikely(!context->id_pool || !context->req_ctx ||
+                 (size_t)combined_idx >= context->req_ctx_count ||
+                 owner_cpu >= nr_cpu_ids)) return;
+    if (context->req_ctx[combined_idx].generation != generation) return;
 
-    xchg(&g_req_ctx[combined_idx].rx_buffer, NULL);
-    WRITE_ONCE(g_req_ctx[combined_idx].done, 0);
+    xchg(&context->req_ctx[combined_idx].rx_buffer, NULL);
+    WRITE_ONCE(context->req_ctx[combined_idx].done, 0);
 
-    pool = per_cpu_ptr(&g_id_pool, owner_cpu);
+    pool = per_cpu_ptr(context->id_pool, owner_cpu);
     if (unlikely(!pool->ids)) return;
     spin_lock_irqsave(&pool->lock, flags);
     pool->ids[pool->tail & (MAX_IDS_PER_CPU - 1)] = raw_idx;
@@ -324,30 +467,43 @@ static void k_free_req_id(uint64_t full_id) {
 }
 
 static int k_check_req_status(uint64_t full_id) {
+    struct wvm_kernel_context *context = wvm_active_context();
     uint32_t combined_idx = (uint32_t)(full_id & 0xFFFFFFFF);
-    if ((size_t)combined_idx >= g_req_ctx_count) return -1;
-    if (READ_ONCE(g_req_ctx[combined_idx].done)) { smp_rmb(); return 1; }
+    if (!context->req_ctx ||
+        (size_t)combined_idx >= context->req_ctx_count) return -1;
+    if (READ_ONCE(context->req_ctx[combined_idx].done)) {
+        smp_rmb();
+        return 1;
+    }
     return 0;
 }
 
 // --- 发送逻辑 ---
 static void k_set_gateway_ip(uint32_t gw_id, uint32_t ip, uint16_t port) {
+    struct wvm_kernel_transport *transport = wvm_active_transport();
+
     // [Fix #1] 入参可能是 composite ID，先解码为裸 node_id 再索引静态数组
     uint32_t raw_node_id = WVM_GET_NODEID(gw_id);
-    if (raw_node_id < WVM_MAX_GATEWAYS) {
-        gateway_table[raw_node_id].sin_family = AF_INET;
-        gateway_table[raw_node_id].sin_addr.s_addr = ip;
-        gateway_table[raw_node_id].sin_port = port;
+    if (transport && raw_node_id < WVM_MAX_GATEWAYS) {
+        transport->gateway_table[raw_node_id].sin_family = AF_INET;
+        transport->gateway_table[raw_node_id].sin_addr.s_addr = ip;
+        transport->gateway_table[raw_node_id].sin_port = port;
     }
 }
 
-static int raw_kernel_send(void *data, int len, uint32_t target_id) {
+static int raw_kernel_send(struct wvm_kernel_context *context,
+                           void *data, int len, uint32_t target_id) {
     struct msghdr msg; struct kvec vec; struct sockaddr_in to_addr; int ret;
+    struct wvm_kernel_transport *transport =
+        context ? context->transport : NULL;
     // [Fix #1] target_id 可能是 composite ID，解码为裸 node_id 索引 gateway_table
     uint32_t raw_id = WVM_GET_NODEID(target_id);
-    if (!g_socket || raw_id >= WVM_MAX_GATEWAYS || gateway_table[raw_id].sin_port == 0) return -ENODEV;
+    if (!transport || !transport->socket || raw_id >= WVM_MAX_GATEWAYS ||
+        transport->gateway_table[raw_id].sin_port == 0) {
+        return -ENODEV;
+    }
 
-    to_addr = gateway_table[raw_id];
+    to_addr = transport->gateway_table[raw_id];
     memset(&msg, 0, sizeof(msg));
     msg.msg_name = &to_addr;
     msg.msg_namelen = sizeof(to_addr);
@@ -355,7 +511,7 @@ static int raw_kernel_send(void *data, int len, uint32_t target_id) {
     vec.iov_base = data;
     vec.iov_len = len;
 
-    ret = kernel_sendmsg(g_socket, &msg, &vec, 1, len);
+    ret = kernel_sendmsg(transport->socket, &msg, &vec, 1, len);
     if (ret == -EAGAIN) {
         if (in_atomic() || irqs_disabled()) udelay(5);
     }
@@ -368,27 +524,37 @@ static int raw_kernel_send(void *data, int len, uint32_t target_id) {
  * [后果] 保证了系统在“内存洪流”中依然能及时响应心跳与版本确认包，防止了由于网络拥塞导致的误判定节点下线。
  */
 static int tx_worker_thread_fn(void *data) {
+    struct wvm_kernel_context *context = data;
+    struct wvm_kernel_transport *transport =
+        context ? context->transport : NULL;
     /* Large TX slots (up to 64KB) cannot live on kernel stack. */
     struct tx_slot_t *slot = kvzalloc(sizeof(*slot), GFP_KERNEL);
-    if (!slot) return -ENOMEM;
+    if (!slot || !transport) {
+        kvfree(slot);
+        return -ENOMEM;
+    }
     while (!kthread_should_stop()) {
-        wait_event_interruptible(g_tx_wq, 
-            atomic_read(&g_fast_ring.pending_count) > 0 || 
-            atomic_read(&g_slow_ring.pending_count) > 0 || kthread_should_stop());
+        wait_event_interruptible(transport->tx_wq,
+            atomic_read(&transport->fast_ring.pending_count) > 0 ||
+            atomic_read(&transport->slow_ring.pending_count) > 0 ||
+            kthread_should_stop());
         
         if (kthread_should_stop()) break;
 
         // 1. Fast Lane (Priority)
-        while (atomic_read(&g_fast_ring.pending_count) > 0) {
+        while (atomic_read(&transport->fast_ring.pending_count) > 0) {
             int found = 0;
-            spin_lock_bh(&g_fast_ring.lock);
-            if (g_fast_ring.head != g_fast_ring.tail) {
-                memcpy(slot, &g_fast_ring.slots[g_fast_ring.head], sizeof(*slot));
-                g_fast_ring.head = (g_fast_ring.head + 1) % TX_RING_SIZE;
-                atomic_dec(&g_fast_ring.pending_count);
+            spin_lock_bh(&transport->fast_ring.lock);
+            if (transport->fast_ring.head != transport->fast_ring.tail) {
+                memcpy(slot,
+                       &transport->fast_ring.slots[transport->fast_ring.head],
+                       sizeof(*slot));
+                transport->fast_ring.head =
+                    (transport->fast_ring.head + 1) % TX_RING_SIZE;
+                atomic_dec(&transport->fast_ring.pending_count);
                 found = 1;
             }
-            spin_unlock_bh(&g_fast_ring.lock);
+            spin_unlock_bh(&transport->fast_ring.lock);
             
             if (found) { 
                 // [V29] CRC Calculation offloaded to worker thread
@@ -396,23 +562,28 @@ static int tx_worker_thread_fn(void *data) {
                 hdr->crc32 = 0;
                 hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot->data, slot->len, slot->target_id); 
+                raw_kernel_send(context, slot->data, slot->len,
+                                slot->target_id);
                 cond_resched(); 
             }
         }
 
         // 2. Slow Lane (Quota)
         int quota = 32; 
-        while (quota-- > 0 && atomic_read(&g_slow_ring.pending_count) > 0) {
+        while (quota-- > 0 &&
+               atomic_read(&transport->slow_ring.pending_count) > 0) {
             int found = 0;
-            spin_lock_bh(&g_slow_ring.lock);
-            if (g_slow_ring.head != g_slow_ring.tail) {
-                memcpy(slot, &g_slow_ring.slots[g_slow_ring.head], sizeof(*slot));
-                g_slow_ring.head = (g_slow_ring.head + 1) % TX_RING_SIZE;
-                atomic_dec(&g_slow_ring.pending_count);
+            spin_lock_bh(&transport->slow_ring.lock);
+            if (transport->slow_ring.head != transport->slow_ring.tail) {
+                memcpy(slot,
+                       &transport->slow_ring.slots[transport->slow_ring.head],
+                       sizeof(*slot));
+                transport->slow_ring.head =
+                    (transport->slow_ring.head + 1) % TX_RING_SIZE;
+                atomic_dec(&transport->slow_ring.pending_count);
                 found = 1;
             }
-            spin_unlock_bh(&g_slow_ring.lock);
+            spin_unlock_bh(&transport->slow_ring.lock);
             
             if (found) {
                 // [V29] CRC Calculation
@@ -420,10 +591,11 @@ static int tx_worker_thread_fn(void *data) {
                 hdr->crc32 = 0;
                 hdr->crc32 = htonl(calculate_crc32(slot->data, slot->len));
                 
-                raw_kernel_send(slot->data, slot->len, slot->target_id);
+                raw_kernel_send(context, slot->data, slot->len,
+                                slot->target_id);
             }
             // Preempt if fast packet arrives
-            if (atomic_read(&g_fast_ring.pending_count) > 0) break;
+            if (atomic_read(&transport->fast_ring.pending_count) > 0) break;
         }
         k_touch_watchdog();
     }
@@ -431,15 +603,13 @@ static int tx_worker_thread_fn(void *data) {
     return 0;
 }
 
-// [PATCH] 全局 Epoch 变量
-static uint32_t g_kernel_epoch = 0;
-
 // [修改] k_send_packet 函数
 static int k_send_packet(void *data, int len, uint32_t target_id) {
     struct wvm_header *hdr = (struct wvm_header *)data;
+    struct wvm_kernel_context *context = wvm_active_context();
     
     // [PATCH] 注入当前 Epoch
-    hdr->epoch = htonl(g_kernel_epoch);
+    hdr->epoch = htonl(READ_ONCE(context->kernel_epoch));
     // Node State 在内核态通常默认为 ACTIVE (2)，因为能跑内核模块说明节点活着
     hdr->node_state = 2; 
     hdr->target_id = htonl(target_id);
@@ -447,9 +617,14 @@ static int k_send_packet(void *data, int len, uint32_t target_id) {
     hdr->crc32 = 0;
     hdr->crc32 = htonl(calculate_crc32(data, len));
     
-    if (!k_is_atomic_context()) return raw_kernel_send(data, len, target_id);
+    if (!context || !context->transport)
+        return -ENODEV;
+    if (!k_is_atomic_context())
+        return raw_kernel_send(context, data, len, target_id);
 
-    struct wvm_tx_ring_t *ring = (hdr->qos_level == 1) ? &g_fast_ring : &g_slow_ring;
+    struct wvm_tx_ring_t *ring =
+        (hdr->qos_level == 1) ? &context->transport->fast_ring
+                               : &context->transport->slow_ring;
     unsigned long flags;
     spin_lock_irqsave(&ring->lock, flags);
     uint32_t next = (ring->tail + 1) % TX_RING_SIZE;
@@ -459,7 +634,7 @@ static int k_send_packet(void *data, int len, uint32_t target_id) {
         memcpy(ring->slots[ring->tail].data, data, len);
         ring->tail = next;
         atomic_inc(&ring->pending_count);
-        wake_up_interruptible(&g_tx_wq);
+        wake_up_interruptible(&context->transport->tx_wq);
     }
     spin_unlock_irqrestore(&ring->lock, flags);
     return 0;
@@ -475,7 +650,8 @@ static void k_send_packet_async(uint16_t msg_type, void* payload, int len, uint3
     hdr->magic = htonl(WVM_MAGIC);
     hdr->msg_type = htons(msg_type);
     hdr->payload_len = htons(len);
-    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+    hdr->slave_id = htonl(WVM_ENCODE_ID(wvm_kernel_current_vm_id(),
+                                         g_my_node_id));
     hdr->req_id = 0;
     hdr->qos_level = qos;
     if (payload && len > 0) memcpy(buffer + sizeof(*hdr), payload, len);
@@ -488,35 +664,26 @@ static void k_send_packet_async(uint16_t msg_type, void* payload, int len, uint3
 extern int wvm_handle_local_fault_fastpath(uint64_t gpa, void* page_buffer, uint64_t *version);
 extern void wvm_declare_interest_in_neighborhood(uint64_t gpa);
 
-#define MAX_WVM_SLOTS 32
-
-struct wvm_mem_slot {
-    uint64_t start_gpa;
-    uint64_t size;
-    uint64_t host_offset; // 对应后端 SHM 文件的偏移
-    bool active;
-};
-
-static struct wvm_mem_slot g_mem_slots[MAX_WVM_SLOTS];
-
 // [NEW IOCTL] 动态注入 Guest 内存布局
-static int wvm_set_mem_layout(struct wvm_ioctl_mem_layout *layout) {
+static int wvm_set_mem_layout(struct wvm_kernel_context *context,
+                              struct wvm_ioctl_mem_layout *layout) {
     if (layout->count > MAX_WVM_SLOTS) return -EINVAL;
 
     /* Reset old slots first to avoid stale ranges after restart/reconfigure. */
     for (int i = 0; i < MAX_WVM_SLOTS; i++) {
-        g_mem_slots[i].active = false;
-        g_mem_slots[i].start_gpa = 0;
-        g_mem_slots[i].size = 0;
-        g_mem_slots[i].host_offset = 0;
+        context->mem_slots[i].active = false;
+        context->mem_slots[i].start_gpa = 0;
+        context->mem_slots[i].size = 0;
+        context->mem_slots[i].host_offset = 0;
     }
 
     for (int i = 0; i < layout->count; i++) {
-        g_mem_slots[i].start_gpa = layout->slots[i].start;
-        g_mem_slots[i].size = layout->slots[i].size;
-        g_mem_slots[i].active = true;
+        context->mem_slots[i].start_gpa = layout->slots[i].start;
+        context->mem_slots[i].size = layout->slots[i].size;
+        context->mem_slots[i].active = true;
         printk(KERN_INFO "[WVM] Active RAM Slot %d: GPA 0x%llx - 0x%llx\n", 
-               i, g_mem_slots[i].start_gpa, g_mem_slots[i].start_gpa + g_mem_slots[i].size);
+               i, context->mem_slots[i].start_gpa,
+               context->mem_slots[i].start_gpa + context->mem_slots[i].size);
     }
     return 0;
 }
@@ -527,14 +694,18 @@ static int wvm_set_mem_layout(struct wvm_ioctl_mem_layout *layout) {
  * [后果] 这是整个项目最高频的入口点。通过异步休眠替代了 V28 的自旋死等，使得物理 CPU 可以在等待内存期间去跑其他任务。
  */
 static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
+    struct wvm_kernel_context *context = wvm_context_from_vma(vmf->vma);
     uint64_t gpa = (uint64_t)vmf->pgoff << PAGE_SHIFT;
     bool is_valid_ram = false;
 
+    if (!context)
+        return VM_FAULT_SIGBUS;
+
     // 严谨的地址合法性检查
     for (int i = 0; i < MAX_WVM_SLOTS; i++) {
-        if (g_mem_slots[i].active && 
-            gpa >= g_mem_slots[i].start_gpa && 
-            gpa < g_mem_slots[i].start_gpa + g_mem_slots[i].size) {
+        if (context->mem_slots[i].active &&
+            gpa >= context->mem_slots[i].start_gpa &&
+            gpa < context->mem_slots[i].start_gpa + context->mem_slots[i].size) {
             is_valid_ram = true;
             break;
         }
@@ -594,9 +765,9 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
             }
             
             // 注册到全局索引树 (用于后续接收 PUSH)
-            spin_lock(&g_page_tree_lock);
-            radix_tree_insert(&g_page_tree, gpa >> PAGE_SHIFT, meta);
-            spin_unlock(&g_page_tree_lock);
+            spin_lock(&context->page_tree_lock);
+            radix_tree_insert(&context->page_tree, gpa >> PAGE_SHIFT, meta);
+            spin_unlock(&context->page_tree_lock);
 
             // 释放 alloc_page 的引用，现在由 VMA 管理
             put_page(page);
@@ -653,7 +824,8 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
             hdr->magic = htonl(WVM_MAGIC);
             hdr->msg_type = htons(MSG_MEM_READ);
             hdr->payload_len = htons(sizeof(net_gpa));
-            hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, dir_node));
+            hdr->slave_id = htonl(WVM_ENCODE_ID(
+                wvm_kernel_current_vm_id(), dir_node));
             hdr->req_id = WVM_HTONLL(rid);
             hdr->qos_level = 1;
             hdr->crc32 = 0;
@@ -663,15 +835,15 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
         }
 
         while (1) {
-            // 4. 睡眠等待
-            timeout_ret = wait_event_interruptible_timeout(
-                g_req_ctx[(uint32_t)rid].wq, 
-                READ_ONCE(g_req_ctx[(uint32_t)rid].done) == 1, 
+        // 4. 睡眠等待
+        timeout_ret = wait_event_interruptible_timeout(
+                context->req_ctx[(uint32_t)rid].wq,
+                READ_ONCE(context->req_ctx[(uint32_t)rid].done) == 1,
                 timeout_jiffies
             );
 
-            // 5. 成功检查
-            if (READ_ONCE(g_req_ctx[(uint32_t)rid].done) == 1) {
+        // 5. 成功检查
+            if (READ_ONCE(context->req_ctx[(uint32_t)rid].done) == 1) {
                 break; // 数据到了，跳出
             }
 
@@ -696,7 +868,8 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
                     hdr->magic = htonl(WVM_MAGIC);
                     hdr->msg_type = htons(MSG_MEM_READ);
                     hdr->payload_len = htons(sizeof(net_gpa));
-                    hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, dir_node));
+                    hdr->slave_id = htonl(WVM_ENCODE_ID(
+                        wvm_kernel_current_vm_id(), dir_node));
                     hdr->req_id = WVM_HTONLL(rid);
                     hdr->qos_level = 1;
                     hdr->crc32 = 0;
@@ -726,9 +899,9 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
             return VM_FAULT_SIGBUS;
         }
         
-        spin_lock(&g_page_tree_lock);
-        radix_tree_insert(&g_page_tree, gpa >> PAGE_SHIFT, meta);
-        spin_unlock(&g_page_tree_lock);
+        spin_lock(&context->page_tree_lock);
+        radix_tree_insert(&context->page_tree, gpa >> PAGE_SHIFT, meta);
+        spin_unlock(&context->page_tree_lock);
 
         put_page(page);
 
@@ -745,24 +918,31 @@ static vm_fault_t wvm_fault_handler(struct vm_fault *vmf) {
  * [后果] 实现了极低带宽下的高频内存同步。它只传输变动的比特，使得在千兆网环境下也能模拟出万兆总线的写入吞吐量。
  */
 static int committer_thread_fn(void *data) {
+    struct wvm_kernel_context *context = data;
+    struct wvm_kernel_transport *transport =
+        context ? context->transport : NULL;
+
+    if (!transport)
+        return -EINVAL;
     while (!kthread_should_stop()) {
         struct diff_task_t *task;
         
         // 1. 等待任务
-        wait_event_interruptible(g_diff_wq, 
-            !list_empty(&g_diff_queue) || kthread_should_stop());
+        wait_event_interruptible(transport->diff_wq,
+            !list_empty(&transport->diff_queue) || kthread_should_stop());
             
         if (kthread_should_stop()) break;
 
         // 2. 取出一个任务
-        spin_lock_bh(&g_diff_lock);
-        if (list_empty(&g_diff_queue)) {
-            spin_unlock_bh(&g_diff_lock);
+        spin_lock_bh(&transport->diff_lock);
+        if (list_empty(&transport->diff_queue)) {
+            spin_unlock_bh(&transport->diff_lock);
             continue;
         }
-        task = list_first_entry(&g_diff_queue, struct diff_task_t, list);
+        task = list_first_entry(&transport->diff_queue, struct diff_task_t,
+                                list);
         list_del(&task->list);
-        spin_unlock_bh(&g_diff_lock);
+        spin_unlock_bh(&transport->diff_lock);
 
         // 3. 计算 Diff (Compare current page with pre-image)
         void *current_data = kmap_atomic(task->page);
@@ -806,14 +986,16 @@ static int committer_thread_fn(void *data) {
                 hdr->msg_type = htons(MSG_COMMIT_DIFF);
                 hdr->payload_len = htons(payload_size);
                 extern int g_my_node_id;
-                hdr->slave_id = htonl(WVM_ENCODE_ID(g_my_vm_id, g_my_node_id));
+                hdr->slave_id = htonl(WVM_ENCODE_ID(
+                    wvm_kernel_current_vm_id(), g_my_node_id));
                 hdr->req_id = 0;
                 hdr->qos_level = 1;
 
                 struct wvm_diff_log *log = (struct wvm_diff_log*)(buffer + sizeof(*hdr));
                 log->gpa = WVM_HTONLL(task->gpa);
                 rcu_read_lock();
-                kvm_page_meta_t *meta = radix_tree_lookup(&g_page_tree, task->gpa >> PAGE_SHIFT);
+                kvm_page_meta_t *meta = radix_tree_lookup(
+                    &task->context->page_tree, task->gpa >> PAGE_SHIFT);
                 // 如果找到了元数据，就填入网络序的版本号；找不到(极罕见)则填0触发强制同步作为保底
                 log->version = meta ? WVM_HTONLL(meta->version) : 0;
                 rcu_read_unlock();
@@ -835,11 +1017,12 @@ static int committer_thread_fn(void *data) {
         // 5. [Critical] 重新启用写保护 (Reset cycle)
         // 必须调用 unmap_mapping_range 来清除 PTE 的写权限
         // 这样下一次写入才会再次触发 page_mkwrite
-        down_read(&g_mapping_sem); // 读锁，允许睡眠
-        if (g_mapping) {
-            unmap_mapping_range(g_mapping, (loff_t)task->gpa, PAGE_SIZE, 1);
+        down_read(&task->context->mapping_sem); // 读锁，允许睡眠
+        if (task->context->mapping) {
+            unmap_mapping_range(task->context->mapping,
+                                (loff_t)task->gpa, PAGE_SIZE, 1);
         }
-        up_read(&g_mapping_sem);
+        up_read(&task->context->mapping_sem);
 
         // 6. 清理资源
         vfree(task->pre_image);
@@ -855,8 +1038,12 @@ static int committer_thread_fn(void *data) {
  * [后果] 它是分布式写操作的触发器。通过此钩子，WaveVM 能在不修改 Guest 内核的情况下，精准感知每一个字节的变动。
  */
 static vm_fault_t wvm_page_mkwrite(struct vm_fault *vmf) {
+    struct wvm_kernel_context *context = wvm_context_from_vma(vmf->vma);
     struct page *page = vmf->page;
     uint64_t gpa = (uint64_t)vmf->pgoff << PAGE_SHIFT;
+
+    if (!context)
+        return VM_FAULT_SIGBUS;
     
     // 1. 分配任务结构和快照内存
     struct diff_task_t *task = kmalloc(sizeof(*task), GFP_KERNEL);
@@ -874,6 +1061,7 @@ static vm_fault_t wvm_page_mkwrite(struct vm_fault *vmf) {
     memcpy(task->pre_image, vaddr, 4096);
     kunmap_atomic(vaddr);
 
+    task->context = context;
     task->page = page;
     get_page(page); // 增加引用计数，防止在线程处理前被释放
     task->gpa = gpa;
@@ -881,12 +1069,18 @@ static vm_fault_t wvm_page_mkwrite(struct vm_fault *vmf) {
 
     // 3. 加入队列
     // [FIX-M3] 统一使用 spin_lock_bh，与取出端保持一致，防止 softirq 死锁
-    spin_lock_bh(&g_diff_lock);
-    list_add_tail(&task->list, &g_diff_queue);
-    spin_unlock_bh(&g_diff_lock);
+    if (!context->transport) {
+        vfree(task->pre_image);
+        put_page(task->page);
+        kfree(task);
+        return VM_FAULT_SIGBUS;
+    }
+    spin_lock_bh(&context->transport->diff_lock);
+    list_add_tail(&task->list, &context->transport->diff_queue);
+    spin_unlock_bh(&context->transport->diff_lock);
 
     // 4. 唤醒提交线程
-    wake_up_interruptible(&g_diff_wq);
+    wake_up_interruptible(&context->transport->diff_wq);
 
     // 5. 允许写入
     // 返回 VM_FAULT_LOCKED 后，内核会将 PTE 设为可写
@@ -977,6 +1171,7 @@ static void try_flush_reorder_q(kvm_page_meta_t *meta) {
  * [后果] 这是 V30 性能超越 V28 的秘密武器。它在内核底层完成了数据的“无感更新”，Guest 甚至不知道内存已经变了。
  */
 static void handle_kernel_push(struct wvm_header *hdr, void *payload) {
+    struct wvm_kernel_context *context = wvm_active_context();
     uint16_t type = ntohs(hdr->msg_type);
     uint8_t flags = hdr->flags; 
     uint64_t gpa, push_version;
@@ -1005,7 +1200,8 @@ static void handle_kernel_push(struct wvm_header *hdr, void *payload) {
 
     // --- 2. 核心处理 ---
     rcu_read_lock(); 
-    kvm_page_meta_t *meta = radix_tree_lookup(&g_page_tree, gpa >> PAGE_SHIFT);
+    kvm_page_meta_t *meta =
+        radix_tree_lookup(&context->page_tree, gpa >> PAGE_SHIFT);
     
     if (meta && meta->page) {
         // [FIX] 幂等性检查：如果包版本 <= 本地版本，静默丢弃
@@ -1059,6 +1255,8 @@ static void handle_kernel_push(struct wvm_header *hdr, void *payload) {
  * [后果] 它让分布式虚拟机的“冷启动”与“克隆”速度达到了硬件极限，绕过了所有缓慢的软件协议栈处理路径。
  */
 static void handle_kernel_rpc_batch(void *payload, uint32_t payload_len) {
+    struct wvm_kernel_context *context = wvm_active_context();
+
     if (payload_len < sizeof(struct wvm_rpc_batch_memset)) return;
 
     struct wvm_rpc_batch_memset *batch = (struct wvm_rpc_batch_memset *)payload;
@@ -1090,7 +1288,8 @@ static void handle_kernel_rpc_batch(void *payload, uint32_t payload_len) {
 
             rcu_read_lock();
             // 1. 在 Radix Tree 中查找物理页元数据
-            kvm_page_meta_t *meta = radix_tree_lookup(&g_page_tree, page_base >> PAGE_SHIFT);
+            kvm_page_meta_t *meta =
+                radix_tree_lookup(&context->page_tree, page_base >> PAGE_SHIFT);
             
             if (meta && meta->page) {
                 // 2. 建立临时原子映射 (HighMem 兼容)
@@ -1104,7 +1303,9 @@ static void handle_kernel_rpc_batch(void *payload, uint32_t payload_len) {
 
                 // 4. 标记脏页并更新版本号 (逻辑一致性)
                 SetPageDirty(meta->page);
-                meta->version = MAKE_VERSION(g_kernel_epoch, GET_COUNTER(meta->version) + 1);
+                meta->version = MAKE_VERSION(
+                    READ_ONCE(context->kernel_epoch),
+                    GET_COUNTER(meta->version) + 1);
                 
                 // 注意：这里不需要广播 Diff，因为 Prophet 的设计假设是
                 // 发送端已经广播了 RPC 指令，所有节点都会执行这个操作。
@@ -1126,7 +1327,11 @@ static void handle_kernel_rpc_batch(void *payload, uint32_t payload_len) {
  * [关键逻辑] 1. 执行强制 CRC32 完整性校验；2. 识别消息类型并根据优先级分发给 Prophet 引擎或逻辑核心。
  * [后果] 这是内核驱动的防火墙。它确保了只有格式正确、且未被篡改的数据包能接触到 Guest 的物理内存。
  */
-static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_ip) {
+static void internal_process_single_packet(
+    struct wvm_kernel_context *context, struct wvm_header *hdr,
+    uint32_t src_ip) {
+    struct wvm_kernel_transport *transport =
+        context ? context->transport : NULL;
     // 1. [V29 新增] CRC32 强校验
     // 这是 V28 没有的。如果不加，V29 的高可靠性就是空谈。
     uint32_t pkt_len = sizeof(struct wvm_header) + ntohs(hdr->payload_len);
@@ -1153,19 +1358,22 @@ static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_
         struct sockaddr_in s_addr = {
             .sin_family = AF_INET,
             .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-            .sin_port = htons(local_slave_port)
+            .sin_port = htons(transport ? transport->local_slave_port : 0)
         };
         struct msghdr msg = { .msg_name = &s_addr, .msg_namelen = sizeof(s_addr), .msg_flags = MSG_DONTWAIT };
         struct kvec vec = { .iov_base = hdr, .iov_len = pkt_len };
-        kernel_sendmsg(g_socket, &msg, &vec, 1, pkt_len); // 内核直发 Loopback
+        if (transport && transport->socket && s_addr.sin_port != 0)
+            kernel_sendmsg(transport->socket, &msg, &vec, 1, pkt_len);
         return;
     }
 
     // 4. 拦截物理中断包
     // Logic Core 无法处理此消息，必须在内核层直接唤醒 QEMU 等待队列
     if (type == MSG_VFIO_IRQ) {
-        atomic_set(&g_irq_pending, 1);
-        wake_up_interruptible(&g_irq_wait_queue);
+        if (!context)
+            return;
+        atomic_set(&context->irq_pending, 1);
+        wake_up_interruptible(&context->irq_wait_queue);
         return; 
     }
 
@@ -1187,9 +1395,12 @@ static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_
     // 7. [V28 继承] 处理 ACK (唤醒等待线程)
     if (type == MSG_MEM_ACK || type == MSG_VCPU_EXIT) {
         uint64_t rid = WVM_NTOHLL(hdr->req_id);
+        if (!context)
+            return;
         uint32_t combined_idx = (uint32_t)(rid & 0xFFFFFFFF);
-        if ((size_t)combined_idx < g_req_ctx_count) {
-            struct req_ctx_t *ctx = &g_req_ctx[combined_idx];
+        if (context->req_ctx &&
+            (size_t)combined_idx < context->req_ctx_count) {
+            struct req_ctx_t *ctx = &context->req_ctx[combined_idx];
             // 检查 Generation 防止 ABA
             if ((rid >> 32) == ctx->generation) {
                 if (ctx->rx_buffer) {
@@ -1219,7 +1430,12 @@ static void internal_process_single_packet(struct wvm_header *hdr, uint32_t src_
  * [后果] 配合 Gateway 的聚合逻辑，它在内核态实现了“多包合一”的高效处理，极大地减轻了 CPU 软中断的负荷。
  */
 static void wavevm_udp_data_ready(struct sock *sk) {
+    struct wvm_kernel_context *context =
+        sk ? (struct wvm_kernel_context *)sk->sk_user_data : NULL;
     struct sk_buff *skb;
+
+    if (!context)
+        return;
     while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
         // 1. 线性化：确保 skb->data 是连续内存，方便指针操作
         if (skb_is_nonlinear(skb) && skb_linearize(skb) != 0) { 
@@ -1246,7 +1462,7 @@ static void wavevm_udp_data_ready(struct sock *sk) {
             if (offset + pkt_len > total_len) break;
 
             // 调用单包处理逻辑 (注意：该函数内部已包含 CRC 校验)
-            internal_process_single_packet(hdr, src_ip);
+            internal_process_single_packet(context, hdr, src_ip);
 
             // 3. 指针后移
             offset += pkt_len;
@@ -1262,13 +1478,15 @@ static void wavevm_udp_data_ready(struct sock *sk) {
  * [后果] 实现了真正的“硬件级失效”。当 Guest 下一次访问该地址时，硬件会产生 EPT 违例并陷入内核，保证不会读到旧数据。
  */
 static void k_invalidate_local(uint64_t gpa) {
+    struct wvm_kernel_context *context = wvm_active_context();
+
     // 1. 先从内核元数据索引中删除（防止新的 Push 进来）
-    k_invalidate_meta_atomic(gpa);
+    k_invalidate_meta_atomic(context, gpa);
     
     // 2. [关键] 必须调用这个！触发 unmap_mapping_range
     // 这会强制撤销 Guest 的物理页映射，并冲刷 TLB
     // 由于此函数可能在软中断上下文，必须走 Workqueue 异步执行
-    schedule_async_unmap(gpa);
+    schedule_async_unmap(context, gpa);
     
     k_log("[Consistency] Invalidate hardware mapping for GPA: %llx", gpa);
 }
@@ -1297,32 +1515,268 @@ static struct dsm_driver_ops k_ops = {
     .send_packet_async = k_send_packet_async
 };
 
+static int wvm_bytes_nonzero(const uint8_t *bytes, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        if (bytes[i] != 0) return 1;
+    }
+    return 0;
+}
+
+static void wvm_context_identity_from_ioctl(
+    struct wvm_kernel_context_identity *identity,
+    const struct wvm_ioctl_context_bind *request)
+{
+    memset(identity, 0, sizeof(*identity));
+    identity->vm_id = request->vm_id;
+    identity->physical_node_id = request->physical_node_id;
+    identity->vm_incarnation = request->vm_incarnation;
+    identity->manifest_generation = request->manifest_generation;
+    memcpy(identity->candidate_manifest_digest,
+           request->candidate_manifest_digest,
+           sizeof(identity->candidate_manifest_digest));
+    memcpy(identity->capability_profile_digest,
+           request->capability_profile_digest,
+           sizeof(identity->capability_profile_digest));
+    memcpy(identity->activation_fence, request->activation_fence,
+           sizeof(identity->activation_fence));
+    identity->route_snapshot_key = request->route_snapshot_key;
+}
+
+static int wvm_context_identity_equal(
+    const struct wvm_kernel_context_identity *left,
+    const struct wvm_kernel_context_identity *right)
+{
+    return left->vm_id == right->vm_id &&
+           left->physical_node_id == right->physical_node_id &&
+           left->vm_incarnation == right->vm_incarnation &&
+           left->manifest_generation == right->manifest_generation &&
+           memcmp(left->candidate_manifest_digest,
+                  right->candidate_manifest_digest,
+                  sizeof(left->candidate_manifest_digest)) == 0 &&
+           memcmp(left->capability_profile_digest,
+                  right->capability_profile_digest,
+                  sizeof(left->capability_profile_digest)) == 0 &&
+           memcmp(left->activation_fence, right->activation_fence,
+                  sizeof(left->activation_fence)) == 0 &&
+           left->route_snapshot_key.scope_key.vm_id ==
+               right->route_snapshot_key.scope_key.vm_id &&
+           left->route_snapshot_key.scope_key.vm_incarnation ==
+               right->route_snapshot_key.scope_key.vm_incarnation &&
+           left->route_snapshot_key.scope_key.route_scope_id ==
+               right->route_snapshot_key.scope_key.route_scope_id &&
+           left->route_snapshot_key.topology_revision ==
+               right->route_snapshot_key.topology_revision &&
+           left->route_snapshot_key.route_generation ==
+               right->route_snapshot_key.route_generation &&
+           memcmp(left->route_snapshot_key.snapshot_digest,
+                  right->route_snapshot_key.snapshot_digest,
+                  sizeof(left->route_snapshot_key.snapshot_digest)) == 0;
+}
+
+static int wvm_context_request_valid(
+    const struct wvm_ioctl_context_bind *request)
+{
+    if (!request ||
+        request->magic != WVM_KERNEL_CONTEXT_MAGIC ||
+        request->version != WVM_KERNEL_CONTEXT_ABI_VERSION ||
+        request->vm_id == 0 ||
+        request->vm_id > 0xffU ||
+        request->vm_incarnation == 0 ||
+        request->manifest_generation == 0 ||
+        !wvm_bytes_nonzero(request->candidate_manifest_digest,
+                           WVM_KERNEL_DIGEST_BYTES) ||
+        !wvm_bytes_nonzero(request->capability_profile_digest,
+                           WVM_KERNEL_DIGEST_BYTES) ||
+        !wvm_bytes_nonzero(request->activation_fence,
+                           WVM_KERNEL_FENCE_BYTES) ||
+        request->route_snapshot_key.scope_key.vm_id != request->vm_id ||
+        request->route_snapshot_key.scope_key.vm_incarnation !=
+            request->vm_incarnation ||
+        request->route_snapshot_key.scope_key.route_scope_id == 0 ||
+        request->route_snapshot_key.topology_revision == 0 ||
+        request->route_snapshot_key.route_generation == 0 ||
+        !wvm_bytes_nonzero(request->route_snapshot_key.snapshot_digest,
+                           WVM_KERNEL_DIGEST_BYTES)) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int wvm_context_bind_file(
+    struct wvm_kernel_file_context *file_context,
+    const struct wvm_ioctl_context_bind *request)
+{
+    struct wvm_kernel_context_identity identity;
+    struct wvm_route_snapshot_key route_key;
+    int result = 0;
+
+    if (!file_context || wvm_context_request_valid(request) != 0) {
+        return -EINVAL;
+    }
+    wvm_context_identity_from_ioctl(&identity, request);
+    if (identity.route_snapshot_key.scope_key.vm_id != identity.vm_id ||
+        identity.route_snapshot_key.scope_key.vm_incarnation !=
+            identity.vm_incarnation) {
+        return -EINVAL;
+    }
+    memset(&route_key, 0, sizeof(route_key));
+    route_key.scope_key.vm_id = request->route_snapshot_key.scope_key.vm_id;
+    route_key.scope_key.vm_incarnation =
+        request->route_snapshot_key.scope_key.vm_incarnation;
+    route_key.scope_key.route_scope_id =
+        request->route_snapshot_key.scope_key.route_scope_id;
+    route_key.topology_revision = request->route_snapshot_key.topology_revision;
+    route_key.route_generation = request->route_snapshot_key.route_generation;
+    memcpy(route_key.snapshot_digest, request->route_snapshot_key.snapshot_digest,
+           sizeof(route_key.snapshot_digest));
+
+    mutex_lock(&g_context_mutex);
+    if (file_context->bound) {
+        result = wvm_context_identity_equal(&file_context->identity,
+                                            &identity) ? 0 : -EBUSY;
+        mutex_unlock(&g_context_mutex);
+        return result;
+    }
+    if (g_kernel_context.active &&
+        !wvm_context_identity_equal(&g_kernel_context.identity, &identity)) {
+        mutex_unlock(&g_context_mutex);
+        return -EBUSY;
+    }
+    if (!g_kernel_context.active) {
+        if (wvm_logic_bind_route_snapshot(&route_key) != 0) {
+            mutex_unlock(&g_context_mutex);
+            return -EINVAL;
+        }
+        g_kernel_context.identity = identity;
+        g_kernel_context.active = 1;
+    }
+    file_context->context = &g_kernel_context;
+    file_context->identity = identity;
+    file_context->bound = 1;
+    WRITE_ONCE(g_my_vm_id, (uint8_t)identity.vm_id);
+    atomic_inc(&g_kernel_context.refs);
+    mutex_unlock(&g_context_mutex);
+    return 0;
+}
+
+static int wvm_context_unbind_file(
+    struct wvm_kernel_file_context *file_context,
+    const struct wvm_ioctl_context_bind *request)
+{
+    struct wvm_kernel_context_identity identity;
+    int result = 0;
+
+    if (!file_context || !file_context->bound) return 0;
+    if (request) {
+        if (wvm_context_request_valid(request) != 0) return -EINVAL;
+        wvm_context_identity_from_ioctl(&identity, request);
+        if (!wvm_context_identity_equal(&file_context->identity, &identity))
+            return -EPERM;
+    }
+
+    mutex_lock(&g_context_mutex);
+    file_context->bound = 0;
+    memset(&file_context->identity, 0, sizeof(file_context->identity));
+    file_context->context = NULL;
+    if (atomic_dec_and_test(&g_kernel_context.refs)) {
+        g_kernel_context.active = 0;
+        memset(&g_kernel_context.identity, 0,
+               sizeof(g_kernel_context.identity));
+        wvm_logic_unbind_route_snapshot();
+        WRITE_ONCE(g_my_vm_id, 0);
+    }
+    mutex_unlock(&g_context_mutex);
+    return result;
+}
+
+static int wvm_context_accepts_vm_id(uint8_t vm_id)
+{
+    int result = 0;
+
+    mutex_lock(&g_context_mutex);
+    if (g_kernel_context.active &&
+        g_kernel_context.identity.vm_id != vm_id)
+        result = -EPERM;
+    mutex_unlock(&g_context_mutex);
+    return result;
+}
+
 // [V29] 存储全局 mapping 以便 unmap 使用
 static int wvm_open(struct inode *inode, struct file *filp) {
-    g_mapping = inode->i_mapping;
+    struct wvm_kernel_file_context *file_context;
+
+    (void)inode;
+    file_context = kzalloc(sizeof(*file_context), GFP_KERNEL);
+    if (!file_context) return -ENOMEM;
+    filp->private_data = file_context;
     return 0;
 }
 
 static int wvm_release(struct inode *inode, struct file *filp) {
-    // 当 QEMU 进程被杀或退出时，VMA 映射(mapping)即将失效。
-    // 必须立刻将全局指针置空，防止正在 Workqueue 中排队的 unmap 任务访问野指针。
-    down_write(&g_mapping_sem); // 写锁
-    g_mapping = NULL;
-    up_write(&g_mapping_sem);
-    
+    struct wvm_kernel_file_context *file_context = filp->private_data;
+    struct wvm_kernel_context *context =
+        wvm_context_for_file(file_context);
+    struct address_space *mapping = file_context ? file_context->mapping : NULL;
+
+    (void)inode;
+    if (mapping) {
+        down_write(&context->mapping_sem);
+        if (context->mapping == mapping)
+            context->mapping = NULL;
+        up_write(&context->mapping_sem);
+    }
+    wvm_context_unbind_file(file_context, NULL);
+    kfree(file_context);
+    filp->private_data = NULL;
+
     return 0;
 }
 
 static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     void __user *argp = (void __user *)arg;
+    struct wvm_kernel_file_context *file_context = filp->private_data;
+
     switch (cmd) {
+    case IOCTL_WVM_BIND_CONTEXT: {
+        struct wvm_ioctl_context_bind request;
+
+        if (copy_from_user(&request, argp, sizeof(request)))
+            return -EFAULT;
+        return wvm_context_bind_file(file_context, &request);
+    }
+    case IOCTL_WVM_UNBIND_CONTEXT: {
+        struct wvm_ioctl_context_bind request;
+
+        if (copy_from_user(&request, argp, sizeof(request)))
+            return -EFAULT;
+        return wvm_context_unbind_file(file_context, &request);
+    }
+    case IOCTL_WVM_QUERY_CAPS: {
+        struct wvm_ioctl_context_caps caps;
+
+        memset(&caps, 0, sizeof(caps));
+        caps.magic = WVM_KERNEL_CONTEXT_MAGIC;
+        caps.version = WVM_KERNEL_CONTEXT_ABI_VERSION;
+        caps.max_concurrent_contexts = 1;
+        caps.active_contexts = READ_ONCE(g_kernel_context.active) ? 1U : 0U;
+        caps.feature_bits = WVM_KERNEL_CAP_CONTEXT_BIND |
+                            WVM_KERNEL_CAP_SINGLE_CONTEXT;
+        if (copy_to_user(argp, &caps, sizeof(caps)))
+            return -EFAULT;
+        return 0;
+    }
     case IOCTL_SET_GATEWAY: {
         struct wvm_ioctl_gateway gw;
+        struct wvm_kernel_transport *transport =
+            wvm_context_for_file(file_context)->transport;
         if (copy_from_user(&gw, argp, sizeof(gw))) return -EFAULT;
-        if (gw.gw_id < WVM_MAX_GATEWAYS) {
-            gateway_table[gw.gw_id].sin_family = AF_INET;
-            gateway_table[gw.gw_id].sin_addr.s_addr = gw.ip;
-            gateway_table[gw.gw_id].sin_port = gw.port;
+        if (transport && gw.gw_id < WVM_MAX_GATEWAYS) {
+            transport->gateway_table[gw.gw_id].sin_family = AF_INET;
+            transport->gateway_table[gw.gw_id].sin_addr.s_addr = gw.ip;
+            transport->gateway_table[gw.gw_id].sin_port = gw.port;
         }
         break;
     }
@@ -1364,9 +1818,13 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         break;
     }
     case IOCTL_WAIT_IRQ: {
-        if (wait_event_interruptible(g_irq_wait_queue, atomic_read(&g_irq_pending) != 0))
+        struct wvm_kernel_context *context =
+            wvm_context_for_file(file_context);
+
+        if (wait_event_interruptible(context->irq_wait_queue,
+                                     atomic_read(&context->irq_pending) != 0))
             return -ERESTARTSYS;
-        atomic_set(&g_irq_pending, 0);
+        atomic_set(&context->irq_pending, 0);
         uint32_t irq = 16; 
         if (copy_to_user(argp, &irq, sizeof(irq))) return -EFAULT;
         break;
@@ -1375,7 +1833,7 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     case IOCTL_SET_MEM_LAYOUT: {
         struct wvm_ioctl_mem_layout layout;
         if (copy_from_user(&layout, argp, sizeof(layout))) return -EFAULT;
-        return wvm_set_mem_layout(&layout);
+        return wvm_set_mem_layout(wvm_context_for_file(file_context), &layout);
     }
 
     case IOCTL_UPDATE_MEM_ROUTE: {
@@ -1444,7 +1902,9 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         uint8_t vm_id;
 
         if (copy_from_user(&vm_id, argp, sizeof(vm_id))) return -EFAULT;
-        g_my_vm_id = vm_id;
+        if (wvm_context_accepts_vm_id(vm_id) != 0) return -EPERM;
+        WRITE_ONCE(g_kernel_context.identity.vm_id, vm_id);
+        WRITE_ONCE(g_my_vm_id, vm_id);
         break;
     }
 
@@ -1453,8 +1913,9 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
         uint32_t new_epoch;
         if (copy_from_user(&new_epoch, (void __user *)arg, sizeof(uint32_t)))
             return -EFAULT;
-        g_kernel_epoch = new_epoch;
-        // printk(KERN_INFO "[WVM] Kernel Epoch updated to %u\n", g_kernel_epoch);
+        WRITE_ONCE(wvm_context_for_file(file_context)->kernel_epoch,
+                   new_epoch);
+        // printk(KERN_INFO "[WVM] Kernel Epoch updated to %u\n", new_epoch);
         break;
     }
 
@@ -1495,15 +1956,21 @@ static const struct vm_operations_struct wvm_vm_ops = {
 };
 
 static int wvm_mmap(struct file *filp, struct vm_area_struct *vma) {
+    struct wvm_kernel_file_context *file_context = filp->private_data;
+    struct wvm_kernel_context *context =
+        wvm_context_for_file(file_context);
+
     vma->vm_ops = &wvm_vm_ops;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
     vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 #else
     vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 #endif
-    down_write(&g_mapping_sem);
-    g_mapping = vma->vm_file->f_mapping; 
-    up_write(&g_mapping_sem);
+    down_write(&context->mapping_sem);
+    context->mapping = vma->vm_file->f_mapping;
+    up_write(&context->mapping_sem);
+    if (file_context)
+        file_context->mapping = vma->vm_file->f_mapping;
     return 0;
 }
 
@@ -1524,12 +1991,25 @@ static struct miscdevice wvm_misc = {
 static int __init wavevm_init(void) {
     int cpu;
     struct sockaddr_in bind_addr;
+    struct wvm_kernel_transport *transport;
 
-    init_waitqueue_head(&g_irq_wait_queue);
-    init_waitqueue_head(&g_tx_wq);
-    init_waitqueue_head(&g_diff_wq); // [V29] Init diff waiter
-    spin_lock_init(&g_diff_lock);
-    init_rwsem(&g_mapping_sem);
+    memset(&g_kernel_context, 0, sizeof(g_kernel_context));
+    transport = kzalloc(sizeof(*transport), GFP_KERNEL);
+    if (!transport)
+        return -ENOMEM;
+    transport->service_port = module_service_port;
+    transport->local_slave_port = module_local_slave_port;
+    INIT_LIST_HEAD(&transport->diff_queue);
+    spin_lock_init(&transport->diff_lock);
+    g_kernel_context.transport = transport;
+    atomic_set(&g_kernel_context.refs, 0);
+    atomic_set(&g_kernel_context.irq_pending, 0);
+    init_waitqueue_head(&g_kernel_context.irq_wait_queue);
+    INIT_RADIX_TREE(&g_kernel_context.page_tree, GFP_ATOMIC);
+    spin_lock_init(&g_kernel_context.page_tree_lock);
+    init_waitqueue_head(&transport->tx_wq);
+    init_waitqueue_head(&transport->diff_wq); // [V29] Init diff waiter
+    init_rwsem(&g_kernel_context.mapping_sem);
 
     /*
      * [FIX] 必须用 nr_cpu_ids 而非 num_online_cpus()。
@@ -1537,13 +2017,28 @@ static int __init wavevm_init(void) {
      * num_online_cpus()=4 但 get_cpu() 可能返回 5，导致 combined_idx 越界。
      * nr_cpu_ids 是内核保证的最大 CPU ID + 1，覆盖所有可能的 get_cpu() 返回值。
      */
-    g_req_ctx_count = (size_t)nr_cpu_ids * (size_t)MAX_IDS_PER_CPU;
-    g_req_ctx = vzalloc(sizeof(struct req_ctx_t) * g_req_ctx_count);
-    if (!g_req_ctx) return -ENOMEM;
-    for (size_t i = 0; i < g_req_ctx_count; i++) init_waitqueue_head(&g_req_ctx[i].wq);
+    /*
+     * Runtime-sized: nr_cpu_ids * MAX_IDS_PER_CPU. The original fixed sizing
+     * (1024 * 65536) is too large for most test environments and can stall
+     * insmod. The request namespace belongs to the active kernel context.
+     */
+    g_kernel_context.req_ctx_count =
+        (size_t)nr_cpu_ids * (size_t)MAX_IDS_PER_CPU;
+    g_kernel_context.req_ctx =
+        vzalloc(sizeof(struct req_ctx_t) * g_kernel_context.req_ctx_count);
+    if (!g_kernel_context.req_ctx)
+        goto fail_transport;
+    for (size_t i = 0; i < g_kernel_context.req_ctx_count; i++)
+        init_waitqueue_head(&g_kernel_context.req_ctx[i].wq);
+
+    g_kernel_context.id_pool = alloc_percpu(struct id_pool_t);
+    if (!g_kernel_context.id_pool) {
+        goto fail_context_allocations;
+    }
 
     for_each_online_cpu(cpu) {
-        struct id_pool_t *pool = per_cpu_ptr(&g_id_pool, cpu);
+        struct id_pool_t *pool =
+            per_cpu_ptr(g_kernel_context.id_pool, cpu);
         spin_lock_init(&pool->lock);
         pool->ids = vzalloc(sizeof(uint32_t) * MAX_IDS_PER_CPU);
         pool->head = 0; pool->tail = MAX_IDS_PER_CPU;
@@ -1553,41 +2048,83 @@ static int __init wavevm_init(void) {
     size_t slab_size = sizeof(struct wvm_header) + 4096 + sizeof(struct wvm_mem_ack_payload);
     wvm_pkt_cache = kmem_cache_create("wvm_data", slab_size, 0, SLAB_HWCACHE_ALIGN, NULL);
 
-    init_ring(&g_fast_ring);
-    init_ring(&g_slow_ring);
+    if (init_ring(&transport->fast_ring) != 0 ||
+        init_ring(&transport->slow_ring) != 0)
+        goto fail_context_allocations;
 
-    g_tx_thread = kthread_run(tx_worker_thread_fn, NULL, "wavevm_qos_tx");
+    transport->tx_thread =
+        kthread_run(tx_worker_thread_fn, &g_kernel_context, "wavevm_qos_tx");
+    if (IS_ERR(transport->tx_thread)) {
+        transport->tx_thread = NULL;
+        goto fail_context_allocations;
+    }
     
     // [V29] 启动 Diff 提交线程
-    g_committer_thread = kthread_run(committer_thread_fn, NULL, "wvm_diff_commit");
+    transport->committer_thread =
+        kthread_run(committer_thread_fn, &g_kernel_context, "wvm_diff_commit");
+    if (IS_ERR(transport->committer_thread)) {
+        transport->committer_thread = NULL;
+        goto fail_context_allocations;
+    }
 
-    if (wvm_core_init(&k_ops, 1) != 0) return -ENOMEM;
+    if (wvm_core_init(&k_ops, 1) != 0)
+        goto fail_context_allocations;
 
-    if (misc_register(&wvm_misc)) return -ENODEV;
-    if (sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP, &g_socket) < 0) return -EIO;
+    if (misc_register(&wvm_misc))
+        goto fail_context_allocations;
+    if (sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+                         &transport->socket) < 0)
+        goto fail_misc;
 
     memset(&bind_addr, 0, sizeof(bind_addr));
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind_addr.sin_port = htons(service_port);
+    bind_addr.sin_port = htons(transport->service_port);
     /*
      * kernel_bind() changed its typed sockaddr parameter in newer kernels.
      * The concrete object is always sockaddr_in; void * preserves source
      * compatibility with both the old sockaddr and new sockaddr_unsized APIs.
      */
-    kernel_bind(g_socket, (void *)&bind_addr, sizeof(bind_addr));
-    g_socket->sk->sk_data_ready = wavevm_udp_data_ready;
+    kernel_bind(transport->socket, (void *)&bind_addr, sizeof(bind_addr));
+    transport->socket->sk->sk_user_data = &g_kernel_context;
+    transport->socket->sk->sk_data_ready = wavevm_udp_data_ready;
 
     k_log("WaveVM V29.5 'Wavelet' Kernel Backend Loaded (Mode A Active).");
     return 0;
+
+fail_misc:
+    misc_deregister(&wvm_misc);
+fail_context_allocations:
+    wvm_transport_stop(transport);
+    for_each_possible_cpu(cpu) {
+        struct id_pool_t *pool =
+            g_kernel_context.id_pool
+                ? per_cpu_ptr(g_kernel_context.id_pool, cpu)
+                : NULL;
+        if (pool && pool->ids) {
+            vfree(pool->ids);
+            pool->ids = NULL;
+        }
+    }
+    if (g_kernel_context.id_pool) {
+        free_percpu(g_kernel_context.id_pool);
+        g_kernel_context.id_pool = NULL;
+    }
+    vfree(g_kernel_context.req_ctx);
+    g_kernel_context.req_ctx = NULL;
+    g_kernel_context.req_ctx_count = 0;
+fail_transport:
+    g_kernel_context.transport = NULL;
+    kfree(transport);
+    return -ENOMEM;
 }
 
 static void __exit wavevm_exit(void) {
     int cpu;
+    struct wvm_kernel_transport *transport = g_kernel_context.transport;
     
     // 1. 先停掉所有自产的内核线程
-    if (g_tx_thread) kthread_stop(g_tx_thread);
-    if (g_committer_thread) kthread_stop(g_committer_thread);
+    wvm_transport_stop(transport);
     
     // 2. 刷新系统工作队列 (Workqueue Flush)
     // 确保所有 schedule_async_unmap 扔出去的任务都已执行完毕。
@@ -1599,19 +2136,22 @@ static void __exit wavevm_exit(void) {
     rcu_barrier(); 
 
     // 4. 释放其余资源
-    if (g_fast_ring.slots) vfree(g_fast_ring.slots);
-    if (g_slow_ring.slots) vfree(g_slow_ring.slots);
-
-    if (g_socket) { g_socket->sk->sk_data_ready = NULL; sock_release(g_socket); }
     misc_deregister(&wvm_misc);
     
     for_each_possible_cpu(cpu) {
-        struct id_pool_t *pool = per_cpu_ptr(&g_id_pool, cpu);
-        if (pool->ids) vfree(pool->ids);
+        struct id_pool_t *pool =
+            g_kernel_context.id_pool
+                ? per_cpu_ptr(g_kernel_context.id_pool, cpu)
+                : NULL;
+        if (pool && pool->ids) vfree(pool->ids);
     }
-    vfree(g_req_ctx);
+    if (g_kernel_context.id_pool)
+        free_percpu(g_kernel_context.id_pool);
+    vfree(g_kernel_context.req_ctx);
     // [FIX-M4] 销毁 slab 缓存，防止模块卸载后内存泄漏
     if (wvm_pkt_cache) kmem_cache_destroy(wvm_pkt_cache);
+    g_kernel_context.transport = NULL;
+    kfree(transport);
 }
 
 module_init(wavevm_init);

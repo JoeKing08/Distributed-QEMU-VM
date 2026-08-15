@@ -37,6 +37,7 @@
 #include "../../../common_include/wavevm_protocol.h"
 #include "../../../common_include/wavevm_ioctl.h"
 #include "wavevm-accel.h"
+#include "wavevm-runtime-registration.h"
 
 // 引用相关模块
 extern void wavevm_user_mem_init(void *ram_ptr, size_t ram_size);
@@ -1167,7 +1168,8 @@ static bool wavevm_allowed = true;
 static int connect_to_master_helper_role(uint32_t role);
 
 static int connect_to_master_helper(void) {
-    return connect_to_master_helper_role(0);
+    return connect_to_master_helper_role(
+        wavevm_qemu_runtime_gate_enabled() ? WVM_IPC_ROLE_SYNC : 0);
 }
 
 static int connect_to_master_helper_role(uint32_t role) {
@@ -1192,12 +1194,27 @@ static int connect_to_master_helper_role(uint32_t role) {
     }
 
     if (role != 0) {
-        struct wvm_ipc_header_t reg_hdr = {
-            .type = WVM_IPC_TYPE_REGISTER,
-            .len = sizeof(role),
-        };
+        struct wvm_ipc_runtime_registration registration;
+        const void *payload = &role;
+        size_t payload_size = sizeof(role);
+        wvm_ipc_header_t reg_hdr;
+
+        if (wavevm_qemu_runtime_gate_enabled()) {
+            if (wavevm_qemu_fill_runtime_registration((uint16_t)role,
+                                                      &registration) != 0) {
+                fprintf(stderr,
+                        "[WVM] runtime gate active but QEMU registration "
+                        "identity is incomplete\n");
+                close(sock);
+                return -1;
+            }
+            payload = &registration;
+            payload_size = sizeof(registration);
+        }
+        reg_hdr.type = WVM_IPC_TYPE_REGISTER;
+        reg_hdr.len = (uint32_t)payload_size;
         if (write_all(sock, &reg_hdr, sizeof(reg_hdr)) < 0 ||
-            write_all(sock, &role, sizeof(role)) < 0) {
+            write_all(sock, payload, payload_size) < 0) {
             close(sock);
             return -1;
         }
@@ -1601,9 +1618,30 @@ static void *wavevm_slave_net_thread(void *arg) {
 }
 
 static int wavevm_init_machine_kernel(WaveVMAccelState *s, MachineState *ms) {
+    struct wvm_ioctl_context_caps caps;
     fprintf(stderr, "[WaveVM-QEMU] KERNEL MODE: Connecting to /dev/wavevm...\n");
     s->dev_fd = open("/dev/wavevm", O_RDWR);
     if (s->dev_fd < 0) return -errno;
+    if (wavevm_qemu_query_kernel_caps(s->dev_fd, &caps) < 0) {
+        fprintf(stderr,
+                "[WaveVM-QEMU] /dev/wavevm lacks the required context-bound "
+                "accelerator ABI\n");
+        close(s->dev_fd);
+        s->dev_fd = -1;
+        return -ENOTSUP;
+    }
+    {
+        int bind_result = wavevm_qemu_bind_kernel_context(s->dev_fd);
+        if (bind_result < 0) {
+            fprintf(stderr,
+                    "[WaveVM-QEMU] manifest-bound kernel context bind "
+                    "failed: %s\n",
+                    strerror(-bind_result));
+            close(s->dev_fd);
+            s->dev_fd = -1;
+            return bind_result;
+        }
+    }
     wavevm_setup_memory_region(ms->ram, ms->ram_size, s->dev_fd);
     // 启动线程
     qemu_thread_create(&s->irq_thread, "wvm-k-irq", wavevm_kernel_irq_thread, s, QEMU_THREAD_DETACHED);
@@ -1796,7 +1834,7 @@ static MemoryListener wavevm_mem_listener = {
 
 static int wavevm_init_machine(MachineState *ms) {
     WaveVMAccelState *s = WAVEVM_ACCEL(ms->accelerator);
-    bool has_wvm_dev = (access("/dev/wavevm", R_OK | W_OK) == 0);
+    bool has_wvm_dev = wavevm_qemu_kernel_accel_usable();
     const char *disable_auto_kvm = getenv("WVM_DISABLE_AUTO_KVM");
     bool auto_kvm_enabled = !(disable_auto_kvm && atoi(disable_auto_kvm) == 1);
     char *role = getenv("WVM_ROLE");

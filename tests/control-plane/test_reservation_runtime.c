@@ -1,0 +1,138 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "wavevm_reservation_runtime.h"
+
+static int expect(int condition, const char *message)
+{
+    if (!condition) {
+        fprintf(stderr, "reservation-runtime test: %s\n", message);
+        return -1;
+    }
+    return 0;
+}
+
+static void fill_id(uint8_t id[WVM_IDENTITY_ID_BYTES], uint8_t value)
+{
+    memset(id, 0, WVM_IDENTITY_ID_BYTES);
+    id[WVM_IDENTITY_ID_BYTES - 1] = value;
+}
+
+static void fill_reservation(struct wvm_resource_reservation *reservation,
+                             uint8_t id, uint32_t node_id)
+{
+    memset(reservation, 0, sizeof(*reservation));
+    fill_id(reservation->reservation_id, id);
+    fill_id(reservation->plan_digest, id + 10);
+    fill_id(reservation->candidate_manifest_digest, id + 20);
+    fill_id(reservation->admission_tx_id, id + 30);
+    fill_id(reservation->eligibility_fence_digest, id + 40);
+    reservation->vm_id = 100 + id;
+    reservation->vm_incarnation = 1;
+    reservation->physical_node_id = node_id;
+    reservation->node_instance_id = 9;
+    reservation->inventory_revision = 4;
+    reservation->guest_vcpu_slots = 2;
+    reservation->guest_memory_bytes = 4096;
+    reservation->overhead_memory_bytes = 4096;
+    reservation->state = WVM_RESERVATION_PREPARED;
+    reservation->exclusive_leases.count = 1;
+    reservation->exclusive_leases.capacity = 1;
+}
+
+int main(void)
+{
+    struct wvm_admission_node node;
+    struct wvm_resource_reservation stored[4];
+    struct wvm_resource_reservation first;
+    struct wvm_resource_reservation conflicting;
+    struct wvm_exclusive_lease first_lease;
+    struct wvm_exclusive_lease conflict_lease;
+    struct wvm_local_reservation_registry registry;
+    struct wvm_activation_record activation;
+    enum wvm_reservation_runtime_result result;
+    char error[256] = {0};
+
+    memset(&node, 0, sizeof(node));
+    node.physical_node_id = 17;
+    node.node_instance_id = 9;
+    node.inventory_revision = 4;
+    node.allocatable_vcpu_slots = 4;
+    node.allocatable_memory_bytes = 16384;
+
+    memset(&first_lease, 0, sizeof(first_lease));
+    first_lease.lease_kind = 1;
+    first_lease.lease_generation = 1;
+    strcpy(first_lease.lease_name, "vm-101-qemu");
+    fill_reservation(&first, 1, 17);
+    first.exclusive_leases.entries = &first_lease;
+    first.has_prepared_expiry = 1;
+    first.prepared_expiry_unix_time_ms = 10;
+
+    memset(&conflict_lease, 0, sizeof(conflict_lease));
+    conflict_lease.lease_kind = 1;
+    conflict_lease.lease_generation = 1;
+    strcpy(conflict_lease.lease_name, "vm-101-qemu");
+    fill_reservation(&conflicting, 2, 17);
+    conflicting.exclusive_leases.entries = &conflict_lease;
+    conflicting.has_prepared_expiry = 1;
+    conflicting.prepared_expiry_unix_time_ms = 20;
+
+    if (expect(wvm_local_reservation_registry_init(
+                   &registry, &node, stored, 4, error, sizeof(error)) == 0,
+               "initialize registry") ||
+        expect(wvm_local_reservation_prepare(
+                   &registry, &first, &result, error, sizeof(error)) == 0 &&
+                   result == WVM_RESERVATION_RUNTIME_NEW,
+               "prepare first reservation") ||
+        expect(wvm_local_reservation_prepare(
+                   &registry, &first, &result, error, sizeof(error)) == 0 &&
+                   result == WVM_RESERVATION_RUNTIME_REPLAY,
+               "replay identical prepare") ||
+        expect(wvm_local_reservation_prepare(
+                   &registry, &conflicting, &result, error, sizeof(error)) != 0,
+               "reject conflicting lease")) {
+        wvm_local_reservation_registry_destroy(&registry);
+        return 1;
+    }
+
+    memset(&activation, 0, sizeof(activation));
+    fill_id(activation.admission_tx_id, 31);
+    fill_id(activation.candidate_manifest_digest, 21);
+    fill_id(activation.activation_fence, 41);
+    activation.coordinator_instance_id = 1;
+    fill_id(activation.required_participant_set_digest, 51);
+    activation.decision = WVM_ACTIVATION_ACTIVATE;
+    activation.durable_decision_sequence = 1;
+    activation.decided_at = 1;
+    {
+        struct wvm_route_snapshot_key route_key;
+
+        memset(&route_key, 0, sizeof(route_key));
+        route_key.scope_key.vm_id = first.vm_id;
+        route_key.scope_key.vm_incarnation = first.vm_incarnation;
+        route_key.scope_key.route_scope_id = 1;
+        route_key.topology_revision = 1;
+        route_key.route_generation = 1;
+        memset(route_key.snapshot_digest, 1, sizeof(route_key.snapshot_digest));
+        activation.required_route_snapshot_keys = &route_key;
+        activation.required_route_snapshot_count = 1;
+        activation.required_route_snapshot_capacity = 1;
+        if (expect(wvm_local_reservation_commit(
+                       &registry, first.reservation_id, &activation, &result,
+                       error, sizeof(error)) != 0,
+                   "reject mismatched activation") ||
+            expect(wvm_local_reservation_abort(
+                       &registry, first.reservation_id, &result, error,
+                       sizeof(error)) == 0,
+                   "abort prepared reservation") ||
+            expect(wvm_local_reservation_reap_expired(&registry, 100) == 0,
+                   "do not reap released reservation")) {
+            wvm_local_reservation_registry_destroy(&registry);
+            return 1;
+        }
+    }
+    wvm_local_reservation_registry_destroy(&registry);
+    puts("reservation-runtime tests: PASS");
+    return 0;
+}

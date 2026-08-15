@@ -50,4 +50,60 @@ struct wvm_ioctl_mem_layout {
 /* Keep the kernel Logic Core's composite-ID namespace aligned with the master. */
 #define IOCTL_SET_VM_ID _IOW('G', 22, uint8_t)
 
+/*
+ * Context-bound Mode A admission.
+ *
+ * These operations are the first migration boundary for the kernel
+ * accelerator.  Legacy setters remain available for compatibility, but a
+ * manifest-gated launch must bind its VM identity before using /dev/wavevm.
+ * The current implementation advertises one concurrent context per physical
+ * module instance until the remaining module-global state is moved into the
+ * context.
+ */
+#define WVM_KERNEL_CONTEXT_MAGIC       0x574b4358U /* "WKCX" */
+#define WVM_KERNEL_CONTEXT_ABI_VERSION 2U
+#define WVM_KERNEL_DIGEST_BYTES        32U
+#define WVM_KERNEL_FENCE_BYTES         16U
+
+#define WVM_KERNEL_CAP_CONTEXT_BIND    (1ULL << 0)
+#define WVM_KERNEL_CAP_SINGLE_CONTEXT  (1ULL << 1)
+
+struct wvm_ioctl_route_snapshot_key {
+    struct {
+        uint32_t vm_id;
+        uint64_t vm_incarnation;
+        uint64_t route_scope_id;
+    } scope_key;
+    uint64_t topology_revision;
+    uint64_t route_generation;
+    uint8_t snapshot_digest[WVM_KERNEL_DIGEST_BYTES];
+};
+
+struct wvm_ioctl_context_bind {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t flags;
+    uint32_t vm_id;
+    uint32_t physical_node_id;
+    uint64_t vm_incarnation;
+    uint64_t manifest_generation;
+    uint8_t candidate_manifest_digest[WVM_KERNEL_DIGEST_BYTES];
+    uint8_t capability_profile_digest[WVM_KERNEL_DIGEST_BYTES];
+    uint8_t activation_fence[WVM_KERNEL_FENCE_BYTES];
+    struct wvm_ioctl_route_snapshot_key route_snapshot_key;
+};
+
+struct wvm_ioctl_context_caps {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t max_concurrent_contexts;
+    uint32_t active_contexts;
+    uint64_t feature_bits;
+};
+
+#define IOCTL_WVM_BIND_CONTEXT  _IOW('G', 30, struct wvm_ioctl_context_bind)
+#define IOCTL_WVM_UNBIND_CONTEXT _IOW('G', 31, struct wvm_ioctl_context_bind)
+#define IOCTL_WVM_QUERY_CAPS    _IOR('G', 32, struct wvm_ioctl_context_caps)
+
 #endif // WAVEVM_IOCTL_H

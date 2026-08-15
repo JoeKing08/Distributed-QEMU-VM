@@ -33,6 +33,7 @@
 #include "exec/ram_addr.h"
 
 #include "../../../common_include/wavevm_protocol.h"
+#include "wavevm-runtime-registration.h"
 
 /*
  * WaveVM V29.5 "Wavelet" User-Mode Memory Engine (Production Ready)
@@ -616,12 +617,27 @@ static int internal_connect_master_role(uint32_t role) {
     }
 
     if (role != 0) {
-        wvm_ipc_header_t reg_hdr = {
-            .type = WVM_IPC_TYPE_REGISTER,
-            .len = sizeof(role),
-        };
+        struct wvm_ipc_runtime_registration registration;
+        const void *payload = &role;
+        size_t payload_size = sizeof(role);
+        wvm_ipc_header_t reg_hdr;
+
+        if (wavevm_qemu_runtime_gate_enabled()) {
+            if (wavevm_qemu_fill_runtime_registration((uint16_t)role,
+                                                      &registration) != 0) {
+                fprintf(stderr,
+                        "[WaveVM-User] runtime gate active but QEMU "
+                        "registration identity is incomplete\n");
+                close(sock);
+                return -1;
+            }
+            payload = &registration;
+            payload_size = sizeof(registration);
+        }
+        reg_hdr.type = WVM_IPC_TYPE_REGISTER;
+        reg_hdr.len = (uint32_t)payload_size;
         if (write_all_fd(sock, &reg_hdr, sizeof(reg_hdr)) < 0 ||
-            write_all_fd(sock, &role, sizeof(role)) < 0) {
+            write_all_fd(sock, payload, payload_size) < 0) {
             close(sock);
             return -1;
         }
@@ -631,7 +647,8 @@ static int internal_connect_master_role(uint32_t role) {
 
 static int internal_connect_master(void)
 {
-    return internal_connect_master_role(0);
+    return internal_connect_master_role(
+        wavevm_qemu_runtime_gate_enabled() ? WVM_IPC_ROLE_SYNC : 0);
 }
 
 static int ensure_local_shm_shadow(void)

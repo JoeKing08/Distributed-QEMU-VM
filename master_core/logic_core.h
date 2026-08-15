@@ -4,6 +4,22 @@
 #include "unified_driver.h"
 #include "../common_include/wavevm_protocol.h"
 #ifdef __KERNEL__
+struct wvm_vm_route_scope_key {
+    uint32_t vm_id;
+    uint64_t vm_incarnation;
+    uint64_t route_scope_id;
+};
+
+struct wvm_route_snapshot_key {
+    struct wvm_vm_route_scope_key scope_key;
+    uint64_t topology_revision;
+    uint64_t route_generation;
+    uint8_t snapshot_digest[32];
+};
+#else
+#include "../common_include/wavevm_manifest.h"
+#endif
+#ifdef __KERNEL__
 #include <linux/in.h>
 #else
 #include <stdint.h>
@@ -20,6 +36,13 @@
 extern int g_my_node_id;
 extern uint32_t g_curr_epoch;
 extern uint8_t g_my_node_state;
+#ifdef __KERNEL__
+uint8_t wvm_kernel_current_vm_id(void);
+#define WVM_CURRENT_VM_ID() wvm_kernel_current_vm_id()
+#else
+extern uint8_t g_my_vm_id;
+#define WVM_CURRENT_VM_ID() g_my_vm_id
+#endif
 
 // --- 初始化与配置 ---
 int wvm_core_init(struct dsm_driver_ops *ops, int total_nodes_hint);
@@ -63,9 +86,23 @@ const uint32_t* wvm_get_memory_route_table(void);
 
 void wvm_set_mem_mapping(int slot, uint32_t value);
 void wvm_set_memory_mapping(int chunk_index, uint32_t node_id);
+/*
+ * Canonical runtime manifests assign arbitrary non-overlapping GPA ranges.
+ * The old 1 GiB table remains a compatibility cache; this ordered range map
+ * is the user-space authority for admitted launches.
+ */
+int wvm_set_memory_range_mapping(uint64_t gpa_start, uint64_t bytes,
+                                 uint32_t node_id);
 void wvm_clear_memory_mappings(void);
 
 void wvm_set_cpu_mapping(int vcpu_index, uint32_t slave_id);
 void wvm_clear_cpu_mappings(void);
+
+int wvm_logic_bind_route_snapshot(
+    const struct wvm_route_snapshot_key *snapshot_key);
+int wvm_logic_route_snapshot_valid(void);
+int wvm_logic_get_route_snapshot_key(
+    struct wvm_route_snapshot_key *snapshot_key);
+void wvm_logic_unbind_route_snapshot(void);
 
 #endif // LOGIC_CORE_H

@@ -29,6 +29,7 @@ struct wvm_resource_vm {
     uint32_t vcpu_count;
     uint64_t memory_mb;
     enum wvm_resource_policy policy;
+    uint32_t host_phys_id;
     uint32_t memory_chunk_count;
     uint32_t vcpu_nodes[WVM_CPU_ROUTE_TABLE_SIZE];
     uint32_t memory_nodes[WVM_RESOURCE_MAX_MEMORY_CHUNKS];
@@ -60,6 +61,13 @@ struct wvm_resource_plan {
 int wvm_resource_plan_load(const char *path, struct wvm_resource_plan *plan,
                            char *error, size_t error_len);
 
+/*
+ * Validate a fully materialized compatibility plan.  The validator is pure:
+ * it does not modify the plan and does not reserve runtime resources.
+ */
+int wvm_resource_plan_validate(const struct wvm_resource_plan *plan,
+                               char *error, size_t error_len);
+
 const struct wvm_resource_node *
 wvm_resource_plan_find_node(const struct wvm_resource_plan *plan,
                             uint32_t phys_id);
@@ -72,6 +80,9 @@ uint32_t wvm_resource_plan_local_vcpus(const struct wvm_resource_plan *plan,
 
 uint64_t wvm_resource_plan_local_memory_mb(
     const struct wvm_resource_plan *plan, uint8_t vm_id, uint32_t phys_id);
+
+uint32_t wvm_resource_plan_host_node(const struct wvm_resource_plan *plan,
+                                     uint8_t vm_id);
 
 void wvm_resource_plan_print(const struct wvm_resource_plan *plan,
                              int vm_id_filter);
