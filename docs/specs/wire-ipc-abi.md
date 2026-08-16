@@ -67,7 +67,7 @@ are raw bytes in network order.
 | 6 | `u16` | `header_bytes` | Exactly `164`. |
 | 8 | `u16` | `message_type` | Registry-defined data/control/local operation. |
 | 10 | `u16` | `flags` | Typed non-overlapping flags; unknown set bits reject. |
-| 12 | `u32` | `payload_bytes` | Bytes following this header in this frame/fragment. |
+| 12 | `u32` | `payload_bytes` | Bytes following this header in this frame/fragment, including the required routed-frame prefix when one applies. |
 | 16 | `u32` | `vm_id` | Logical namespace; zero only for explicitly legacy/control traffic. |
 | 20 | `u64` | `vm_incarnation` | Required for all nonlegacy VM operations. |
 | 28 | `u64` | `manifest_generation` | Candidate/admitted manifest generation; zero only for cluster registration. |
@@ -94,7 +94,120 @@ and route digest are forwarding metadata. They are excluded from
 `semantic_payload_digest`; route refresh may replace them without changing the
 semantic deduplication key, request bytes, or operation result.
 
-### 1.4 Canonical Records, Size Limits, and Fragmentation
+### 1.3.1 Routed-Frame Prefix
+
+Every routed data message has this exact 24-byte prefix immediately after the
+fixed V1 header and before either the fragment prefix or the semantic payload.
+It is mandatory for both local and network transport. The frame CRC32C covers
+it; the semantic payload digest deliberately excludes it.
+
+| Offset | Type | Field | Required meaning |
+| --- | --- | --- | --- |
+| 0 | `u16` | `route_prefix_version` | Exactly `1`. |
+| 2 | `u16` | `route_prefix_bytes` | Exactly `24`. |
+| 4 | `u16` | `destination_kind` | `1=FLAT_VNODE`, `2=FRACTAL_VNODE`. |
+| 6 | `u16` | `flags` | Reserved; exactly zero in V1. |
+| 8 | `u64` | `destination_scope` | Zero for `FLAT_VNODE`; required nonzero Pod/prefix for `FRACTAL_VNODE`. |
+| 16 | `u32` | `destination_vnode_or_endpoint` | Target vnode or node-runtime endpoint within the stated scope. Zero is a valid first vnode; `0xffffffff` is the only V1 unspecified sentinel and rejects. |
+| 20 | `u16` | `hop_limit` | Route-compiler supplied maximum forwarding hops; required nonzero. |
+| 22 | `u16` | `hop_count` | Starts at zero; each forwarding sidecar/gateway increments once and rejects forwarding beyond `hop_limit`. |
+
+The prefix completes the required `RouteKey` carried by every routed frame:
+the fixed envelope supplies protocol version, VM identity/incarnation, and
+route scope; the prefix supplies destination scope and vnode/endpoint. A
+gateway must use that complete key with its admitted immutable snapshot. It
+must not substitute the UDP source, a physical-node ID, `target_id`, or a raw
+legacy route entry.
+
+Route-snapshot rules have matching canonical constraints. A flat snapshot uses
+only `EXACT_VNODE` rules with scope zero. A fractal `PREFIX` rule represents a
+subtree rather than a leaf: its vnode field is zero, its scope is nonzero, and
+its next hop is an admitted gateway. A fractal exact leaf rule has a nonzero
+scope. These checks reject malformed route records before they can be
+published to a V1 consumer.
+
+### 1.4 V1 Memory Payloads
+
+`MSG_MEM_READ`, `MSG_MEM_ACK`, `MSG_COMMIT_DIFF`, and `MSG_MEM_COMMIT_ACK` use
+fixed big-endian semantic payloads. The
+envelope's route prefix names the current receiver. A read payload separately
+carries the reply leaf RouteKey because the ACK path must not infer it from a
+UDP source address, physical node ID, `target_id`, or a legacy request table.
+The directory resolves that key against its admitted immutable route snapshot
+and creates an ACK whose outer route prefix targets that reply destination.
+
+```text
+MemReadPayload {
+    u64 gpa;                       // 4 KiB aligned
+    u16 reply_destination_kind;    // 1=FLAT_VNODE, 2=FRACTAL_VNODE
+    u16 reserved_zero;
+    u64 reply_destination_scope;   // zero only for FLAT_VNODE
+    u32 reply_destination_vnode;   // 0 is valid; 0xffffffff rejects
+}
+
+MemAckPayload {
+    u64 gpa;                       // same 4 KiB aligned page
+    u64 version;                   // nonzero only for SUCCESS
+    u16 status;                    // 0=SUCCESS, 1=STALE, 2=NOT_FOUND,
+                                    // 3=BACKPRESSURE, 4=INTERNAL_FAILURE
+    u16 reserved_zero;
+    u32 directory_physical_node_id;
+    u64 directory_node_instance_id;
+    u8[4096] data;                 // present exactly when status=SUCCESS
+}
+```
+
+A successful ACK has exactly `32 + 4096` payload bytes and carries the
+authoritative full page. A terminal non-success ACK has exactly 32 bytes,
+version zero, and no page data. Both forms preserve the request's complete
+semantic operation key in their envelope; only mutable forwarding metadata
+and the outer route destination change for the reply. Before creating the
+outer ACK prefix, the directory node runtime must resolve the payload's reply
+destination against its admitted immutable snapshot and obtain a fresh
+nonzero hop limit. It must reject an absent, mismatched, or stale reply route.
+The requester must match the ACK's directory physical-node and node-instance
+identity against its admitted memory dispatch projection before installing
+page data.
+
+`MSG_COMMIT_DIFF` carries one normal dirty commit. It never aliases the legacy
+host-native `wvm_diff_log` layout. The request includes a complete reply leaf
+RouteKey for the same reason as `MSG_MEM_READ`: a directory returns only through
+the admitted snapshot, never by reversing a UDP source or consulting a legacy
+request map.
+
+```text
+MemCommitPayload {
+    u64 gpa;                       // 4 KiB aligned
+    u64 base_version;              // nonzero directory version observed by writer
+    u16 offset;                    // byte offset within page
+    u16 size;                      // 1..4096, offset + size <= 4096
+    u16 reply_destination_kind;    // 1=FLAT_VNODE, 2=FRACTAL_VNODE
+    u16 reserved_zero;
+    u64 reply_destination_scope;   // zero only for FLAT_VNODE
+    u32 reply_destination_vnode;   // 0 is valid; 0xffffffff rejects
+    u8[size] data;
+}
+
+MemCommitAckPayload {
+    u64 gpa;
+    u64 result_version;            // nonzero only for SUCCESS
+    u16 status;                    // 0=SUCCESS, 1=STALE_BASE_VERSION,
+                                    // 2=NOT_FOUND, 3=BACKPRESSURE,
+                                    // 4=INTERNAL_FAILURE
+    u16 reserved_zero;
+    u32 directory_physical_node_id;
+    u64 directory_node_instance_id;
+}
+```
+
+A commit ACK has exactly 32 bytes. It preserves the request's complete
+semantic operation key; only forwarding metadata and outer route destination
+change. On a duplicate `MSG_COMMIT_DIFF`, the directory compares the complete
+semantic payload digest under the same origin/runtime and operation key. The
+same digest returns the recorded `MemCommitAckPayload`; a different digest is
+an `OPERATION_ID_CONFLICT` and never reapplies bytes.
+
+### 1.5 Canonical Records, Size Limits, and Fragmentation
 
 Manifest, route snapshot, and control payloads use canonical WVM-TLV records:
 
@@ -136,8 +249,10 @@ V1 limits are protocol safety limits, not hidden test parameters:
 | Concurrent incomplete reassemblies | 64 per VM incarnation and 8 MiB aggregate per origin. |
 | Reassembly lifetime | 5 seconds; expiry returns/drops with bounded `FRAGMENT_EXPIRED` diagnostics. |
 
-When `FLAG_FRAGMENTED` is set, the frame payload begins with this 40-byte
-fragment prefix followed by at most 1024 bytes of logical payload:
+When `FLAG_FRAGMENTED` is set, the routed-frame prefix is followed by this
+40-byte fragment prefix, then at most 1024 bytes of logical payload. A
+non-routed control frame omits the routed-frame prefix and begins directly with
+this fragment prefix:
 
 ```text
 FragmentPrefix {

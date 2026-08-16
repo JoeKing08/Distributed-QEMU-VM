@@ -33,6 +33,8 @@
 #include "exec/ram_addr.h"
 
 #include "../../../common_include/wavevm_protocol.h"
+#include "../../../common_include/wavevm_local_memory_v1.h"
+#include "../../../common_include/wavevm_memory_v1.h"
 #include "wavevm-runtime-registration.h"
 
 /*
@@ -55,6 +57,7 @@ static int g_client_sync_batch = 1024; // 当前生效的 Batch
 static int g_min_batch = 1;            // 下限
 static int g_max_batch = 8192;         // 上限
 static int g_enable_auto_tuning = 1;   // 开关：1=自动, 0=固定(强一致用)
+static _Atomic uint64_t g_v1_operation_sequence = 1;
 
 static uint64_t get_us_time(void);
 static uint64_t get_local_page_version(uint64_t gpa);
@@ -525,6 +528,7 @@ typedef struct WVMHandoffDirtyRecord {
     ram_addr_t ra;
     uint64_t old_version;
     uint64_t new_version;
+    bool commit_confirmed;
 } WVMHandoffDirtyRecord;
 
 typedef struct WVMHandoffDirtyJournal {
@@ -596,6 +600,252 @@ static int read_exact(int fd, void *buf, size_t len) {
         else if (ret == 0) return -1; // EOF
         else if (errno != EINTR) return -1; // Error
     }
+    return 0;
+}
+
+static void write_be64(uint8_t output[8], uint64_t value)
+{
+    size_t i;
+
+    for (i = 0; i < 8; i++) {
+        output[7U - i] = (uint8_t)(value >> (i * 8U));
+    }
+}
+
+/*
+ * The local node runtime deduplicates by operation key, so each QEMU fault
+ * gets a process-scoped, never-reused ID.  After sequence exhaustion QEMU
+ * fails the request instead of wrapping into an older operation identity.
+ */
+static int make_v1_operation_id(
+    uint8_t operation_id[WVM_IDENTITY_ID_BYTES])
+{
+    uint64_t current = atomic_load_explicit(&g_v1_operation_sequence,
+                                            memory_order_relaxed);
+
+    for (;;) {
+        uint64_t next;
+
+        if (current == 0) {
+            return -EOVERFLOW;
+        }
+        next = current == UINT64_MAX ? 0 : current + 1U;
+        if (atomic_compare_exchange_weak_explicit(
+                &g_v1_operation_sequence, &current, next,
+                memory_order_relaxed, memory_order_relaxed)) {
+            write_be64(operation_id, (uint64_t)(uint32_t)getpid());
+            write_be64(operation_id + 8, current);
+            return 0;
+        }
+    }
+}
+
+static int parse_v1_u64_env(const char *name, uint64_t *value)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int fill_v1_commit_reply_destination(
+    struct wvm_v1_mem_commit *commit)
+{
+    uint64_t kind;
+    uint64_t scope;
+    uint64_t vnode;
+
+    if (!commit ||
+        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_KIND",
+                         &kind) != 0 ||
+        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_SCOPE",
+                         &scope) != 0 ||
+        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_VNODE",
+                         &vnode) != 0 ||
+        kind > UINT16_MAX || vnode > UINT32_MAX) {
+        return -EINVAL;
+    }
+    commit->reply_destination_kind = (uint16_t)kind;
+    commit->reply_destination_scope = scope;
+    commit->reply_destination_vnode = (uint32_t)vnode;
+    return 0;
+}
+
+static int v1_ack_status_to_errno(uint16_t status)
+{
+    switch (status) {
+    case WVM_V1_MEM_ACK_SUCCESS:
+        return 0;
+    case WVM_V1_MEM_ACK_STALE:
+        return -ESTALE;
+    case WVM_V1_MEM_ACK_NOT_FOUND:
+        return -ENOENT;
+    case WVM_V1_MEM_ACK_BACKPRESSURE:
+        return -EAGAIN;
+    case WVM_V1_MEM_ACK_INTERNAL_FAILURE:
+        return -EIO;
+    default:
+        return -EPROTO;
+    }
+}
+
+static int v1_commit_status_to_errno(uint16_t status)
+{
+    switch (status) {
+    case WVM_V1_MEM_COMMIT_ACK_SUCCESS:
+        return 0;
+    case WVM_V1_MEM_COMMIT_ACK_STALE_BASE_VERSION:
+        return -ESTALE;
+    case WVM_V1_MEM_COMMIT_ACK_NOT_FOUND:
+        return -ENOENT;
+    case WVM_V1_MEM_COMMIT_ACK_BACKPRESSURE:
+        return -EAGAIN;
+    case WVM_V1_MEM_COMMIT_ACK_INTERNAL_FAILURE:
+        return -EIO;
+    default:
+        return -EPROTO;
+    }
+}
+
+/*
+ * Submit one canonical V1 commit over an already registered synchronous
+ * local IPC connection. The caller owns the connection lifecycle; this
+ * helper only validates and exchanges one request/result pair.
+ */
+static int request_v1_commit_on_fd(
+    int fd, uint64_t gpa, uint64_t base_version, uint16_t offset,
+    const uint8_t *data, size_t data_bytes,
+    struct wvm_v1_mem_commit_ack *ack_out)
+{
+    struct wvm_local_memory_v1_commit_request request;
+    struct wvm_local_memory_v1_commit_result result;
+    wvm_ipc_header_t header;
+    uint8_t request_bytes[WVM_LOCAL_MEMORY_V1_COMMIT_REQUEST_HEADER_BYTES +
+                          WVM_V1_MEMORY_PAGE_BYTES];
+    uint8_t result_bytes[WVM_LOCAL_MEMORY_V1_COMMIT_RESULT_BYTES];
+    size_t request_bytes_count = 0;
+    char error[160] = {0};
+    int status;
+
+    if (fd < 0 || !data || !ack_out || base_version == 0 ||
+        gpa % WVM_V1_MEMORY_PAGE_BYTES != 0 || data_bytes == 0 ||
+        data_bytes > WVM_V1_MEMORY_PAGE_BYTES ||
+        offset > WVM_V1_MEMORY_PAGE_BYTES - data_bytes) {
+        return -EINVAL;
+    }
+    memset(&request, 0, sizeof(request));
+    memset(&result, 0, sizeof(result));
+    if (make_v1_operation_id(request.operation_id) != 0) {
+        return -EOVERFLOW;
+    }
+    request.delivery_attempt_id = 1;
+    request.commit.gpa = gpa;
+    request.commit.base_version = base_version;
+    request.commit.offset = offset;
+    request.commit.size = (uint16_t)data_bytes;
+    request.commit.data = data;
+    request.commit.data_bytes = data_bytes;
+    if (fill_v1_commit_reply_destination(&request.commit) != 0 ||
+        wvm_local_memory_v1_commit_request_encode(
+            &request, request_bytes, sizeof(request_bytes),
+            &request_bytes_count, error, sizeof(error)) != 0) {
+        return -EPROTO;
+    }
+    header.type = WVM_IPC_TYPE_MEM_COMMIT_V1;
+    header.len = (uint32_t)request_bytes_count;
+    if (write_all_fd(fd, &header, sizeof(header)) < 0 ||
+        write_all_fd(fd, request_bytes, request_bytes_count) < 0 ||
+        read_exact(fd, result_bytes, sizeof(result_bytes)) < 0 ||
+        wvm_local_memory_v1_commit_result_decode(
+            result_bytes, &result, error, sizeof(error)) != 0 ||
+        memcmp(result.operation_id, request.operation_id,
+               sizeof(request.operation_id)) != 0 ||
+        result.ack.gpa != gpa) {
+        return -EIO;
+    }
+    *ack_out = result.ack;
+    status = v1_commit_status_to_errno(result.ack.status);
+    return status;
+}
+
+/*
+ * The QEMU SYNC channel is serialized per thread.  The request and response
+ * are both typed V1 records; a zero result length means node runtime failed
+ * before it received a directory ACK.
+ */
+static int request_v1_page_over_ipc(
+    uint64_t gpa, struct wvm_v1_mem_ack *ack_out,
+    uint8_t page[WVM_V1_MEMORY_PAGE_BYTES])
+{
+    struct wvm_local_memory_v1_fault_request request;
+    wvm_ipc_header_t header;
+    uint8_t request_bytes[WVM_LOCAL_MEMORY_V1_FAULT_REQUEST_BYTES];
+    uint8_t result_length[WVM_LOCAL_MEMORY_V1_RESULT_LENGTH_BYTES];
+    uint8_t ack_bytes[WVM_V1_MEM_ACK_HEADER_BYTES +
+                      WVM_V1_MEMORY_PAGE_BYTES];
+    size_t ack_bytes_count = 0;
+    struct wvm_v1_mem_ack decoded_ack;
+    char error[160] = {0};
+    int result;
+
+    if (!ack_out || !page || gpa % WVM_V1_MEMORY_PAGE_BYTES != 0) {
+        return -EINVAL;
+    }
+    if (t_com_sock == -1) {
+        t_com_sock = internal_connect_master();
+        if (t_com_sock < 0) {
+            return -ENOTCONN;
+        }
+    }
+    memset(&request, 0, sizeof(request));
+    result = make_v1_operation_id(request.operation_id);
+    if (result != 0) {
+        return result;
+    }
+    request.delivery_attempt_id = 1;
+    request.gpa = gpa;
+    if (wvm_local_memory_v1_fault_request_encode(
+            &request, request_bytes, error, sizeof(error)) != 0) {
+        return -EPROTO;
+    }
+    header.type = WVM_IPC_TYPE_MEM_FAULT_V1;
+    header.len = sizeof(request_bytes);
+    if (write_all_fd(t_com_sock, &header, sizeof(header)) < 0 ||
+        write_all_fd(t_com_sock, request_bytes, sizeof(request_bytes)) < 0 ||
+        read_exact(t_com_sock, result_length, sizeof(result_length)) < 0 ||
+        wvm_local_memory_v1_result_length_decode(
+            result_length, &ack_bytes_count, error, sizeof(error)) != 0) {
+        close(t_com_sock);
+        t_com_sock = -1;
+        return -EIO;
+    }
+    if (ack_bytes_count == 0) {
+        return -EIO;
+    }
+    if (read_exact(t_com_sock, ack_bytes, ack_bytes_count) < 0 ||
+        wvm_v1_mem_ack_decode(ack_bytes, ack_bytes_count, &decoded_ack,
+                              error, sizeof(error)) != 0 ||
+        decoded_ack.gpa != gpa) {
+        close(t_com_sock);
+        t_com_sock = -1;
+        return -EPROTO;
+    }
+    if (decoded_ack.status == WVM_V1_MEM_ACK_SUCCESS) {
+        memcpy(page, decoded_ack.data, sizeof(page[0]) *
+                                      WVM_V1_MEMORY_PAGE_BYTES);
+        decoded_ack.data = page;
+    }
+    *ack_out = decoded_ack;
     return 0;
 }
 
@@ -766,52 +1016,30 @@ int wavevm_user_mem_sync_page(uint64_t gpa)
 
     /* 使用线程局部 IPC socket (与 request_page_sync Master 路径相同) */
     if (!g_is_slave) {
-        /* Master 模式：通过本地 IPC socket 请求 */
-        if (t_com_sock == -1) {
-            t_com_sock = internal_connect_master();
-            if (t_com_sock < 0) {
-                fprintf(stderr, "[WaveVM-User] sync page: IPC connect failed for GPA 0x%"
-                        PRIx64 "\n", gpa);
-                return -ENOTCONN;
-            }
-        }
+        struct wvm_v1_mem_ack ack;
+        uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
+        int result = request_v1_page_over_ipc(gpa, &ack, page);
 
-        struct wvm_ipc_fault_req req = { .gpa = gpa, .len = 4096, .vcpu_id = 0 };
-        struct wvm_ipc_header_t ipc_hdr = { .type = WVM_IPC_TYPE_MEM_FAULT, .len = sizeof(req) };
-        struct iovec iov[2] = { {&ipc_hdr, sizeof(ipc_hdr)}, {&req, sizeof(req)} };
-        struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
-
-        if (sendmsg(t_com_sock, &msg, 0) < 0) {
-            /* 连接断开，关闭以便下次重建 */
-            close(t_com_sock);
-            t_com_sock = -1;
-            fprintf(stderr, "[WaveVM-User] sync page: IPC send failed for GPA 0x%"
+        if (result != 0) {
+            fprintf(stderr,
+                    "[WaveVM-User] sync page: V1 IPC failed for GPA 0x%"
                     PRIx64 "\n", gpa);
-            return -EIO;
+            return result;
         }
-
-        struct wvm_ipc_fault_ack ack;
-        if (read_exact(t_com_sock, &ack, sizeof(ack)) < 0) {
-            close(t_com_sock);
-            t_com_sock = -1;
-            fprintf(stderr, "[WaveVM-User] sync page: IPC recv failed for GPA 0x%"
-                    PRIx64 "\n", gpa);
-            return -EIO;
-        }
-
-        if (ack.status == 0) {
+        result = v1_ack_status_to_errno(ack.status);
+        if (result == 0) {
             void *fetch_hva = gpa_to_hva_safe(gpa);
             if (!fetch_hva) {
                 return -EFAULT;
             }
             mprotect(fetch_hva, 4096, PROT_READ | PROT_WRITE);
-            memcpy(fetch_hva, ack.data, 4096);
+            memcpy(fetch_hva, ack.data, WVM_V1_MEMORY_PAGE_BYTES);
             /* KVM 模式下不降权：脏页由 dirty log 跟踪，
              * mprotect(PROT_READ) 会导致 EPT 违例 → exit=17 */
             set_local_page_version(gpa, ack.version);
             return 0;
         }
-        return ack.status;
+        return result;
     } else {
         /* Slave 模式：复用 request_page_sync 的 UDP 路径。
          * 由于 request_page_sync 接受 fault_addr (HVA) 参数，
@@ -868,24 +1096,23 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
             if (t_com_sock < 0) return -1;
         }
 
-        struct wvm_ipc_fault_req req = { .gpa = gpa, .len = 4096, .vcpu_id = 0 };
-        struct wvm_ipc_header_t ipc_hdr = { .type = WVM_IPC_TYPE_MEM_FAULT, .len = sizeof(req) };
-        struct iovec iov[2] = { {&ipc_hdr, sizeof(ipc_hdr)}, {&req, sizeof(req)} };
-        struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
+        {
+            struct wvm_v1_mem_ack ack;
+            uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
+            int result = request_v1_page_over_ipc(gpa, &ack, page);
 
-        if (sendmsg(t_com_sock, &msg, 0) < 0) return -1;
-
-        // [V29 Fix] 接收带版本的 ACK
-        struct wvm_ipc_fault_ack ack;
-        if (read_exact(t_com_sock, &ack, sizeof(ack)) < 0) return -1;
-
-        if (ack.status == 0) {
+            if (result != 0) {
+                return result;
+            }
+            result = v1_ack_status_to_errno(ack.status);
+            if (result != 0) {
+                return result;
+            }
             mprotect((void *)aligned_addr, 4096, PROT_READ | PROT_WRITE);
-            memcpy((void *)aligned_addr, ack.data, 4096);
+            memcpy((void *)aligned_addr, ack.data, WVM_V1_MEMORY_PAGE_BYTES);
             set_local_page_version(gpa, ack.version); // 同步版本
             return 0;
         }
-        return -1;
     }
 
     /*
@@ -1252,11 +1479,10 @@ static int send_full_page_diff_to_ipc_fd(int fd, uint64_t gpa,
 {
     uint8_t payload[sizeof(struct wvm_diff_log) + 4096];
     struct wvm_diff_log *log = (struct wvm_diff_log *)payload;
-    wvm_ipc_header_t ipc_hdr = {
-        .type = WVM_IPC_TYPE_COMMIT_DIFF_SYNC,
-        .len = sizeof(payload),
-    };
+    wvm_ipc_header_t ipc_hdr;
 
+    ipc_hdr.type = WVM_IPC_TYPE_COMMIT_DIFF_SYNC;
+    ipc_hdr.len = sizeof(payload);
     log->gpa = WVM_HTONLL(gpa);
     log->version = WVM_HTONLL(version);
     log->offset = 0;
@@ -1310,6 +1536,7 @@ static int append_handoff_dirty_record(WVMHandoffDirtyJournal **journalp,
         .ra = ra,
         .old_version = old_version,
         .new_version = new_version,
+        .commit_confirmed = false,
     };
     return 0;
 }
@@ -1318,6 +1545,9 @@ static void rollback_handoff_dirty_locked(WVMHandoffDirtyJournal *journal)
 {
     for (size_t i = 0; journal && i < journal->count; i++) {
         WVMHandoffDirtyRecord *rec = &journal->items[i];
+        if (rec->commit_confirmed) {
+            continue;
+        }
         if (get_local_page_version(rec->gpa) == rec->new_version) {
             set_local_page_version(rec->gpa, rec->old_version);
         }
@@ -1426,7 +1656,24 @@ int wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd,
                 free_handoff_dirty_journal(journal);
                 return -ENOMEM;
             }
-            if (send_full_page_diff_to_ipc_fd(ipc_fd, gpa, ver, hva) < 0) {
+            if (wavevm_qemu_runtime_gate_enabled()) {
+                struct wvm_v1_mem_commit_ack ack;
+                int commit_ret = request_v1_commit_on_fd(
+                    ipc_fd, gpa, cur_ver, 0, hva,
+                    WVM_V1_MEMORY_PAGE_BYTES, &ack);
+
+                if (commit_ret == 0) {
+                    ver = ack.result_version;
+                    journal->items[journal->count - 1].new_version = ver;
+                    journal->items[journal->count - 1].commit_confirmed = true;
+                } else {
+                    cpu_physical_memory_set_dirty_range(
+                        ra, 4096, 1 << DIRTY_MEMORY_MIGRATION);
+                    pthread_mutex_unlock(&g_dirty_flush_lock);
+                    free_handoff_dirty_journal(journal);
+                    return commit_ret;
+                }
+            } else if (send_full_page_diff_to_ipc_fd(ipc_fd, gpa, ver, hva) < 0) {
                 int saved_errno = errno;
                 if (journal_out) {
                     *journal_out = journal;
@@ -1676,13 +1923,43 @@ static int process_writable_batch(WritablePage *batch_head,
     return committed;
 }
 
+static void requeue_writable_page_chain(WritablePage *head)
+{
+    WritablePage *tail;
+    WritablePage *observed;
+
+    if (!head) {
+        return;
+    }
+    for (tail = head; tail->next; tail = tail->next) {
+        void *page_addr = gpa_to_hva_safe(tail->gpa);
+        if (page_addr && !wvm_is_volatile_gpa(tail->gpa)) {
+            mprotect(page_addr, 4096, PROT_READ | PROT_WRITE);
+        }
+    }
+    {
+        void *page_addr = gpa_to_hva_safe(tail->gpa);
+        if (page_addr && !wvm_is_volatile_gpa(tail->gpa)) {
+            mprotect(page_addr, 4096, PROT_READ | PROT_WRITE);
+        }
+    }
+    observed = __atomic_load_n(&g_writable_pages_list, __ATOMIC_ACQUIRE);
+    do {
+        tail->next = observed;
+    } while (!__atomic_compare_exchange_n(
+        &g_writable_pages_list, &observed, head, true,
+        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
+}
+
 static int process_writable_batch_full_snapshot(WritablePage *batch_head,
                                                 void *current_snapshot)
 {
     int committed = 0;
+    int first_error = 0;
     uint64_t *seen = NULL;
     size_t seen_count = 0;
     size_t seen_capacity = 0;
+    const bool use_v1_commit = wavevm_qemu_runtime_gate_enabled();
 
     for (WritablePage *curr = batch_head; curr; curr = curr->next) {
         bool duplicate = false;
@@ -1701,6 +1978,8 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
             size_t new_capacity = seen_capacity ? seen_capacity * 2 : 64;
             uint64_t *new_seen = realloc(seen, new_capacity * sizeof(*seen));
             if (!new_seen) {
+                first_error = -ENOMEM;
+                requeue_writable_page_chain(curr);
                 break;
             }
             seen = new_seen;
@@ -1710,7 +1989,9 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
 
         void *page_addr = gpa_to_hva_safe(curr->gpa);
         if (!page_addr) {
-            continue;
+            first_error = -EFAULT;
+            requeue_writable_page_chain(curr);
+            break;
         }
 
         int idx = LATCH_IDX(curr->gpa);
@@ -1731,15 +2012,45 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
          * pages such as kernel stacks do not depend on a lossless chain of
          * intermediate partial diffs.
          */
-        uint64_t ver = get_local_page_version(curr->gpa) + 1;
-        add_to_aggregator(curr->gpa, ver, 0, 4096, current_snapshot, 0);
-        set_local_page_version(curr->gpa, ver);
+        if (use_v1_commit) {
+            struct wvm_v1_mem_commit_ack ack;
+            uint64_t base_version = get_local_page_version(curr->gpa);
+            int commit_ret;
+
+            if (base_version == 0) {
+                commit_ret = -ESTALE;
+            } else {
+                if (t_com_sock < 0) {
+                    t_com_sock = internal_connect_master();
+                }
+                commit_ret = request_v1_commit_on_fd(
+                    t_com_sock, curr->gpa, base_version, 0,
+                    current_snapshot, WVM_V1_MEMORY_PAGE_BYTES, &ack);
+            }
+            if (commit_ret != 0) {
+                ram_addr_t ra = qemu_ram_addr_from_host(page_addr);
+                if (ra != RAM_ADDR_INVALID) {
+                    cpu_physical_memory_set_dirty_range(
+                        ra, 4096, 1 << DIRTY_MEMORY_MIGRATION);
+                }
+                first_error = commit_ret;
+                requeue_writable_page_chain(curr);
+                break;
+            }
+            set_local_page_version(curr->gpa, ack.result_version);
+        } else {
+            uint64_t ver = get_local_page_version(curr->gpa) + 1;
+            add_to_aggregator(curr->gpa, ver, 0, 4096, current_snapshot, 0);
+            set_local_page_version(curr->gpa, ver);
+        }
         committed++;
     }
 
     free(seen);
-    flush_aggregator();
-    return committed;
+    if (!use_v1_commit) {
+        flush_aggregator();
+    }
+    return first_error != 0 ? first_error : committed;
 }
 
 int wavevm_user_mem_flush_slave_dirty_sync(void)
@@ -1764,7 +2075,9 @@ int wavevm_user_mem_flush_slave_dirty_sync(void)
                                      __ATOMIC_ACQ_REL);
     committed = process_writable_batch_full_snapshot(batch_head,
                                                      current_snapshot);
-    if (committed > 0) {
+    if (committed < 0) {
+        rtt = committed;
+    } else if (committed > 0) {
         /*
          * A remote TCG slice return is a causal handoff: all writes made by the
          * slave must be visible to the directory before the CPU ACK is exported.
@@ -1784,7 +2097,7 @@ int wavevm_user_mem_flush_slave_dirty_sync(void)
         flush_log_count++;
     }
 
-    return (rtt < 0) ? -ETIMEDOUT : 0;
+    return (rtt < 0) ? (int)rtt : 0;
 }
 
 /*

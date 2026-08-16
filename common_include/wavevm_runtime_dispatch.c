@@ -16,8 +16,8 @@
 #include "wavevm_config.h"
 #include "wavevm_membership.h"
 
-#define WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES 8U
-#define WVM_RUNTIME_DISPATCH_MEMORY_ENTRY_BYTES 26U
+#define WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES 18U
+#define WVM_RUNTIME_DISPATCH_MEMORY_ENTRY_BYTES 58U
 
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
 {
@@ -125,7 +125,8 @@ static const struct wvm_node_record *find_node(
 }
 
 static const struct wvm_route_rule_record *find_exact_route(
-    const struct wvm_route_snapshot_record *snapshot, uint32_t vnode)
+    const struct wvm_route_snapshot_record *snapshot, uint64_t scope,
+    uint32_t vnode)
 {
     size_t i;
 
@@ -137,7 +138,7 @@ static const struct wvm_route_rule_record *find_exact_route(
             &snapshot->next_hop_rules.entries[i];
 
         if (rule->destination_kind == WVM_ROUTE_DESTINATION_EXACT_VNODE &&
-            rule->destination_scope == 0 &&
+            rule->destination_scope == scope &&
             rule->destination_vnode_or_endpoint == vnode) {
             return rule;
         }
@@ -145,69 +146,77 @@ static const struct wvm_route_rule_record *find_exact_route(
     return NULL;
 }
 
-static int primary_vnode_for_node(const struct wvm_cluster_record_set *records,
-                                  uint32_t physical_node_id,
-                                  uint32_t *vnode_out, char *error,
-                                  size_t error_len)
+static int route_topology_valid(uint16_t topology_kind)
+{
+    return topology_kind == WVM_ROUTE_TOPOLOGY_FLAT ||
+           topology_kind == WVM_ROUTE_TOPOLOGY_FRACTAL;
+}
+
+static int route_destination_validate(
+    const struct wvm_runtime_route_destination *destination,
+    uint16_t topology_kind, char *error, size_t error_len)
+{
+    if (!destination || !route_topology_valid(topology_kind) ||
+        destination->destination_vnode >= WVM_MAX_GATEWAYS) {
+        set_error(error, error_len, "runtime route destination is invalid");
+        return -1;
+    }
+    if (topology_kind == WVM_ROUTE_TOPOLOGY_FLAT &&
+        destination->destination_kind ==
+            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+        destination->destination_scope == 0) {
+        return 0;
+    }
+    if (topology_kind == WVM_ROUTE_TOPOLOGY_FRACTAL &&
+        destination->destination_kind ==
+            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+        destination->destination_scope != 0) {
+        return 0;
+    }
+    set_error(error, error_len,
+              "runtime route destination does not match topology");
+    return -1;
+}
+
+static int primary_destination_for_node(
+    const struct wvm_cluster_record_set *records, uint32_t physical_node_id,
+    uint16_t topology_kind, struct wvm_runtime_route_destination *destination,
+    char *error, size_t error_len)
 {
     const struct wvm_node_record *node = find_node(records, physical_node_id);
 
-    if (!node ||
+    if (!node || !destination || !route_topology_valid(topology_kind) ||
         wvm_node_record_validate(node, error, error_len) != 0 ||
         node->local_vnode_first >= WVM_MAX_GATEWAYS ||
         node->local_vnode_count == 0 ||
         node->local_vnode_count >
-            WVM_MAX_GATEWAYS - node->local_vnode_first) {
+            WVM_MAX_GATEWAYS - node->local_vnode_first ||
+        (topology_kind == WVM_ROUTE_TOPOLOGY_FRACTAL &&
+         node->pod_id == 0)) {
         set_error(error, error_len,
-                  "physical node %u has no representable legacy vnode",
+                  "physical node %u has no representable route destination",
                   physical_node_id);
         return -1;
     }
-    *vnode_out = node->local_vnode_first;
+
+    memset(destination, 0, sizeof(*destination));
+    destination->destination_kind =
+        topology_kind == WVM_ROUTE_TOPOLOGY_FLAT
+            ? WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE
+            : WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE;
+    destination->destination_scope =
+        topology_kind == WVM_ROUTE_TOPOLOGY_FLAT ? 0 : node->pod_id;
+    destination->destination_vnode = node->local_vnode_first;
+    if (route_destination_validate(destination, topology_kind, error,
+                                   error_len) != 0) {
+        return -1;
+    }
     return 0;
 }
 
-static int route_vnode_count(const struct wvm_route_snapshot_record *snapshot,
-                             uint32_t *count_out, char *error,
-                             size_t error_len)
-{
-    uint32_t maximum = 0;
-    int have_vnode = 0;
-    size_t i;
-
-    if (!snapshot || !count_out) {
-        return -1;
-    }
-    for (i = 0; i < snapshot->next_hop_rules.count; i++) {
-        const struct wvm_route_rule_record *rule =
-            &snapshot->next_hop_rules.entries[i];
-
-        if (rule->destination_kind != WVM_ROUTE_DESTINATION_EXACT_VNODE ||
-            rule->destination_scope != 0 ||
-            rule->destination_vnode_or_endpoint >= WVM_MAX_GATEWAYS ||
-            !endpoint_is_legacy_udp_v4(&rule->next_hop_endpoint)) {
-            set_error(error, error_len,
-                      "route snapshot cannot be consumed by the legacy "
-                      "flat-vnode adapter");
-            return -1;
-        }
-        if (!have_vnode || rule->destination_vnode_or_endpoint > maximum) {
-            maximum = rule->destination_vnode_or_endpoint;
-            have_vnode = 1;
-        }
-    }
-    if (!have_vnode || maximum == UINT32_MAX) {
-        set_error(error, error_len,
-                  "route snapshot has no representable vnode routes");
-        return -1;
-    }
-    *count_out = maximum + 1U;
-    return 0;
-}
-
-static int validate_cpu_dispatch(const struct wvm_runtime_cpu_dispatch_list *list,
-                                 uint32_t route_vnode_count, char *error,
-                                 size_t error_len)
+static int validate_cpu_dispatch(
+    const struct wvm_runtime_cpu_dispatch_list *list, uint16_t topology_kind,
+    char *error, size_t error_len)
 {
     size_t i;
 
@@ -221,7 +230,8 @@ static int validate_cpu_dispatch(const struct wvm_runtime_cpu_dispatch_list *lis
         const struct wvm_runtime_cpu_dispatch *entry = &list->entries[i];
 
         if (entry->guest_vcpu_index >= WVM_CPU_ROUTE_TABLE_SIZE ||
-            entry->executor_vnode >= route_vnode_count ||
+            route_destination_validate(&entry->executor, topology_kind, error,
+                                       error_len) != 0 ||
             (i != 0 &&
              list->entries[i - 1].guest_vcpu_index >= entry->guest_vcpu_index)) {
             set_error(error, error_len, "runtime CPU dispatch entry is invalid");
@@ -233,7 +243,7 @@ static int validate_cpu_dispatch(const struct wvm_runtime_cpu_dispatch_list *lis
 
 static int validate_memory_dispatch(
     const struct wvm_runtime_memory_dispatch_list *list,
-    uint32_t route_vnode_count, char *error, size_t error_len)
+    uint16_t topology_kind, char *error, size_t error_len)
 {
     size_t i;
 
@@ -247,8 +257,12 @@ static int validate_memory_dispatch(
         const struct wvm_runtime_memory_dispatch *entry = &list->entries[i];
 
         if (entry->bytes == 0 || entry->gpa_start > UINT64_MAX - entry->bytes ||
-            entry->directory_vnode >= route_vnode_count ||
-            entry->executor_vnode >= route_vnode_count ||
+            route_destination_validate(&entry->directory, topology_kind, error,
+                                       error_len) != 0 ||
+            route_destination_validate(&entry->executor, topology_kind, error,
+                                       error_len) != 0 ||
+            entry->directory_physical_node_id == 0 ||
+            entry->directory_node_instance_id == 0 ||
             entry->consistency_policy == 0 ||
             (i != 0 &&
              list->entries[i - 1].gpa_start + list->entries[i - 1].bytes >
@@ -298,18 +312,18 @@ int wvm_runtime_dispatch_projection_validate(
             projection->vm_id ||
         projection->required_route_snapshot_key.scope_key.vm_incarnation !=
             projection->vm_incarnation ||
-        projection->local_primary_vnode >= WVM_MAX_GATEWAYS ||
-        projection->route_vnode_count == 0 ||
-        projection->route_vnode_count > WVM_MAX_GATEWAYS ||
-        projection->local_primary_vnode >= projection->route_vnode_count ||
+        !route_topology_valid(projection->route_topology_kind) ||
+        route_destination_validate(&projection->local_primary,
+                                   projection->route_topology_kind, error,
+                                   error_len) != 0 ||
         wvm_endpoint_validate(&projection->local_sidecar_endpoint, error,
                               error_len) != 0 ||
         !endpoint_is_legacy_udp_v4(&projection->local_sidecar_endpoint) ||
         validate_cpu_dispatch(&projection->cpu_dispatch,
-                              projection->route_vnode_count, error,
+                              projection->route_topology_kind, error,
                               error_len) != 0 ||
         validate_memory_dispatch(&projection->memory_dispatch,
-                                 projection->route_vnode_count, error,
+                                 projection->route_topology_kind, error,
                                  error_len) != 0) {
         set_error(error, error_len, "runtime dispatch projection is invalid");
         return -1;
@@ -329,8 +343,7 @@ int wvm_runtime_dispatch_projection_build(
     const struct wvm_route_rule_record *local_route;
     struct wvm_runtime_cpu_dispatch_list cpu_dispatch;
     struct wvm_runtime_memory_dispatch_list memory_dispatch;
-    uint32_t route_count;
-    uint32_t local_primary_vnode;
+    struct wvm_runtime_route_destination local_primary;
     size_t i;
 
     if (!candidate || !runtime_manifest || !records || !route_snapshot ||
@@ -353,7 +366,7 @@ int wvm_runtime_dispatch_projection_build(
                          &runtime_manifest->required_route_snapshot_key) ||
         !route_key_equal(&runtime_manifest->required_route_snapshot_key,
                          &route_snapshot->route_snapshot_key) ||
-        route_snapshot->topology_kind != WVM_ROUTE_TOPOLOGY_FLAT ||
+        !route_topology_valid(route_snapshot->topology_kind) ||
         candidate->vcpu_placements.count > projection->cpu_dispatch.capacity ||
         candidate->memory_placements.count >
             projection->memory_dispatch.capacity ||
@@ -368,11 +381,13 @@ int wvm_runtime_dispatch_projection_build(
     if (!local_node ||
         local_node->node_instance_id !=
             runtime_manifest->expected_node_instance_id ||
-        primary_vnode_for_node(records, runtime_manifest->physical_node_id,
-                               &local_primary_vnode, error, error_len) != 0 ||
-        route_vnode_count(route_snapshot, &route_count, error, error_len) !=
-            0 ||
-        !(local_route = find_exact_route(route_snapshot, local_primary_vnode)) ||
+        primary_destination_for_node(
+            records, runtime_manifest->physical_node_id,
+            route_snapshot->topology_kind, &local_primary, error,
+            error_len) != 0 ||
+        !(local_route = find_exact_route(
+              route_snapshot, local_primary.destination_scope,
+              local_primary.destination_vnode)) ||
         !endpoint_is_legacy_udp_v4(&local_route->next_hop_endpoint)) {
         set_error(error, error_len,
                   "runtime dispatch has no admitted local sidecar route");
@@ -399,20 +414,21 @@ int wvm_runtime_dispatch_projection_build(
            sizeof(projection->activation_fence));
     projection->required_route_snapshot_key =
         runtime_manifest->required_route_snapshot_key;
-    projection->local_primary_vnode = local_primary_vnode;
-    projection->route_vnode_count = route_count;
+    projection->route_topology_kind = route_snapshot->topology_kind;
+    projection->local_primary = local_primary;
     projection->local_sidecar_endpoint = local_route->next_hop_endpoint;
 
     for (i = 0; i < candidate->vcpu_placements.count; i++) {
-        uint32_t executor_vnode;
+        struct wvm_runtime_route_destination executor;
         const struct wvm_vcpu_assignment *assignment =
             &candidate->vcpu_placements.entries[i];
 
-        if (primary_vnode_for_node(records,
-                                   assignment->executor_physical_node_id,
-                                   &executor_vnode, error, error_len) != 0 ||
-            executor_vnode >= route_count ||
-            !find_exact_route(route_snapshot, executor_vnode)) {
+        if (primary_destination_for_node(
+                records, assignment->executor_physical_node_id,
+                route_snapshot->topology_kind, &executor, error,
+                error_len) != 0 ||
+            !find_exact_route(route_snapshot, executor.destination_scope,
+                              executor.destination_vnode)) {
             set_error(error, error_len,
                       "vCPU %u has no admitted runtime route",
                       assignment->guest_vcpu_index);
@@ -421,24 +437,31 @@ int wvm_runtime_dispatch_projection_build(
         projection->cpu_dispatch.entries[projection->cpu_dispatch.count++] =
             (struct wvm_runtime_cpu_dispatch){
                 .guest_vcpu_index = assignment->guest_vcpu_index,
-                .executor_vnode = executor_vnode,
+                .executor = executor,
             };
     }
     for (i = 0; i < candidate->memory_placements.count; i++) {
-        uint32_t directory_vnode;
-        uint32_t executor_vnode;
+        struct wvm_runtime_route_destination directory;
+        struct wvm_runtime_route_destination executor;
         const struct wvm_memory_chunk_assignment *assignment =
             &candidate->memory_placements.entries[i];
+        const struct wvm_node_record *directory_node;
 
-        if (primary_vnode_for_node(records,
-                                   assignment->directory_physical_node_id,
-                                   &directory_vnode, error, error_len) != 0 ||
-            primary_vnode_for_node(records,
-                                   assignment->executor_physical_node_id,
-                                   &executor_vnode, error, error_len) != 0 ||
-            directory_vnode >= route_count || executor_vnode >= route_count ||
-            !find_exact_route(route_snapshot, directory_vnode) ||
-            !find_exact_route(route_snapshot, executor_vnode)) {
+        directory_node =
+            find_node(records, assignment->directory_physical_node_id);
+        if (primary_destination_for_node(
+                records, assignment->directory_physical_node_id,
+                route_snapshot->topology_kind, &directory, error,
+                error_len) != 0 ||
+            primary_destination_for_node(
+                records, assignment->executor_physical_node_id,
+                route_snapshot->topology_kind, &executor, error,
+                error_len) != 0 ||
+            !directory_node || directory_node->node_instance_id == 0 ||
+            !find_exact_route(route_snapshot, directory.destination_scope,
+                              directory.destination_vnode) ||
+            !find_exact_route(route_snapshot, executor.destination_scope,
+                              executor.destination_vnode)) {
             set_error(error, error_len,
                       "memory range %#llx has no admitted runtime route",
                       (unsigned long long)assignment->gpa_start);
@@ -449,13 +472,71 @@ int wvm_runtime_dispatch_projection_build(
             (struct wvm_runtime_memory_dispatch){
                 .gpa_start = assignment->gpa_start,
                 .bytes = assignment->bytes,
-                .directory_vnode = directory_vnode,
-                .executor_vnode = executor_vnode,
+                .directory = directory,
+                .executor = executor,
+                .directory_physical_node_id =
+                    assignment->directory_physical_node_id,
+                .directory_node_instance_id =
+                    directory_node->node_instance_id,
                 .consistency_policy = assignment->consistency_policy,
             };
     }
     return wvm_runtime_dispatch_projection_validate(projection, error,
                                                     error_len);
+}
+
+const struct wvm_runtime_cpu_dispatch *wvm_runtime_dispatch_find_cpu(
+    const struct wvm_runtime_dispatch_projection *projection,
+    uint32_t guest_vcpu_index)
+{
+    size_t left = 0;
+    size_t right;
+
+    if (!projection || !projection->cpu_dispatch.entries) {
+        return NULL;
+    }
+    right = projection->cpu_dispatch.count;
+    while (left < right) {
+        size_t middle = left + (right - left) / 2U;
+        const struct wvm_runtime_cpu_dispatch *entry =
+            &projection->cpu_dispatch.entries[middle];
+
+        if (entry->guest_vcpu_index == guest_vcpu_index) {
+            return entry;
+        }
+        if (entry->guest_vcpu_index < guest_vcpu_index) {
+            left = middle + 1U;
+        } else {
+            right = middle;
+        }
+    }
+    return NULL;
+}
+
+const struct wvm_runtime_memory_dispatch *wvm_runtime_dispatch_find_memory(
+    const struct wvm_runtime_dispatch_projection *projection, uint64_t gpa)
+{
+    size_t left = 0;
+    size_t right;
+
+    if (!projection || !projection->memory_dispatch.entries) {
+        return NULL;
+    }
+    right = projection->memory_dispatch.count;
+    while (left < right) {
+        size_t middle = left + (right - left) / 2U;
+        const struct wvm_runtime_memory_dispatch *entry =
+            &projection->memory_dispatch.entries[middle];
+
+        if (gpa < entry->gpa_start) {
+            right = middle;
+        } else if (gpa - entry->gpa_start >= entry->bytes) {
+            left = middle + 1U;
+        } else {
+            return entry;
+        }
+    }
+    return NULL;
 }
 
 static int encode_cpu_list(const struct wvm_runtime_cpu_dispatch_list *list,
@@ -475,7 +556,12 @@ static int encode_cpu_list(const struct wvm_runtime_cpu_dispatch_list *list,
                          i * WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES;
 
         write_be32(entry, list->entries[i].guest_vcpu_index);
-        write_be32(entry + 4, list->entries[i].executor_vnode);
+        write_be16(entry + 4,
+                   list->entries[i].executor.destination_kind);
+        write_be64(entry + 6,
+                   list->entries[i].executor.destination_scope);
+        write_be32(entry + 14,
+                   list->entries[i].executor.destination_vnode);
     }
     return 0;
 }
@@ -501,9 +587,15 @@ static int encode_memory_list(
 
         write_be64(entry, source->gpa_start);
         write_be64(entry + 8, source->bytes);
-        write_be32(entry + 16, source->directory_vnode);
-        write_be32(entry + 20, source->executor_vnode);
-        write_be16(entry + 24, source->consistency_policy);
+        write_be16(entry + 16, source->directory.destination_kind);
+        write_be64(entry + 18, source->directory.destination_scope);
+        write_be32(entry + 26, source->directory.destination_vnode);
+        write_be16(entry + 30, source->executor.destination_kind);
+        write_be64(entry + 32, source->executor.destination_scope);
+        write_be32(entry + 40, source->executor.destination_vnode);
+        write_be32(entry + 44, source->directory_physical_node_id);
+        write_be64(entry + 48, source->directory_node_instance_id);
+        write_be16(entry + 56, source->consistency_policy);
     }
     return 0;
 }
@@ -566,22 +658,26 @@ int wvm_runtime_dispatch_projection_encode(
         return -1;
     }
     memcpy(field_value, route_key_bytes, route_key_byte_count);
-    if (wvm_canonical_field_append_u32(&builder, 9,
-                                       projection->local_primary_vnode) != 0 ||
-        wvm_canonical_field_append_u32(&builder, 10,
-                                       projection->route_vnode_count) != 0 ||
-        wvm_canonical_field_reserve(&builder, 11,
+    if (wvm_canonical_field_append_u16(&builder, 9,
+                                       projection->route_topology_kind) != 0 ||
+        wvm_canonical_field_append_u16(
+            &builder, 10, projection->local_primary.destination_kind) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 11, projection->local_primary.destination_scope) != 0 ||
+        wvm_canonical_field_append_u32(
+            &builder, 12, projection->local_primary.destination_vnode) != 0 ||
+        wvm_canonical_field_reserve(&builder, 13,
                                     (uint32_t)endpoint_byte_count,
                                     &field_value) != 0) {
         set_error(error, error_len, "cannot encode runtime dispatch projection");
         return -1;
     }
     memcpy(field_value, endpoint_bytes, endpoint_byte_count);
-    if (wvm_canonical_field_reserve(&builder, 12, (uint32_t)cpu_byte_count,
+    if (wvm_canonical_field_reserve(&builder, 14, (uint32_t)cpu_byte_count,
                                     &field_value) != 0 ||
         encode_cpu_list(&projection->cpu_dispatch, field_value,
                         cpu_byte_count) != 0 ||
-        wvm_canonical_field_reserve(&builder, 13, (uint32_t)memory_byte_count,
+        wvm_canonical_field_reserve(&builder, 15, (uint32_t)memory_byte_count,
                                     &field_value) != 0 ||
         encode_memory_list(&projection->memory_dispatch, field_value,
                            memory_byte_count) != 0 ||
@@ -593,8 +689,8 @@ int wvm_runtime_dispatch_projection_encode(
 }
 
 static int collect_fields(const uint8_t *bytes, size_t encoded_bytes,
-                          struct wvm_canonical_field fields[14],
-                          unsigned char present[14], char *error,
+                          struct wvm_canonical_field fields[16],
+                          unsigned char present[16], char *error,
                           size_t error_len)
 {
     struct wvm_canonical_record record;
@@ -607,10 +703,10 @@ static int collect_fields(const uint8_t *bytes, size_t encoded_bytes,
         set_error(error, error_len, "runtime dispatch record is malformed");
         return -1;
     }
-    memset(fields, 0, sizeof(struct wvm_canonical_field) * 14);
-    memset(present, 0, 14);
+    memset(fields, 0, sizeof(struct wvm_canonical_field) * 16);
+    memset(present, 0, 16);
     while ((next = wvm_canonical_record_next(&record, &offset, &field)) == 1) {
-        if (field.tag == 0 || field.tag > 13 || present[field.tag]) {
+        if (field.tag == 0 || field.tag > 15 || present[field.tag]) {
             set_error(error, error_len,
                       "runtime dispatch record has an unknown field");
             return -1;
@@ -622,7 +718,7 @@ static int collect_fields(const uint8_t *bytes, size_t encoded_bytes,
         set_error(error, error_len, "runtime dispatch record is malformed");
         return -1;
     }
-    for (size_t i = 1; i <= 13; i++) {
+    for (size_t i = 1; i <= 15; i++) {
         if (!present[i]) {
             set_error(error, error_len,
                       "runtime dispatch record misses field %zu", i);
@@ -669,7 +765,9 @@ static int decode_cpu_list(const struct wvm_canonical_field *field,
                                i * WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES;
 
         list->entries[i].guest_vcpu_index = read_be32(entry);
-        list->entries[i].executor_vnode = read_be32(entry + 4);
+        list->entries[i].executor.destination_kind = read_be16(entry + 4);
+        list->entries[i].executor.destination_scope = read_be64(entry + 6);
+        list->entries[i].executor.destination_vnode = read_be32(entry + 14);
     }
     return 0;
 }
@@ -694,9 +792,15 @@ static int decode_memory_list(
 
         list->entries[i].gpa_start = read_be64(entry);
         list->entries[i].bytes = read_be64(entry + 8);
-        list->entries[i].directory_vnode = read_be32(entry + 16);
-        list->entries[i].executor_vnode = read_be32(entry + 20);
-        list->entries[i].consistency_policy = read_be16(entry + 24);
+        list->entries[i].directory.destination_kind = read_be16(entry + 16);
+        list->entries[i].directory.destination_scope = read_be64(entry + 18);
+        list->entries[i].directory.destination_vnode = read_be32(entry + 26);
+        list->entries[i].executor.destination_kind = read_be16(entry + 30);
+        list->entries[i].executor.destination_scope = read_be64(entry + 32);
+        list->entries[i].executor.destination_vnode = read_be32(entry + 40);
+        list->entries[i].directory_physical_node_id = read_be32(entry + 44);
+        list->entries[i].directory_node_instance_id = read_be64(entry + 48);
+        list->entries[i].consistency_policy = read_be16(entry + 56);
     }
     return 0;
 }
@@ -706,8 +810,8 @@ int wvm_runtime_dispatch_projection_decode(
     struct wvm_runtime_dispatch_projection *projection, char *error,
     size_t error_len)
 {
-    struct wvm_canonical_field fields[14];
-    unsigned char present[14];
+    struct wvm_canonical_field fields[16];
+    unsigned char present[16];
     struct wvm_runtime_cpu_dispatch_list cpu_dispatch;
     struct wvm_runtime_memory_dispatch_list memory_dispatch;
 
@@ -719,7 +823,8 @@ int wvm_runtime_dispatch_projection_decode(
         fields[4].value_bytes != 8 || fields[5].value_bytes != 4 ||
         fields[6].value_bytes != 8 ||
         fields[7].value_bytes != WVM_IDENTITY_ID_BYTES ||
-        fields[9].value_bytes != 4 || fields[10].value_bytes != 4) {
+        fields[9].value_bytes != 2 || fields[10].value_bytes != 2 ||
+        fields[11].value_bytes != 8 || fields[12].value_bytes != 4) {
         set_error(error, error_len, "runtime dispatch record has invalid fields");
         return -1;
     }
@@ -737,16 +842,18 @@ int wvm_runtime_dispatch_projection_decode(
     projection->expected_node_instance_id = read_be64(fields[6].value);
     memcpy(projection->activation_fence, fields[7].value,
            sizeof(projection->activation_fence));
-    projection->local_primary_vnode = read_be32(fields[9].value);
-    projection->route_vnode_count = read_be32(fields[10].value);
+    projection->route_topology_kind = read_be16(fields[9].value);
+    projection->local_primary.destination_kind = read_be16(fields[10].value);
+    projection->local_primary.destination_scope = read_be64(fields[11].value);
+    projection->local_primary.destination_vnode = read_be32(fields[12].value);
     if (wvm_route_snapshot_key_decode(
             fields[8].value, fields[8].value_bytes,
             &projection->required_route_snapshot_key, error, error_len) != 0 ||
-        wvm_endpoint_decode(fields[11].value, fields[11].value_bytes,
+        wvm_endpoint_decode(fields[13].value, fields[13].value_bytes,
                             &projection->local_sidecar_endpoint, error,
                             error_len) != 0 ||
-        decode_cpu_list(&fields[12], &projection->cpu_dispatch) != 0 ||
-        decode_memory_list(&fields[13], &projection->memory_dispatch) != 0) {
+        decode_cpu_list(&fields[14], &projection->cpu_dispatch) != 0 ||
+        decode_memory_list(&fields[15], &projection->memory_dispatch) != 0) {
         set_error(error, error_len, "runtime dispatch list decoding failed");
         return -1;
     }
@@ -946,13 +1053,13 @@ out:
 static int find_dispatch_list_counts(const uint8_t *bytes, size_t byte_count,
                                      size_t *cpu_count, size_t *memory_count)
 {
-    struct wvm_canonical_field fields[14];
-    unsigned char present[14];
+    struct wvm_canonical_field fields[16];
+    unsigned char present[16];
 
     if (collect_fields(bytes, byte_count, fields, present, NULL, 0) != 0 ||
-        list_count(&fields[12], WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES,
+        list_count(&fields[14], WVM_RUNTIME_DISPATCH_CPU_ENTRY_BYTES,
                    WVM_CPU_ROUTE_TABLE_SIZE, cpu_count) != 0 ||
-        list_count(&fields[13], WVM_RUNTIME_DISPATCH_MEMORY_ENTRY_BYTES,
+        list_count(&fields[15], WVM_RUNTIME_DISPATCH_MEMORY_ENTRY_BYTES,
                    WVM_MEMORY_ROUTE_TABLE_SIZE, memory_count) != 0) {
         return -1;
     }

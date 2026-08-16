@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "wavevm_cluster.h"
+#include "wavevm_envelope_v1.h"
 #include "wavevm_route_delivery.h"
 
 #define WVM_RECORD_RUNTIME_DISPATCH_PROJECTION 0x1028U
@@ -12,20 +13,28 @@
 #define WVM_RUNTIME_DISPATCH_PATH_MAX 4096U
 
 /*
- * This is a derived cache for the legacy logic-core adapter.  It is not a
+ * This is a derived cache for the node-runtime dispatch boundary. It is not a
  * second placement or routing authority: every field is bound to one admitted
  * manifest, one activated local runtime projection, and one route snapshot.
  */
+struct wvm_runtime_route_destination {
+    uint16_t destination_kind;
+    uint64_t destination_scope;
+    uint32_t destination_vnode;
+};
+
 struct wvm_runtime_cpu_dispatch {
     uint32_t guest_vcpu_index;
-    uint32_t executor_vnode;
+    struct wvm_runtime_route_destination executor;
 };
 
 struct wvm_runtime_memory_dispatch {
     uint64_t gpa_start;
     uint64_t bytes;
-    uint32_t directory_vnode;
-    uint32_t executor_vnode;
+    struct wvm_runtime_route_destination directory;
+    struct wvm_runtime_route_destination executor;
+    uint32_t directory_physical_node_id;
+    uint64_t directory_node_instance_id;
     uint16_t consistency_policy;
 };
 
@@ -50,8 +59,8 @@ struct wvm_runtime_dispatch_projection {
     uint64_t expected_node_instance_id;
     uint8_t activation_fence[WVM_IDENTITY_ID_BYTES];
     struct wvm_route_snapshot_key required_route_snapshot_key;
-    uint32_t local_primary_vnode;
-    uint32_t route_vnode_count;
+    uint16_t route_topology_kind;
+    struct wvm_runtime_route_destination local_primary;
     struct wvm_endpoint local_sidecar_endpoint;
     struct wvm_runtime_cpu_dispatch_list cpu_dispatch;
     struct wvm_runtime_memory_dispatch_list memory_dispatch;
@@ -85,6 +94,17 @@ int wvm_runtime_dispatch_projection_build(
 int wvm_runtime_dispatch_projection_validate(
     const struct wvm_runtime_dispatch_projection *projection, char *error,
     size_t error_len);
+
+/*
+ * Resolve one admitted placement without consulting launcher configuration or
+ * legacy raw node IDs. The returned pointer is owned by the projection.
+ */
+const struct wvm_runtime_cpu_dispatch *wvm_runtime_dispatch_find_cpu(
+    const struct wvm_runtime_dispatch_projection *projection,
+    uint32_t guest_vcpu_index);
+const struct wvm_runtime_memory_dispatch *wvm_runtime_dispatch_find_memory(
+    const struct wvm_runtime_dispatch_projection *projection, uint64_t gpa);
+
 int wvm_runtime_dispatch_projection_encode(
     const struct wvm_runtime_dispatch_projection *projection, uint8_t *bytes,
     size_t capacity, size_t *encoded_bytes, char *error, size_t error_len);

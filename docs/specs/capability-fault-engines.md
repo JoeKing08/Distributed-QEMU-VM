@@ -153,6 +153,45 @@ regardless of the selected engine.
 6. Every selected engine and fallback has an explicit reason and profile digest
    visible to diagnostics and CI.
 
+### 3.1.1 Heterogeneous Compute Clusters
+
+Execution capability is advertised per node and is not a mutually exclusive
+node label. A node with usable KVM may advertise both `EXECUTION_KVM` and
+`EXECUTION_TCG` when its TCG helper/context probe passes. A node without KVM
+normally advertises TCG only. Neither execution capability by itself decides
+whether the node may provide guest memory: memory participation is governed by
+the node's memory-service capability, capacity, route scope, and negotiated
+memory profile.
+
+For one VM incarnation, every vCPU assignment uses the one backend recorded in
+the admitted execution profile. A KVM-capable node may therefore contribute
+TCG vCPU capacity to a TCG VM, but it executes that VM through its TCG helper;
+it does not create a mixed KVM/TCG vCPU plan. Backend selection is a
+pre-activation admission decision, not a runtime downgrade or context
+conversion.
+
+`AUTO` has deterministic KVM-first semantics:
+
+1. The coordinator first attempts a complete KVM plan whose frontend and every
+   required vCPU executor satisfy the KVM capability and context-schema
+   requirements.
+2. If no complete KVM plan is admissible, it may create a new complete TCG
+   plan when the request permits fallback and all selected TCG executors pass
+   their probes.
+3. The fallback is a new plan and reservation attempt. It must not reuse a
+   partially reserved KVM plan, and the selected backend and reason are recorded
+   in the candidate/admitted manifest.
+
+`REQUIRE_KVM` never performs this downgrade: if a complete KVM plan cannot be
+admitted, the request fails before any process starts. `REQUIRE_TCG` selects
+TCG directly. A KVM-to-TCG or TCG-to-KVM transition after `RUNNING` remains
+outside V1.
+
+TCG capacity on a KVM-capable node is a separately advertised and accounted
+capacity class. It must not be inferred by copying KVM vCPU capacity, and
+reservations for KVM and TCG work must still obey the node's shared host CPU
+and overhead budget.
+
 ### 3.2 Engine Matrix
 
 | Backend/path | Dirty capture | Read fault/resync | Invalidation rule |

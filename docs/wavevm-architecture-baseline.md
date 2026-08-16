@@ -394,6 +394,15 @@ V1 supports a homogeneous execution backend inside one VM:
 - KVM frontend to KVM execution runtime.
 - TCG frontend to TCG execution runtime.
 
+The cluster itself may be heterogeneous. A physical node with KVM may
+advertise both KVM and TCG executor capability when its TCG helper is valid;
+a node without KVM normally advertises TCG only. `AUTO` admission prefers a
+complete KVM placement and, if that cannot be admitted, creates a new complete
+TCG placement and records the fallback before activation. `REQUIRE_KVM` fails
+instead of degrading. Guest memory placement is independent of this choice:
+KVM and TCG VMs may use memory participants without KVM when their memory
+service capability, capacity, and route are valid.
+
 Mode A and Mode B may still be mixed between nodes because kernel acceleration
 is independent of the execution backend. KVM-to-TCG or TCG-to-KVM vCPU handoff
 is not a V1 capability. It must fail capability negotiation rather than attempt

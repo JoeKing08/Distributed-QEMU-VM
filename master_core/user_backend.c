@@ -36,6 +36,7 @@
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_executor_abi.h"
+#include "../node_runtime/v1_ingress.h"
 
 extern int wvm_logic_route_snapshot_valid(void);
 
@@ -1389,6 +1390,22 @@ static void* rx_thread_loop(void *arg) {
             int total_len = msgs[i].msg_len;                   // UDP包总长
             int offset = 0;                                    // 当前游标
             uint32_t src_ip = src_addrs[i].sin_addr.s_addr;    // 源IP
+
+            /*
+             * V1 frames are whole UDP datagrams, not legacy aggregate
+             * members. They must be consumed before legacy header parsing so
+             * a malformed/new V1 frame can never be reinterpreted as a
+             * wvm_header. The coordinator role is linked only into the
+             * unified node runtime, so every V1 frame has one mandatory
+             * ingress path.
+             */
+            if (total_len >= 4 && base_ptr[0] == 'W' &&
+                base_ptr[1] == 'V' && base_ptr[2] == 'M' &&
+                base_ptr[3] == '1') {
+                (void)wvm_v1_ingress_handle_datagram(base_ptr,
+                                                      (size_t)total_len);
+                continue;
+            }
 
             // 循环解包：只要剩余数据够一个Header，就继续解析
             while (offset + sizeof(struct wvm_header) <= total_len) {

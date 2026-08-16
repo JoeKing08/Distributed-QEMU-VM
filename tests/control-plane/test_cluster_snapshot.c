@@ -187,7 +187,10 @@ int main(void)
                    snapshot.admission.nodes[0].backend_capabilities ==
                        (WVM_ADMISSION_BACKEND_CAP_KVM |
                         WVM_ADMISSION_BACKEND_CAP_TCG),
-               "derive Mode B backend eligibility")) {
+               "derive Mode B backend eligibility") ||
+        expect(snapshot.admission.nodes[0].runtime_capabilities ==
+                   WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY,
+               "derive independent Mode B memory eligibility")) {
         return 1;
     }
     memset(constraints, 0, sizeof(constraints));

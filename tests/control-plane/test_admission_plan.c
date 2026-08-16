@@ -26,6 +26,7 @@ static struct wvm_admission_node make_node(uint32_t id, uint64_t instance,
     node.health_state = WVM_ADMISSION_HEALTHY;
     node.backend_capabilities =
         WVM_ADMISSION_BACKEND_CAP_KVM | WVM_ADMISSION_BACKEND_CAP_TCG;
+    node.runtime_capabilities = WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY;
     node.registered_vcpu_slots = vcpus + 1;
     node.registered_memory_bytes = memory + WVM_ADMISSION_PAGE_BYTES;
     node.reserved_host_vcpu_slots = 1;
@@ -57,6 +58,30 @@ static void fill_valid_plan(struct wvm_admission_plan *plan)
     plan->reservations[1].expected_node_instance_id = 202;
     plan->reservations[1].expected_inventory_revision = 23;
     plan->reservations[1].guest_vcpu_slots = 1;
+    plan->reservations[1].guest_memory_bytes = 4 * 1024 * 1024;
+}
+
+static void fill_kvm_memory_only_plan(struct wvm_admission_plan *plan)
+{
+    memset(plan, 0, sizeof(*plan));
+    plan->admission_tx_id[WVM_ADMISSION_ID_BYTES - 1] = 1;
+    plan->membership_revision = 7;
+    plan->topology_revision = 11;
+    plan->capability_profile_generation = 13;
+    plan->host_physical_node_id = 17;
+    plan->reservation_count = 2;
+
+    plan->reservations[0].physical_node_id = 17;
+    plan->reservations[0].expected_node_instance_id = 101;
+    plan->reservations[0].expected_inventory_revision = 19;
+    plan->reservations[0].guest_vcpu_slots = 3;
+    plan->reservations[0].guest_memory_bytes = 4 * 1024 * 1024;
+    plan->reservations[0].host_overhead_vcpu_slots = 1;
+    plan->reservations[0].host_overhead_memory_bytes = 1 * 1024 * 1024;
+
+    plan->reservations[1].physical_node_id = 99;
+    plan->reservations[1].expected_node_instance_id = 202;
+    plan->reservations[1].expected_inventory_revision = 23;
     plan->reservations[1].guest_memory_bytes = 4 * 1024 * 1024;
 }
 
@@ -199,6 +224,32 @@ int main(void)
 
     snapshot.nodes[1].backend_capabilities =
         WVM_ADMISSION_BACKEND_CAP_KVM | WVM_ADMISSION_BACKEND_CAP_TCG;
+    snapshot.nodes[0] = make_node(17, 101, 19, 4, 8 * 1024 * 1024);
+    snapshot.nodes[1].backend_capabilities = 0;
+    request.backend = WVM_ADMISSION_BACKEND_KVM;
+    fill_kvm_memory_only_plan(&plan);
+    if (expect(wvm_admission_plan_validate(&snapshot, &request, &plan, error,
+                                           sizeof(error)) == 0,
+               "allow a Mode B memory-only participant without KVM") ||
+        expect(wvm_admission_placement_plan_build(
+                   &snapshot, &request, &plan, eligibility_fence_digest,
+                   &options, &placement_plan, error, sizeof(error)) == 0 &&
+                   placement_plan.vcpu_assignments.count == 3 &&
+                   placement_plan.memory_assignments.count == 4,
+               "materialize homogeneous KVM CPU and memory-only placement")) {
+        return 1;
+    }
+    snapshot.nodes[1].runtime_capabilities = 0;
+    if (expect(wvm_admission_plan_validate(&snapshot, &request, &plan, error,
+                                           sizeof(error)) != 0,
+               "reject a memory participant without Mode B memory service")) {
+        return 1;
+    }
+    snapshot.nodes[1].runtime_capabilities =
+        WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY;
+    snapshot.nodes[1].backend_capabilities =
+        WVM_ADMISSION_BACKEND_CAP_KVM | WVM_ADMISSION_BACKEND_CAP_TCG;
+    request.backend = WVM_ADMISSION_BACKEND_TCG;
     request.vm_id = 0;
     if (expect(wvm_admission_plan_validate(&snapshot, &request, &plan, error,
                                            sizeof(error)) != 0,

@@ -138,7 +138,7 @@ static int capability_set_validate(const struct wvm_cluster_record_set *records,
 static int node_capability_profile(
     const struct wvm_cluster_record_set *records,
     const struct wvm_node_record *node, uint32_t *backend_capabilities,
-    char *error, size_t error_len)
+    uint32_t *runtime_capabilities, char *error, size_t error_len)
 {
     size_t start = records->capability_record_count;
     size_t end = records->capability_record_count;
@@ -188,6 +188,10 @@ static int node_capability_profile(
         return -1;
     }
     *backend_capabilities = 0;
+    *runtime_capabilities = 0;
+    if (mode_b_available) {
+        *runtime_capabilities |= WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY;
+    }
     if (mode_b_available && kvm_available) {
         *backend_capabilities |= WVM_ADMISSION_BACKEND_CAP_KVM;
     }
@@ -433,8 +437,10 @@ int wvm_cluster_snapshot_build(
         struct wvm_admission_node *admission_node =
             &snapshot->admission.nodes[i];
         uint32_t backend_capabilities;
+        uint32_t runtime_capabilities;
 
-        if (node_capability_profile(records, node, &backend_capabilities, error,
+        if (node_capability_profile(records, node, &backend_capabilities,
+                                    &runtime_capabilities, error,
                                     error_len) != 0) {
             return -1;
         }
@@ -446,6 +452,7 @@ int wvm_cluster_snapshot_build(
         admission_node->health_state =
             (enum wvm_admission_health_state)node->observed_health_state;
         admission_node->backend_capabilities = backend_capabilities;
+        admission_node->runtime_capabilities = runtime_capabilities;
         admission_node->registered_vcpu_slots =
             node->inventory.registered_vcpu_slots;
         admission_node->registered_memory_bytes =

@@ -164,9 +164,11 @@ RouteSnapshotKey = {
 ```
 
 `destination_scope` is empty for a flat route domain and is a Pod/prefix for a
-fractal route domain. The exact bit allocation and wire encoding are decided by
-`wire-ipc-abi.md`; this specification fixes the required semantics, not a
-premature packed layout.
+fractal route domain. The exact V1 wire carriage is the 24-byte routed-frame
+prefix in `wire-ipc-abi.md`: its `destination_kind`,
+`destination_scope`, and `destination_vnode_or_endpoint` fields complete this
+key. The prefix is forwarding metadata protected by the frame CRC but excluded
+from the semantic payload digest.
 
 The logical destination form is:
 
@@ -239,6 +241,14 @@ In a fractal topology:
 - A root or upper-level gateway maps a destination Pod/prefix to a subtree.
 - Every level preserves the original VM namespace and incarnation. Hierarchy
   does not authorize a raw-ID lookup or VM-namespace stripping.
+
+The canonical route-rule shape is deliberately stricter than the wire key:
+an `EXACT_VNODE` rule denotes one `{scope, vnode}` leaf destination, while a
+`PREFIX` rule has a nonzero scope, `destination_vnode_or_endpoint=0`, and a
+`GATEWAY` next hop whose member role is `GATEWAY`. A flat snapshot contains
+only exact rules with `destination_scope=0`. A fractal exact rule has a
+nonzero destination scope. These are control-plane validation rules, so a
+gateway never receives an ambiguous snapshot that can only fail at lookup.
 
 The control plane chooses `flat`, `fractal`, or `auto` from the cluster graph,
 fan-out policy, and active topology. A VM request may express placement policy

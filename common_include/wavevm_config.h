@@ -94,6 +94,7 @@
  * 作用：Diff 计算、版本号校验、写冲突检测都精确到 4KB。
  */
 #define WVM_PAGE_SHIFT 12
+#define WVM_PAGE_BYTES (1UL << WVM_PAGE_SHIFT)
 
 #define WVM_DEFAULT_SHM_PATH "/wavevm_ram"
 

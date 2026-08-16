@@ -147,11 +147,18 @@ their base-version order.
 2. If the local node is the directory, it copies the current directory bytes
    and version under the page lock.
 3. Otherwise the local node runtime sends `MSG_MEM_READ` to the manifest-selected
-   directory with a nonzero request ID.
-4. The directory replies with `MSG_MEM_ACK` containing exactly
-   `wvm_mem_ack_payload { gpa, version, data[4096] }`.
-5. The requester verifies VM incarnation, request ID, GPA, directory identity,
-   payload size, and checksum before installing the page as `CLEAN(version)`.
+   directory with a nonzero request ID. Its typed V1 payload contains the
+   4-KiB-aligned GPA and the complete reply leaf RouteKey
+   `{destination_kind, destination_scope, destination_vnode}`.
+4. The directory resolves that reply RouteKey from its admitted immutable route
+   snapshot and returns `MSG_MEM_ACK`. A successful typed V1 ACK contains
+   `{gpa, version, status=SUCCESS, directory_physical_node_id,
+   directory_node_instance_id, data[4096]}`; a terminal status contains no
+   page data. The reply preserves the request operation identity and changes
+   only forwarding metadata and outer route destination.
+5. The requester verifies VM incarnation, complete operation key, GPA,
+   directory identity, status, payload size, and checksum before installing
+   the page as `CLEAN(version)`.
 6. The directory records the requester as an `ACTIVE` subscriber after
    producing the reply snapshot, with current node/runtime identity, route
    snapshot key, observed version, and a `HINT` delivery requirement unless a
@@ -199,6 +206,12 @@ route predecessor completion-query/retry horizon. A rerouted duplicate uses the
 same semantic operation key from `wire-ipc-abi.md`; after retention expires it
 returns `RESULT_EXPIRED` and never reapplies the diff.
 
+`BACKPRESSURE` means the directory declined before applying bytes. It is not a
+completed mutation result: the directory retains the operation ID and semantic
+payload digest to reject conflicting reuse, but an identical retry may perform
+the apply when capacity returns. Terminal results and successful commits are
+the only outcomes replayed from the completion cache.
+
 The canonical commit ACK must contain:
 
 ```text
@@ -206,6 +219,8 @@ commit_ack {
     gpa;
     result_version;
     status;
+    directory_physical_node_id;
+    directory_node_instance_id;
 }
 ```
 

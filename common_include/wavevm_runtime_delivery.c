@@ -84,8 +84,9 @@ static int projection_equal(const struct wvm_runtime_dispatch_projection *left,
                sizeof(left->activation_fence)) != 0 ||
         !route_key_equal(&left->required_route_snapshot_key,
                          &right->required_route_snapshot_key) ||
-        left->local_primary_vnode != right->local_primary_vnode ||
-        left->route_vnode_count != right->route_vnode_count ||
+        left->route_topology_kind != right->route_topology_kind ||
+        memcmp(&left->local_primary, &right->local_primary,
+               sizeof(left->local_primary)) != 0 ||
         memcmp(&left->local_sidecar_endpoint, &right->local_sidecar_endpoint,
                sizeof(left->local_sidecar_endpoint)) != 0) {
         return 0;

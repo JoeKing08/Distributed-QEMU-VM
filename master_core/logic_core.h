@@ -62,6 +62,24 @@ int wvm_handle_page_fault_logic(uint64_t gpa, void *page_buffer, uint64_t *versi
 // [V29] 本地缺页快速路径 (内核态专用)
 int wvm_handle_local_fault_fastpath(uint64_t gpa, void* page_buffer, uint64_t *version_out);
 
+/*
+ * Apply one V1 version-checked diff to the local directory page. This is a
+ * local semantic adapter only: it does not emit network traffic or push
+ * notifications. Completion and subscriber delivery stay above this layer.
+ */
+int wvm_handle_local_commit_v1(uint64_t gpa, uint64_t base_version,
+                               uint16_t offset, const uint8_t *data,
+                               size_t data_bytes, uint64_t *result_version);
+
+/*
+ * Publish an already-applied V1 commit to the captured subscriber set.
+ * Queueing is performed after the page lock is released; the directory
+ * mutation remains authoritative even if a best-effort HINT push is dropped.
+ */
+int wvm_publish_local_commit_v1(uint64_t gpa, uint64_t result_version,
+                                uint16_t offset, const uint8_t *data,
+                                size_t data_bytes, uint32_t writer_node_id);
+
 // [V29] 宣告兴趣 (异步)
 void wvm_declare_interest_in_neighborhood(uint64_t gpa);
 

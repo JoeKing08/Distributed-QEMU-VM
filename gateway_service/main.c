@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include "aggregator.h"
 #include "../common_include/wavevm_protocol.h" 
+#include "../common_include/wavevm_route_delivery.h"
 #include "../common_include/wavevm_runtime_gate.h"
 
 static struct wvm_runtime_manifest_storage g_gateway_manifest_storage;
@@ -38,6 +39,8 @@ static int init_gateway_runtime_gate(void)
     uint64_t node_instance_id;
     uint8_t profile_digest[WVM_SHA256_DIGEST_BYTES];
     struct wvm_runtime_registration registration;
+    struct wvm_route_snapshot_file_storage route_storage;
+    char route_snapshot_path[WVM_ROUTE_DELIVERY_PATH_MAX];
     uint64_t connection_id = 0;
     char error[256] = {0};
 
@@ -52,6 +55,7 @@ static int init_gateway_runtime_gate(void)
         return -1;
     }
     wvm_runtime_manifest_storage_init(&g_gateway_manifest_storage);
+    wvm_route_snapshot_file_storage_init(&route_storage);
     wvm_runtime_gate_init(&g_gateway_runtime_gate);
     if (wvm_runtime_manifest_load_file(
             manifest_path, &g_gateway_manifest_storage, error,
@@ -69,8 +73,38 @@ static int init_gateway_runtime_gate(void)
         fprintf(stderr, "[RuntimeGate] gateway rejected manifest: %s\n",
                 error[0] ? error : "manifest identity mismatch");
         wvm_runtime_manifest_storage_free(&g_gateway_manifest_storage);
+        wvm_route_snapshot_file_storage_free(&route_storage);
         return -1;
     }
+    /*
+     * An active gateway consumes the same manifest-bound route artifact as
+     * the node runtime. Do not let an arbitrary environment path substitute
+     * a stale or unrelated snapshot after the manifest gate has admitted it.
+     */
+    if (wvm_route_snapshot_path_from_manifest(
+            manifest_path, route_snapshot_path, sizeof(route_snapshot_path),
+            error, sizeof(error)) != 0 ||
+        wvm_route_snapshot_file_load(route_snapshot_path, &route_storage,
+                                     error, sizeof(error)) != 0 ||
+        wvm_route_snapshot_file_matches(
+            &route_storage,
+            &g_gateway_manifest_storage.manifest.required_route_snapshot_key,
+            error, sizeof(error)) != 0 ||
+        setenv("WVM_RUNTIME_ROUTE_SNAPSHOT_PATH", route_snapshot_path, 1) !=
+            0) {
+        if (error[0] == '\0') {
+            snprintf(error, sizeof(error),
+                     "cannot select manifest-bound route snapshot: %s",
+                     strerror(errno));
+        }
+        fprintf(stderr,
+                "[RuntimeGate] gateway rejected route snapshot: %s\n",
+                error);
+        wvm_runtime_manifest_storage_free(&g_gateway_manifest_storage);
+        wvm_route_snapshot_file_storage_free(&route_storage);
+        return -1;
+    }
+    wvm_route_snapshot_file_storage_free(&route_storage);
 
     memset(&registration, 0, sizeof(registration));
     registration.connection_role = WVM_MANIFEST_ROLE_GATEWAY;

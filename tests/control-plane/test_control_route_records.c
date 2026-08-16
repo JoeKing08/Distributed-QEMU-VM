@@ -127,6 +127,35 @@ int main(void)
         return 1;
     }
 
+    /*
+     * Route record shapes must match V1 routed-frame semantics before a
+     * snapshot reaches a gateway.  These failures previously survived record
+     * encoding and only appeared as runtime route misses.
+     */
+    rules[0].destination_kind = WVM_ROUTE_DESTINATION_PREFIX;
+    rules[0].destination_scope = 9;
+    rules[0].destination_vnode_or_endpoint = 1;
+    rules[0].next_hop_kind = WVM_ROUTE_NEXT_HOP_GATEWAY;
+    rules[0].next_hop_member.role_type = WVM_MANIFEST_ROLE_GATEWAY;
+    if (expect(wvm_route_snapshot_record_validate(&snapshot, error,
+                                                  sizeof(error)) != 0,
+               "reject prefix with a leaf vnode")) {
+        return 1;
+    }
+    rules[0].destination_vnode_or_endpoint = 0;
+    if (expect(wvm_route_snapshot_record_validate(&snapshot, error,
+                                                  sizeof(error)) != 0,
+               "reject prefix from a flat snapshot")) {
+        return 1;
+    }
+    snapshot.topology_kind = 2;
+    rules[0].next_hop_member.role_type = WVM_MANIFEST_ROLE_NODE_RUNTIME;
+    if (expect(wvm_route_snapshot_record_validate(&snapshot, error,
+                                                  sizeof(error)) != 0,
+               "reject prefix next hop without gateway role")) {
+        return 1;
+    }
+
     puts("control-route-record tests: PASS");
     return 0;
 }

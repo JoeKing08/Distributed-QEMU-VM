@@ -137,6 +137,34 @@ selected before planning. Every guest RAM byte belongs to exactly one
 page-aligned placement chunk. It may be smaller than a physical NUMA domain;
 physical NUMA is an optimization input, not the user-visible allocation unit.
 
+Execution backend and memory placement are separate planning dimensions. A
+memory chunk may be assigned to any `ACTIVE` participant with the required
+memory-service capability, capacity, and manifest-valid route, regardless of
+whether that participant has KVM. The vCPU backend still applies to every vCPU
+assignment in the VM and is not inferred from the node selected for a memory
+chunk.
+
+The planner resolves backend policy before producing the final placement:
+
+1. For `AUTO`, attempt a complete KVM candidate first. Every vCPU assignment
+   must use a KVM-capable executor, while memory chunks may use any eligible
+   memory participant.
+2. If the complete KVM candidate fails, discard its provisional reservations
+   and attempt a new complete TCG candidate. TCG-capable executors may be
+   nodes without KVM or KVM-capable nodes whose TCG helper is admitted.
+3. For `REQUIRE_KVM`, do not attempt the TCG candidate. For `REQUIRE_TCG`,
+   plan TCG directly.
+
+The final plan must be homogeneous in vCPU backend. A plan containing both KVM
+and TCG vCPU assignments is invalid even when every individual assignment is
+locally capable. Backend fallback is therefore a pre-activation replan, not a
+partial CPU downgrade after placement.
+
+Backend capacity is part of the captured inventory. A node may expose distinct
+KVM and TCG vCPU capacity classes, but both draw from the node's shared host
+CPU and overhead budget. The planner must not copy KVM slot counts into TCG
+capacity or allow KVM and TCG reservations to overcommit the same host budget.
+
 The planner rejects an unaligned memory request or rounds it only through a
 documented API default that is included in the normalized request and manifest.
 It does not silently truncate guest RAM.
@@ -276,6 +304,11 @@ The implementation may use bounded backtracking to find a complete legal plan,
 but it must bound search time and return `PLACEMENT_CONSTRAINT` or
 `INSUFFICIENT_CAPACITY` rather than making an unbounded scheduler call. It may
 not reserve or launch a subset of a VM while continuing to search for the rest.
+
+When `AUTO` falls back from KVM to TCG, the returned diagnostic must identify
+that KVM was attempted, why no complete KVM candidate was admissible, and that
+the committed plan uses TCG. This is a backend-selection result, not a hidden
+performance workaround.
 
 ## 6. Atomic Reservation and Admission
 
@@ -425,6 +458,15 @@ a member with active VM allocations is governed by the drain restrictions in
   from the same snapshot and differ only according to their documented scoring.
 - A plan's vCPU and memory tables cover all requested guest resources exactly
   once, are page aligned, and name only `ACTIVE` compatible participants.
+- An `AUTO` request prefers a complete KVM plan, then produces a new complete
+  TCG plan when KVM capacity or capability is insufficient; it never emits a
+  mixed-backend vCPU plan.
+- A `REQUIRE_KVM` request rejects a cluster where any required vCPU cannot be
+  placed on a KVM-capable executor, while its memory may still be placed on an
+  eligible non-KVM memory participant.
+- A KVM-capable node can serve a TCG vCPU only through its admitted TCG
+  executor capacity, with shared host CPU reservations preventing
+  overcommitment.
 - A reservation conflict or stale node instance aborts every prepared peer and
   leaves no leaked capacity, port, SHM file, or accelerator context.
 - Race every admission stage with compute cordon, gateway drain, health

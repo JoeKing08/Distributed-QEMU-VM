@@ -33,9 +33,13 @@
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_config.h"
 #include "../common_include/wavevm_resources.h"
+#include "../common_include/wavevm_membership.h"
 #include "../common_include/wavevm_route_delivery.h"
 #include "../common_include/wavevm_runtime_dispatch.h"
 #include "../common_include/wavevm_runtime_gate.h"
+#include "../common_include/wavevm_local_memory_v1.h"
+#include "../common_include/wavevm_memory_v1.h"
+#include "../node_runtime/memory_service_v1.h"
 
 // --- 全局状态 ---
 extern struct dsm_driver_ops u_ops;
@@ -170,6 +174,10 @@ static int runtime_dispatch_populate_legacy_memory_cache(
     const uint64_t legacy_chunk_bytes = UINT64_C(1) << WVM_ROUTING_SHIFT;
     size_t i;
 
+    if (!dispatch ||
+        dispatch->route_topology_kind != WVM_ROUTE_TOPOLOGY_FLAT) {
+        return 0;
+    }
     for (i = 0; i < dispatch->memory_dispatch.count; i++) {
         const struct wvm_runtime_memory_dispatch *entry =
             &dispatch->memory_dispatch.entries[i];
@@ -177,7 +185,10 @@ static int runtime_dispatch_populate_legacy_memory_cache(
         uint64_t chunk_count;
 
         if (entry->gpa_start % legacy_chunk_bytes != 0 ||
-            entry->bytes % legacy_chunk_bytes != 0) {
+            entry->bytes % legacy_chunk_bytes != 0 ||
+            entry->directory.destination_kind !=
+                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+            entry->directory.destination_scope != 0) {
             return 0;
         }
         first_chunk = entry->gpa_start / legacy_chunk_bytes;
@@ -196,22 +207,85 @@ static int runtime_dispatch_populate_legacy_memory_cache(
 
         for (chunk = 0; chunk < chunk_count; chunk++) {
             wvm_set_memory_mapping((int)(first_chunk + chunk),
-                                   entry->directory_vnode);
+                                   entry->directory.destination_vnode);
         }
     }
     return 1;
+}
+
+static int runtime_dispatch_legacy_vnode_count(
+    const struct wvm_runtime_dispatch_projection *dispatch,
+    uint32_t *count_out)
+{
+    uint32_t maximum;
+    size_t i;
+
+    if (!dispatch || !count_out ||
+        dispatch->route_topology_kind != WVM_ROUTE_TOPOLOGY_FLAT ||
+        dispatch->local_primary.destination_kind !=
+            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+        dispatch->local_primary.destination_scope != 0) {
+        return -1;
+    }
+    maximum = dispatch->local_primary.destination_vnode;
+    for (i = 0; i < dispatch->cpu_dispatch.count; i++) {
+        const struct wvm_runtime_route_destination *destination =
+            &dispatch->cpu_dispatch.entries[i].executor;
+
+        if (destination->destination_kind !=
+                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+            destination->destination_scope != 0) {
+            return -1;
+        }
+        if (destination->destination_vnode > maximum) {
+            maximum = destination->destination_vnode;
+        }
+    }
+    for (i = 0; i < dispatch->memory_dispatch.count; i++) {
+        const struct wvm_runtime_memory_dispatch *entry =
+            &dispatch->memory_dispatch.entries[i];
+
+        if (entry->directory.destination_kind !=
+                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+            entry->directory.destination_scope != 0 ||
+            entry->executor.destination_kind !=
+                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+            entry->executor.destination_scope != 0) {
+            return -1;
+        }
+        if (entry->directory.destination_vnode > maximum) {
+            maximum = entry->directory.destination_vnode;
+        }
+        if (entry->executor.destination_vnode > maximum) {
+            maximum = entry->executor.destination_vnode;
+        }
+    }
+    if (maximum == UINT32_MAX) {
+        return -1;
+    }
+    *count_out = maximum + 1U;
+    return 0;
 }
 
 static int apply_runtime_dispatch(void)
 {
     const struct wvm_runtime_dispatch_projection *dispatch;
     uint32_t sidecar_ip = 0;
+    uint32_t legacy_vnode_count;
     size_t i;
 
     if (!g_runtime_dispatch_active) {
         return -1;
     }
     dispatch = &g_runtime_dispatch_storage.projection;
+    if (runtime_dispatch_legacy_vnode_count(dispatch, &legacy_vnode_count) !=
+        0) {
+        /*
+         * The legacy logic-core route arrays have no Pod/scope dimension.
+         * Do not flatten a fractal admitted route into raw vnode IDs.
+         */
+        return -1;
+    }
     memcpy(&sidecar_ip, dispatch->local_sidecar_endpoint.data_address,
            sizeof(sidecar_ip));
 
@@ -220,13 +294,13 @@ static int apply_runtime_dispatch(void)
      * compatibility target entry deliberately resolves to that peer; the
      * immutable route snapshot remains the cross-node routing authority.
      */
-    for (i = 0; i < dispatch->route_vnode_count; i++) {
+    for (i = 0; i < legacy_vnode_count; i++) {
         u_ops.set_gateway_ip(WVM_ENCODE_ID(g_my_vm_id, (uint32_t)i),
                              sidecar_ip,
                              htons(dispatch->local_sidecar_endpoint.data_port));
     }
 
-    wvm_set_mem_mapping(0, dispatch->route_vnode_count);
+    wvm_set_mem_mapping(0, legacy_vnode_count);
     wvm_clear_cpu_mappings();
     wvm_clear_memory_mappings();
     for (i = 0; i < dispatch->cpu_dispatch.count; i++) {
@@ -237,14 +311,15 @@ static int apply_runtime_dispatch(void)
         }
         wvm_set_cpu_mapping(
             (int)dispatch->cpu_dispatch.entries[i].guest_vcpu_index,
-            dispatch->cpu_dispatch.entries[i].executor_vnode);
+            dispatch->cpu_dispatch.entries[i].executor.destination_vnode);
     }
     for (i = 0; i < dispatch->memory_dispatch.count; i++) {
         const struct wvm_runtime_memory_dispatch *entry =
             &dispatch->memory_dispatch.entries[i];
 
         if (wvm_set_memory_range_mapping(entry->gpa_start, entry->bytes,
-                                         entry->directory_vnode) != 0) {
+                                         entry->directory.destination_vnode) !=
+            0) {
             return -1;
         }
     }
@@ -715,28 +790,99 @@ void load_swarm_config(const char *filename) {
     printf("[Config] CPU Routing Table Initialized (legacy core-weighted mode).\n");
 }
 
-/* 
- * [物理意图] 充当 QEMU 与分布式总线之间的“协议转换器”。
- * [关键逻辑] 拦截 IPC 管道中的缺页与 CPU 任务，调用 Logic Core 判定权属，并决定是本地执行还是发起网络 RPC。
- * [后果] 实现了前后端解耦。它保证了前端 QEMU 不需要理解复杂的 DHT 逻辑，只需发出“我要这块内存”的原始指令。
+/*
+ * The QEMU SYNC channel is the only local fault boundary.  It carries a
+ * typed V1 request into the admitted node runtime and receives one exact
+ * typed MEM_ACK payload in return.  The old legacy fault IPC is deliberately
+ * not translated here: it cannot carry operation identity or authority.
  */
-static void handle_ipc_fault(int qemu_fd, struct wvm_ipc_fault_req* req) {
-    struct wvm_ipc_fault_ack ack = {0}; // 使用扩展后的 ACK 结构
-    fprintf(stderr, "[IPC Fault] gpa=%#llx len=%u vcpu=%u\n",
-            (unsigned long long)req->gpa,
-            req->len, req->vcpu_id);
+static void handle_ipc_fault_v1(int qemu_fd, const uint8_t *payload,
+                                uint32_t payload_bytes)
+{
+    struct wvm_local_memory_v1_fault_request request;
+    struct wvm_v1_mem_ack ack;
+    uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
+    uint8_t ack_payload[WVM_V1_MEM_ACK_HEADER_BYTES +
+                        WVM_V1_MEMORY_PAGE_BYTES];
+    uint8_t result_length[WVM_LOCAL_MEMORY_V1_RESULT_LENGTH_BYTES];
+    size_t ack_payload_bytes = 0;
+    char error[192] = {0};
+    int result;
 
-    ack.status = wvm_handle_page_fault_logic(req->gpa, ack.data, &ack.version);
-    if (ack.status == 0 && g_shm_ptr &&
-        g_shm_size >= 4096 && req->gpa <= g_shm_size - 4096) {
-        memcpy((uint8_t*)g_shm_ptr + req->gpa, ack.data, 4096);
+    memset(&request, 0, sizeof(request));
+    memset(&ack, 0, sizeof(ack));
+    if (wvm_local_memory_v1_fault_request_decode(
+            payload, payload_bytes, &request, error, sizeof(error)) == 0) {
+        result = wvm_v1_memory_service_global_request_fault(
+            request.gpa, request.operation_id, request.delivery_attempt_id,
+            &ack, page, error, sizeof(error));
+        if (result == 0 &&
+            wvm_v1_mem_ack_encode(&ack, ack_payload, sizeof(ack_payload),
+                                  &ack_payload_bytes, error,
+                                  sizeof(error)) == 0) {
+            result = 0;
+        } else if (result == 0) {
+            result = -EPROTO;
+        }
+    } else {
+        result = -EPROTO;
     }
-    fprintf(stderr, "[IPC Fault Ack] gpa=%#llx status=%d ver=%#llx\n",
-            (unsigned long long)req->gpa,
-            ack.status,
-            (unsigned long long)ack.version);
 
-    write_exact(qemu_fd, &ack, sizeof(ack));
+    if (result != 0) {
+        ack_payload_bytes = 0;
+        fprintf(stderr,
+                "[IPC V1 Fault] rejected fd=%d status=%d reason=%s\n",
+                qemu_fd, result, error[0] ? error : "invalid local request");
+    }
+    if (wvm_local_memory_v1_result_length_encode(
+            ack_payload_bytes, result_length, error, sizeof(error)) != 0 ||
+        write_exact(qemu_fd, result_length, sizeof(result_length)) < 0 ||
+        (ack_payload_bytes != 0 &&
+         write_exact(qemu_fd, ack_payload, ack_payload_bytes) < 0)) {
+        fprintf(stderr, "[IPC V1 Fault] response write failed fd=%d\n",
+                qemu_fd);
+    }
+}
+
+static void handle_ipc_commit_v1(int qemu_fd, const uint8_t *payload,
+                                 uint32_t payload_bytes)
+{
+    struct wvm_local_memory_v1_commit_request request;
+    struct wvm_local_memory_v1_commit_result result;
+    uint8_t encoded[WVM_LOCAL_MEMORY_V1_COMMIT_RESULT_BYTES];
+    char error[192] = {0};
+    int status;
+
+    memset(&request, 0, sizeof(request));
+    memset(&result, 0, sizeof(result));
+    if (wvm_local_memory_v1_commit_request_decode(
+            payload, payload_bytes, &request, error, sizeof(error)) != 0) {
+        status = -EPROTO;
+    } else {
+        status = wvm_v1_memory_service_global_request_commit(
+            request.commit.gpa, request.commit.base_version,
+            request.commit.offset, request.commit.data,
+            request.commit.data_bytes, request.operation_id,
+            request.delivery_attempt_id, &result.ack, error, sizeof(error));
+        memcpy(result.operation_id, request.operation_id,
+               sizeof(result.operation_id));
+    }
+    if (status != 0) {
+        memset(&result, 0, sizeof(result));
+        memcpy(result.operation_id, request.operation_id,
+               sizeof(result.operation_id));
+        result.ack.gpa = request.commit.gpa;
+        result.ack.status = WVM_V1_MEM_COMMIT_ACK_INTERNAL_FAILURE;
+        fprintf(stderr,
+                "[IPC V1 Commit] rejected fd=%d status=%d reason=%s\n",
+                qemu_fd, status, error[0] ? error : "invalid local request");
+    }
+    if (wvm_local_memory_v1_commit_result_encode(
+            &result, encoded, error, sizeof(error)) != 0 ||
+        write_exact(qemu_fd, encoded, sizeof(encoded)) < 0) {
+        fprintf(stderr, "[IPC V1 Commit] response write failed fd=%d\n",
+                qemu_fd);
+    }
 }
 
 static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
@@ -1337,8 +1483,11 @@ void* client_handler(void *socket_desc) {
                 }
                 break;
             }
-            case WVM_IPC_TYPE_MEM_FAULT:
-                handle_ipc_fault(qemu_fd, (struct wvm_ipc_fault_req*)payload_buf);
+            case WVM_IPC_TYPE_MEM_FAULT_V1:
+                handle_ipc_fault_v1(qemu_fd, payload_buf, ipc_hdr.len);
+                break;
+            case WVM_IPC_TYPE_MEM_COMMIT_V1:
+                handle_ipc_commit_v1(qemu_fd, payload_buf, ipc_hdr.len);
                 break;
             case WVM_IPC_TYPE_CPU_RUN: {
                 struct wvm_ipc_cpu_run_req *req =
@@ -1636,8 +1785,15 @@ int main(int argc, char **argv) {
         const struct wvm_runtime_dispatch_projection *dispatch =
             &g_runtime_dispatch_storage.projection;
 
-        my_virtual_id = (int)dispatch->local_primary_vnode;
-        total_vnodes = dispatch->route_vnode_count;
+        if (runtime_dispatch_legacy_vnode_count(dispatch, &total_vnodes) !=
+            0) {
+            fprintf(stderr,
+                    "[RuntimeDispatch] fractal route scopes require the "
+                    "typed V1 coordinator path; legacy logic-core startup "
+                    "is refused.\n");
+            return 1;
+        }
+        my_virtual_id = (int)dispatch->local_primary.destination_vnode;
         if (runtime_dispatch_local_reservation(&my_local_cores,
                                                &required_memory_bytes) != 0 ||
             user_backend_init(my_virtual_id, local_port) != 0) {

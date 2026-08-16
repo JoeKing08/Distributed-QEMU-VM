@@ -7,7 +7,7 @@ TARGET = ../wavevm_node_runtime
 
 MASTER_OBJS = master_logic.o master_user.o master_main.o
 SLAVE_OBJS = slave_hybrid.o slave_vfio.o
-COMMON_OBJS = resources.o sha256.o canonical.o identity.o manifest.o lifecycle.o runtime_gate.o runtime_dispatch.o executor_abi.o executor_bridge.o control.o route_delivery.o
+COMMON_OBJS = resources.o sha256.o canonical.o identity.o manifest.o lifecycle.o runtime_gate.o runtime_dispatch.o executor_abi.o envelope_v1.o memory_v1.o local_memory_v1.o route_runtime.o executor_bridge.o memory_service_v1.o v1_ingress.o v1_directory_store.o control.o route_delivery.o
 
 all: $(TARGET)
 
@@ -59,7 +59,28 @@ runtime_dispatch.o: ../common_include/wavevm_runtime_dispatch.c
 executor_abi.o: ../common_include/wavevm_executor_abi.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
+envelope_v1.o: ../common_include/wavevm_envelope_v1.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+memory_v1.o: ../common_include/wavevm_memory_v1.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+local_memory_v1.o: ../common_include/wavevm_local_memory_v1.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+route_runtime.o: ../common_include/wavevm_route_runtime.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
 executor_bridge.o: executor_bridge.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+memory_service_v1.o: memory_service_v1.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+v1_ingress.o: v1_ingress.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+v1_directory_store.o: v1_directory_store.c v1_directory_store.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 control.o: ../common_include/wavevm_control.c

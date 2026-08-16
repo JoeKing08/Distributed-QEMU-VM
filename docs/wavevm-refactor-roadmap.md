@@ -321,7 +321,12 @@ The placement and lifecycle specifications must define deterministic compact
 and spread scoring with stable tie-breakers, candidate filtering, explicit
 `host_node`, host overhead, CPU/memory overcommit policy, capability and device
 constraints, multi-VM fairness, structured rejection, and whether running VMs
-are ever replanned. Lifecycle must define coordinator ownership, identity
+are ever replanned. They must also define backend-aware planning for a
+heterogeneous cluster: `AUTO` tries a complete KVM placement before a new
+complete TCG placement, `REQUIRE_KVM` never silently degrades, vCPU backend is
+homogeneous per VM, and memory placement remains independent when the selected
+memory participants satisfy their own capability and route requirements.
+Lifecycle must define coordinator ownership, identity
 allocation before reservation, candidate route scope, an eligibility fence,
 prepared reservation/participant records, one durable activation fence,
 commit/start/abort messages, operation idempotency, cleanup ownership,

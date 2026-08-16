@@ -177,6 +177,8 @@ typedef struct wvm_ipc_header_t {
 #define WVM_IPC_TYPE_PUSH_BARRIER     9
 #define WVM_IPC_TYPE_PUSH_BARRIER_ACK 10
 #define WVM_IPC_TYPE_REGISTER         11
+#define WVM_IPC_TYPE_MEM_FAULT_V1     12
+#define WVM_IPC_TYPE_MEM_COMMIT_V1    13
 
 /* Local IPC connection roles.  Registration removes any dependency on
  * connection arrival order when a QEMU instance opens several sockets. */

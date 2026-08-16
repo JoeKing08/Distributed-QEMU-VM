@@ -80,12 +80,25 @@ static int digest_is_zero(const uint8_t digest[WVM_SHA256_DIGEST_BYTES])
     return 1;
 }
 
-static int node_is_eligible(const struct wvm_admission_node *node,
-                            enum wvm_admission_backend backend)
+static int node_is_active_and_healthy(const struct wvm_admission_node *node)
 {
     return node && node->membership_state == WVM_ADMISSION_MEMBER_ACTIVE &&
-           node->health_state == WVM_ADMISSION_HEALTHY &&
+           node->health_state == WVM_ADMISSION_HEALTHY;
+}
+
+static int node_is_executor_eligible(
+    const struct wvm_admission_node *node,
+    enum wvm_admission_backend backend)
+{
+    return node_is_active_and_healthy(node) &&
            (node->backend_capabilities & backend_capability(backend)) != 0;
+}
+
+static int node_is_memory_eligible(const struct wvm_admission_node *node)
+{
+    return node_is_active_and_healthy(node) &&
+           (node->runtime_capabilities &
+            WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY) != 0;
 }
 
 static int node_available_capacity(const struct wvm_admission_node *node,
@@ -176,7 +189,10 @@ int wvm_admission_snapshot_validate(const struct wvm_admission_snapshot *snapsho
             !valid_member_state(node->membership_state) ||
             !valid_health_state(node->health_state) ||
             (node->backend_capabilities &
-             ~(WVM_ADMISSION_BACKEND_CAP_KVM | WVM_ADMISSION_BACKEND_CAP_TCG))) {
+             ~(WVM_ADMISSION_BACKEND_CAP_KVM |
+               WVM_ADMISSION_BACKEND_CAP_TCG)) ||
+            (node->runtime_capabilities &
+             ~WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY)) {
             set_error(error, error_len,
                       "admission snapshot has invalid node metadata at index %u",
                       i);
@@ -310,7 +326,13 @@ int wvm_admission_plan_validate(const struct wvm_admission_snapshot *snapshot,
                       reservation->physical_node_id);
             return -1;
         }
-        if (!node_is_eligible(node, request->backend) ||
+        if (!node_is_active_and_healthy(node) ||
+            (reservation->guest_vcpu_slots != 0 &&
+             !node_is_executor_eligible(node, request->backend)) ||
+            (reservation->guest_memory_bytes != 0 &&
+             !node_is_memory_eligible(node)) ||
+            (reservation->physical_node_id == plan->host_physical_node_id &&
+             !node_is_executor_eligible(node, request->backend)) ||
             node_available_capacity(node, &available_cpu, &available_memory) !=
                 0) {
             set_error(error, error_len, "admission plan uses ineligible node %u",
@@ -423,7 +445,7 @@ static int select_host_node(const struct wvm_admission_snapshot *snapshot,
         uint64_t available_memory;
         int comparison;
 
-        if (!node_is_eligible(node, request->backend) ||
+        if (!node_is_executor_eligible(node, request->backend) ||
             node_available_capacity(node, &available_cpu, &available_memory) !=
                 0 ||
             request->host_overhead_vcpu_slots > available_cpu ||
@@ -518,7 +540,9 @@ static int select_assignment_node(
         uint64_t memory_used;
         int selected;
 
-        if (!node_is_eligible(node, request->backend) ||
+        if (!(memory_assignment ? node_is_memory_eligible(node)
+                                : node_is_executor_eligible(
+                                      node, request->backend)) ||
             node_available_capacity(node, &available_cpu, &available_memory) !=
                 0) {
             continue;
@@ -831,6 +855,15 @@ int wvm_admission_placement_plan_build(
     memory = placement_plan->memory_assignments;
     storage = placement_plan->storage_assignments;
     requirements = placement_plan->reservation_requirements;
+    /*
+     * The caller owns the backing buffers, but each build owns its output
+     * contents. Retaining a previous count would append into stale output and
+     * can overrun an otherwise correctly sized reusable buffer.
+     */
+    vcpus.count = 0;
+    memory.count = 0;
+    storage.count = 0;
+    requirements.count = 0;
     if (!vcpus.entries || vcpus.capacity < request->requested_vcpu_slots ||
         !memory.entries || memory.capacity < required_memory_assignments ||
         requirements.capacity < admission_plan->reservation_count ||

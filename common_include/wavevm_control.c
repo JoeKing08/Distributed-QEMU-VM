@@ -1059,13 +1059,48 @@ static int route_rule_compare(const struct wvm_route_rule_record *left,
 static int route_rule_validate(const struct wvm_route_rule_record *rule,
                                char *error, size_t error_len)
 {
-    if (!rule || rule->destination_kind == 0 || rule->next_hop_kind == 0 ||
-        rule->hop_limit == 0 ||
+    if (!rule || rule->hop_limit == 0 ||
         wvm_member_key_validate(&rule->next_hop_member, error, error_len) !=
             0 ||
         wvm_endpoint_validate(&rule->next_hop_endpoint, error, error_len) !=
             0) {
         set_error(error, error_len, "route rule is invalid");
+        return -1;
+    }
+    switch (rule->destination_kind) {
+    case WVM_ROUTE_DESTINATION_EXACT_VNODE:
+        break;
+    case WVM_ROUTE_DESTINATION_PREFIX:
+        /*
+         * Prefix rules describe an admitted fractal subtree.  A prefix never
+         * identifies a leaf executor, and forwarding it directly to a node
+         * runtime would make a route scope silently collapse into raw-ID
+         * routing.
+         */
+        if (rule->destination_scope == 0 ||
+            rule->destination_vnode_or_endpoint != 0 ||
+            rule->next_hop_kind != WVM_ROUTE_NEXT_HOP_GATEWAY ||
+            rule->next_hop_member.role_type != WVM_MANIFEST_ROLE_GATEWAY) {
+            set_error(error, error_len, "route prefix rule is invalid");
+            return -1;
+        }
+        break;
+    default:
+        set_error(error, error_len, "route destination kind is invalid");
+        return -1;
+    }
+    switch (rule->next_hop_kind) {
+    case WVM_ROUTE_NEXT_HOP_ENDPOINT:
+        break;
+    case WVM_ROUTE_NEXT_HOP_GATEWAY:
+        if (rule->next_hop_member.role_type != WVM_MANIFEST_ROLE_GATEWAY) {
+            set_error(error, error_len,
+                      "gateway next hop lacks a gateway member");
+            return -1;
+        }
+        break;
+    default:
+        set_error(error, error_len, "route next-hop kind is invalid");
         return -1;
     }
     return 0;
@@ -1244,6 +1279,26 @@ static int route_snapshot_shape_validate(
                           "route snapshot ACK set has the wrong final key");
                 return -1;
             }
+        }
+    }
+    for (i = 0; i < snapshot->next_hop_rules.count; i++) {
+        const struct wvm_route_rule_record *rule =
+            &snapshot->next_hop_rules.entries[i];
+
+        if (snapshot->topology_kind == 1 &&
+            (rule->destination_kind != WVM_ROUTE_DESTINATION_EXACT_VNODE ||
+             rule->destination_scope != 0)) {
+            set_error(error, error_len,
+                      "flat route snapshot contains a non-flat rule");
+            return -1;
+        }
+        if (snapshot->topology_kind == 2 &&
+            rule->destination_kind ==
+                WVM_ROUTE_DESTINATION_EXACT_VNODE &&
+            rule->destination_scope == 0) {
+            set_error(error, error_len,
+                      "fractal exact route lacks a destination scope");
+            return -1;
         }
     }
     return 0;

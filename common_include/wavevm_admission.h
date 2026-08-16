@@ -36,6 +36,12 @@ enum wvm_admission_backend {
 #define WVM_ADMISSION_BACKEND_CAP_KVM (1U << 0)
 #define WVM_ADMISSION_BACKEND_CAP_TCG (1U << 1)
 
+/*
+ * A memory-only participant serves the Mode B page protocol without hosting
+ * a vCPU executor. Keep this separate from KVM/TCG execution capabilities.
+ */
+#define WVM_ADMISSION_RUNTIME_CAP_MODE_B_MEMORY (1U << 0)
+
 enum wvm_admission_placement_policy {
     WVM_ADMISSION_PLACEMENT_COMPACT = 1,
     WVM_ADMISSION_PLACEMENT_SPREAD = 2,
@@ -53,6 +59,7 @@ struct wvm_admission_node {
     enum wvm_admission_member_state membership_state;
     enum wvm_admission_health_state health_state;
     uint32_t backend_capabilities;
+    uint32_t runtime_capabilities;
     uint32_t registered_vcpu_slots;
     uint64_t registered_memory_bytes;
     uint32_t reserved_host_vcpu_slots;

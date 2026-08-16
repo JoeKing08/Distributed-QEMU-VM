@@ -115,10 +115,18 @@ or a guessed QEMU host. An administrative API may expose explicit placement
 constraints for diagnosis or policy, but it must still pass normal admission
 and cannot bypass reservation or capability validation.
 
-`AUTO` is a request policy, not a runtime fallback permission. Admission
-resolves it to one explicit backend plan before any process starts. A guest
-does not silently change KVM to TCG, or Mode A to Mode B, halfway through a
-running incarnation.
+`AUTO` is a request policy, not a runtime fallback permission. Admission first
+tries a complete KVM placement, including the frontend and every required vCPU
+executor. If that candidate is not admissible, admission may create a new
+complete TCG placement when the request permits fallback. The TCG result must
+have its own plan digest, reservations, capability profile, and manifest
+diagnostic explaining the fallback; a partially reserved KVM candidate is
+aborted rather than being mutated in place.
+
+`REQUIRE_KVM` fails when a complete KVM placement cannot be admitted.
+`REQUIRE_TCG` selects TCG directly. Once the backend is recorded in the
+admitted manifest, a guest does not silently change KVM to TCG, TCG to KVM, or
+Mode A to Mode B halfway through a running incarnation.
 
 ### 3.2 Candidate and Admitted VM Manifest
 

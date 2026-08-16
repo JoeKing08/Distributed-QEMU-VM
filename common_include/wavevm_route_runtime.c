@@ -5,8 +5,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "wavevm_sha256.h"
-#include "wavevm_protocol.h"
+struct route_snapshot_copy {
+    struct wvm_route_snapshot_key key;
+    struct wvm_route_rule_record *rules;
+    size_t rule_count;
+};
+
+struct route_scope_slot {
+    struct wvm_vm_route_scope_key scope_key;
+    struct route_snapshot_copy active;
+    struct route_snapshot_copy prepared;
+    struct route_snapshot_copy predecessor;
+    int has_active;
+    int has_prepared;
+    int has_predecessor;
+};
 
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
 {
@@ -20,88 +33,255 @@ static void set_error(char *error, size_t error_len, const char *fmt, ...)
     va_end(ap);
 }
 
-static int route_key_equal(const struct wvm_route_snapshot_key *left,
-                           const struct wvm_route_snapshot_key *right)
+static int bytes_are_zero(const uint8_t *bytes, size_t byte_count)
 {
-    return left && right &&
-           left->scope_key.vm_id == right->scope_key.vm_id &&
-           left->scope_key.vm_incarnation == right->scope_key.vm_incarnation &&
-           left->scope_key.route_scope_id == right->scope_key.route_scope_id &&
+    size_t i;
+
+    for (i = 0; i < byte_count; i++) {
+        if (bytes[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int scope_key_equal(const struct wvm_vm_route_scope_key *left,
+                           const struct wvm_vm_route_scope_key *right)
+{
+    return left && right && left->vm_id == right->vm_id &&
+           left->vm_incarnation == right->vm_incarnation &&
+           left->route_scope_id == right->route_scope_id;
+}
+
+static int snapshot_key_equal(const struct wvm_route_snapshot_key *left,
+                              const struct wvm_route_snapshot_key *right)
+{
+    return left && right && scope_key_equal(&left->scope_key, &right->scope_key) &&
            left->topology_revision == right->topology_revision &&
            left->route_generation == right->route_generation &&
            memcmp(left->snapshot_digest, right->snapshot_digest,
                   WVM_SHA256_DIGEST_BYTES) == 0;
 }
 
-static int validate_entries(const struct wvm_route_snapshot_key *key,
-                            const struct wvm_route_runtime_entry *entries,
-                            size_t entry_count, char *error, size_t error_len)
+static int route_rule_compare(const struct wvm_route_rule_record *left,
+                              const struct wvm_route_rule_record *right)
 {
-    size_t i;
-
-    if (!key || wvm_route_snapshot_key_validate(key, error, error_len) != 0 ||
-        entry_count == 0 || entry_count > WVM_ROUTE_RUNTIME_MAX_ENTRIES ||
-        !entries) {
-        set_error(error, error_len, "route runtime snapshot is invalid");
-        return -1;
+    if (left->destination_kind != right->destination_kind) {
+        return left->destination_kind < right->destination_kind ? -1 : 1;
     }
-    for (i = 0; i < entry_count; i++) {
-        uint32_t vm_id = WVM_GET_VMID(entries[i].destination_id);
-
-        if (entries[i].destination_id == WVM_NODE_AUTO_ROUTE ||
-            entries[i].next_hop.sin_family != AF_INET ||
-            entries[i].next_hop.sin_port == 0 ||
-            entries[i].next_hop.sin_addr.s_addr == 0 ||
-            (vm_id != 0 && vm_id != key->scope_key.vm_id)) {
-            set_error(error, error_len,
-                      "route entry %zu has invalid namespace or endpoint", i);
-            return -1;
-        }
-        if (i != 0 &&
-            entries[i - 1].destination_id >= entries[i].destination_id) {
-            set_error(error, error_len,
-                      "route entries are not strictly ordered");
-            return -1;
-        }
+    if (left->destination_scope != right->destination_scope) {
+        return left->destination_scope < right->destination_scope ? -1 : 1;
+    }
+    if (left->destination_vnode_or_endpoint !=
+        right->destination_vnode_or_endpoint) {
+        return left->destination_vnode_or_endpoint <
+                       right->destination_vnode_or_endpoint
+                   ? -1
+                   : 1;
     }
     return 0;
 }
 
-static void snapshot_clear(struct wvm_route_runtime_snapshot *snapshot)
+static void snapshot_clear(struct route_snapshot_copy *snapshot)
 {
     if (!snapshot) {
         return;
     }
-    free(snapshot->entries);
+    free(snapshot->rules);
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-static void digest_entries(const struct wvm_route_runtime_entry *entries,
-                           size_t entry_count,
-                           uint8_t digest[WVM_SHA256_DIGEST_BYTES])
+static void scope_clear(struct route_scope_slot *scope)
 {
-    struct wvm_sha256_ctx context;
-    uint8_t count_bytes[8];
+    if (!scope) {
+        return;
+    }
+    snapshot_clear(&scope->active);
+    snapshot_clear(&scope->prepared);
+    snapshot_clear(&scope->predecessor);
+    memset(scope, 0, sizeof(*scope));
+}
+
+static struct route_scope_slot *scope_slots(struct wvm_route_runtime *runtime)
+{
+    return runtime ? runtime->scopes : NULL;
+}
+
+static const struct route_scope_slot *scope_slots_const(
+    const struct wvm_route_runtime *runtime)
+{
+    return runtime ? runtime->scopes : NULL;
+}
+
+static struct route_scope_slot *find_scope(struct wvm_route_runtime *runtime,
+                                           const struct wvm_vm_route_scope_key
+                                               *scope_key)
+{
+    struct route_scope_slot *scopes = scope_slots(runtime);
     size_t i;
 
-    memset(count_bytes, 0, sizeof(count_bytes));
-    for (i = 0; i < sizeof(count_bytes); i++) {
-        count_bytes[sizeof(count_bytes) - 1U - i] =
-            (uint8_t)(entry_count >> (i * 8U));
+    for (i = 0; scopes && i < runtime->scope_count; i++) {
+        if (scope_key_equal(&scopes[i].scope_key, scope_key)) {
+            return &scopes[i];
+        }
     }
-    wvm_sha256_init(&context);
-    wvm_sha256_update(&context, count_bytes, sizeof(count_bytes));
-    for (i = 0; i < entry_count; i++) {
-        uint8_t id_bytes[4];
-        id_bytes[0] = (uint8_t)(entries[i].destination_id >> 24);
-        id_bytes[1] = (uint8_t)(entries[i].destination_id >> 16);
-        id_bytes[2] = (uint8_t)(entries[i].destination_id >> 8);
-        id_bytes[3] = (uint8_t)entries[i].destination_id;
-        wvm_sha256_update(&context, id_bytes, sizeof(id_bytes));
-        wvm_sha256_update(&context, &entries[i].next_hop,
-                          sizeof(entries[i].next_hop));
+    return NULL;
+}
+
+static const struct route_scope_slot *find_scope_const(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_vm_route_scope_key *scope_key)
+{
+    const struct route_scope_slot *scopes = scope_slots_const(runtime);
+    size_t i;
+
+    for (i = 0; scopes && i < runtime->scope_count; i++) {
+        if (scope_key_equal(&scopes[i].scope_key, scope_key)) {
+            return &scopes[i];
+        }
     }
-    wvm_sha256_final(&context, digest);
+    return NULL;
+}
+
+static int add_scope(struct wvm_route_runtime *runtime,
+                     const struct wvm_vm_route_scope_key *scope_key,
+                     struct route_scope_slot **scope_out, char *error,
+                     size_t error_len)
+{
+    struct route_scope_slot *scopes;
+    size_t new_capacity;
+
+    if (runtime->scope_count == WVM_ROUTE_RUNTIME_MAX_SCOPES) {
+        set_error(error, error_len, "route scope capacity is exhausted");
+        return -1;
+    }
+    if (runtime->scope_count == runtime->scope_capacity) {
+        new_capacity = runtime->scope_capacity ? runtime->scope_capacity * 2U
+                                                : 8U;
+        if (new_capacity > WVM_ROUTE_RUNTIME_MAX_SCOPES) {
+            new_capacity = WVM_ROUTE_RUNTIME_MAX_SCOPES;
+        }
+        scopes = realloc(runtime->scopes, new_capacity * sizeof(*scopes));
+        if (!scopes) {
+            set_error(error, error_len, "cannot allocate route scope table");
+            return -1;
+        }
+        runtime->scopes = scopes;
+        runtime->scope_capacity = new_capacity;
+    }
+    scopes = scope_slots(runtime);
+    memset(&scopes[runtime->scope_count], 0,
+           sizeof(scopes[runtime->scope_count]));
+    scopes[runtime->scope_count].scope_key = *scope_key;
+    *scope_out = &scopes[runtime->scope_count++];
+    return 0;
+}
+
+static int snapshot_copy_from_record(
+    const struct wvm_route_snapshot_record *record,
+    struct route_snapshot_copy *copy, char *error, size_t error_len)
+{
+    size_t rule_bytes;
+
+    if (!record || !copy ||
+        wvm_route_snapshot_record_validate(record, error, error_len) != 0 ||
+        record->next_hop_rules.count > WVM_ROUTE_RUNTIME_MAX_ENTRIES ||
+        record->next_hop_rules.count >
+            SIZE_MAX / sizeof(*copy->rules)) {
+        if (!error || error[0] == '\0') {
+            set_error(error, error_len, "route snapshot is invalid");
+        }
+        return -1;
+    }
+    memset(copy, 0, sizeof(*copy));
+    rule_bytes = record->next_hop_rules.count * sizeof(*copy->rules);
+    copy->rules = malloc(rule_bytes);
+    if (!copy->rules) {
+        set_error(error, error_len, "cannot allocate route snapshot rules");
+        return -1;
+    }
+    memcpy(copy->rules, record->next_hop_rules.entries, rule_bytes);
+    copy->key = record->route_snapshot_key;
+    copy->rule_count = record->next_hop_rules.count;
+    return 0;
+}
+
+static int route_destination_fields_valid(uint16_t destination_kind,
+                                          uint64_t destination_scope,
+                                          uint32_t destination_vnode_or_endpoint,
+                                          char *error, size_t error_len)
+{
+    if (destination_vnode_or_endpoint ==
+        WVM_ENVELOPE_V1_ROUTE_DESTINATION_UNSPECIFIED) {
+        set_error(error, error_len, "route destination is unspecified");
+        return -1;
+    }
+    if (destination_kind ==
+        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE) {
+        if (destination_scope == 0) {
+            return 0;
+        }
+        set_error(error, error_len,
+                  "flat route destination has a nonzero scope");
+        return -1;
+    }
+    if (destination_kind ==
+        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+        destination_scope != 0) {
+        return 0;
+    }
+    set_error(error, error_len, "routed envelope destination is invalid");
+    return -1;
+}
+
+static int route_destination_valid(const struct wvm_envelope_v1 *envelope,
+                                   char *error, size_t error_len)
+{
+    if (!envelope || envelope->vm_id == 0 || envelope->vm_incarnation == 0 ||
+        envelope->route_scope_id == 0 || envelope->topology_revision == 0 ||
+        envelope->route_generation == 0 ||
+        bytes_are_zero(envelope->route_snapshot_digest,
+                       sizeof(envelope->route_snapshot_digest)) ||
+        envelope->route.hop_limit == 0 ||
+        envelope->route.hop_count > envelope->route.hop_limit) {
+        set_error(error, error_len, "routed envelope identity is incomplete");
+        return -1;
+    }
+    return route_destination_fields_valid(
+        envelope->route.destination_kind, envelope->route.destination_scope,
+        envelope->route.destination_vnode_or_endpoint, error, error_len);
+}
+
+static const struct wvm_route_rule_record *find_rule(
+    const struct route_snapshot_copy *snapshot, uint16_t destination_kind,
+    uint64_t destination_scope, uint32_t destination_vnode_or_endpoint)
+{
+    struct wvm_route_rule_record needle;
+    size_t left = 0;
+    size_t right;
+
+    if (!snapshot || !snapshot->rules) {
+        return NULL;
+    }
+    memset(&needle, 0, sizeof(needle));
+    needle.destination_kind = destination_kind;
+    needle.destination_scope = destination_scope;
+    needle.destination_vnode_or_endpoint = destination_vnode_or_endpoint;
+    right = snapshot->rule_count;
+    while (left < right) {
+        size_t middle = left + (right - left) / 2U;
+        int comparison = route_rule_compare(&snapshot->rules[middle], &needle);
+
+        if (comparison == 0) {
+            return &snapshot->rules[middle];
+        }
+        if (comparison < 0) {
+            left = middle + 1U;
+        } else {
+            right = middle;
+        }
+    }
+    return NULL;
 }
 
 void wvm_route_runtime_init(struct wvm_route_runtime *runtime)
@@ -115,49 +295,62 @@ void wvm_route_runtime_init(struct wvm_route_runtime *runtime)
 
 void wvm_route_runtime_destroy(struct wvm_route_runtime *runtime)
 {
+    struct route_scope_slot *scopes;
+    size_t i;
+
     if (!runtime) {
         return;
     }
     pthread_rwlock_wrlock(&runtime->lock);
-    snapshot_clear(&runtime->active);
-    snapshot_clear(&runtime->prepared);
-    snapshot_clear(&runtime->predecessor);
-    runtime->has_active = 0;
-    runtime->has_prepared = 0;
-    runtime->has_predecessor = 0;
+    scopes = scope_slots(runtime);
+    for (i = 0; scopes && i < runtime->scope_count; i++) {
+        scope_clear(&scopes[i]);
+    }
+    free(scopes);
+    runtime->scopes = NULL;
+    runtime->scope_count = 0;
+    runtime->scope_capacity = 0;
     pthread_rwlock_unlock(&runtime->lock);
     pthread_rwlock_destroy(&runtime->lock);
 }
 
 int wvm_route_runtime_prepare(
     struct wvm_route_runtime *runtime,
-    const struct wvm_route_snapshot_key *key,
-    const struct wvm_route_runtime_entry *entries, size_t entry_count,
-    char *error, size_t error_len)
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
 {
-    struct wvm_route_runtime_snapshot candidate;
+    struct route_snapshot_copy candidate;
+    struct route_scope_slot *scope;
 
-    if (!runtime || validate_entries(key, entries, entry_count, error,
-                                     error_len) != 0) {
+    if (!runtime ||
+        snapshot_copy_from_record(snapshot, &candidate, error, error_len) !=
+            0) {
         return -1;
     }
-    memset(&candidate, 0, sizeof(candidate));
-    candidate.entries = calloc(entry_count, sizeof(*candidate.entries));
-    if (!candidate.entries) {
-        set_error(error, error_len, "cannot allocate route snapshot");
-        return -1;
-    }
-    candidate.key = *key;
-    memcpy(candidate.entries, entries, entry_count * sizeof(*entries));
-    candidate.entry_count = entry_count;
-    candidate.entry_capacity = entry_count;
-    digest_entries(candidate.entries, candidate.entry_count,
-                   candidate.content_digest);
-
     pthread_rwlock_wrlock(&runtime->lock);
-    snapshot_clear(&runtime->prepared);
-    runtime->prepared = candidate;
-    runtime->has_prepared = 1;
+    scope = find_scope(runtime, &candidate.key.scope_key);
+    if (!scope &&
+        add_scope(runtime, &candidate.key.scope_key, &scope, error,
+                  error_len) != 0) {
+        pthread_rwlock_unlock(&runtime->lock);
+        snapshot_clear(&candidate);
+        return -1;
+    }
+    if (scope->has_active && snapshot_key_equal(&scope->active.key,
+                                                &candidate.key)) {
+        pthread_rwlock_unlock(&runtime->lock);
+        snapshot_clear(&candidate);
+        return 0;
+    }
+    if (scope->has_prepared && snapshot_key_equal(&scope->prepared.key,
+                                                  &candidate.key)) {
+        pthread_rwlock_unlock(&runtime->lock);
+        snapshot_clear(&candidate);
+        return 0;
+    }
+    snapshot_clear(&scope->prepared);
+    scope->prepared = candidate;
+    scope->has_prepared = 1;
     pthread_rwlock_unlock(&runtime->lock);
     return 0;
 }
@@ -166,39 +359,49 @@ int wvm_route_runtime_activate(struct wvm_route_runtime *runtime,
                                const struct wvm_route_snapshot_key *key,
                                char *error, size_t error_len)
 {
-    if (!runtime || !key) {
-        set_error(error, error_len, "route activation input is missing");
+    struct route_scope_slot *scope;
+
+    if (!runtime || !key ||
+        wvm_route_snapshot_key_validate(key, error, error_len) != 0) {
+        if (!error || error[0] == '\0') {
+            set_error(error, error_len, "route activation key is invalid");
+        }
         return -1;
     }
     pthread_rwlock_wrlock(&runtime->lock);
-    if (!runtime->has_prepared ||
-        !route_key_equal(key, &runtime->prepared.key)) {
+    scope = find_scope(runtime, &key->scope_key);
+    if (scope && scope->has_active &&
+        snapshot_key_equal(&scope->active.key, key)) {
+        pthread_rwlock_unlock(&runtime->lock);
+        return 0;
+    }
+    if (!scope || !scope->has_prepared ||
+        !snapshot_key_equal(&scope->prepared.key, key)) {
         pthread_rwlock_unlock(&runtime->lock);
         set_error(error, error_len, "route activation key is not prepared");
         return -1;
     }
-    if (runtime->has_active &&
-        route_key_equal(key, &runtime->active.key)) {
-        snapshot_clear(&runtime->prepared);
-        runtime->has_prepared = 0;
+    if (scope->has_active && snapshot_key_equal(&scope->active.key, key)) {
+        snapshot_clear(&scope->prepared);
+        scope->has_prepared = 0;
         pthread_rwlock_unlock(&runtime->lock);
         return 0;
     }
-    if (runtime->has_predecessor) {
+    if (scope->has_predecessor) {
         pthread_rwlock_unlock(&runtime->lock);
         set_error(error, error_len,
                   "route predecessor must retire before another replacement");
         return -1;
     }
-    if (runtime->has_active) {
-        runtime->predecessor = runtime->active;
-        runtime->has_predecessor = 1;
-        memset(&runtime->active, 0, sizeof(runtime->active));
+    if (scope->has_active) {
+        scope->predecessor = scope->active;
+        memset(&scope->active, 0, sizeof(scope->active));
+        scope->has_predecessor = 1;
     }
-    runtime->active = runtime->prepared;
-    memset(&runtime->prepared, 0, sizeof(runtime->prepared));
-    runtime->has_active = 1;
-    runtime->has_prepared = 0;
+    scope->active = scope->prepared;
+    memset(&scope->prepared, 0, sizeof(scope->prepared));
+    scope->has_active = 1;
+    scope->has_prepared = 0;
     pthread_rwlock_unlock(&runtime->lock);
     return 0;
 }
@@ -207,131 +410,168 @@ int wvm_route_runtime_retire(struct wvm_route_runtime *runtime,
                              const struct wvm_route_snapshot_key *key,
                              char *error, size_t error_len)
 {
+    struct route_scope_slot *scopes;
+    struct route_scope_slot *scope;
+    size_t scope_index;
+
     if (!runtime || !key) {
-        set_error(error, error_len, "route retirement input is missing");
+        set_error(error, error_len, "route retirement key is missing");
         return -1;
     }
     pthread_rwlock_wrlock(&runtime->lock);
-    if (runtime->has_predecessor &&
-        route_key_equal(key, &runtime->predecessor.key)) {
-        snapshot_clear(&runtime->predecessor);
-        runtime->has_predecessor = 0;
-    } else if (runtime->has_active &&
-               route_key_equal(key, &runtime->active.key)) {
-        snapshot_clear(&runtime->active);
-        runtime->has_active = 0;
-    } else {
+    scope = find_scope(runtime, &key->scope_key);
+    if (!scope) {
         pthread_rwlock_unlock(&runtime->lock);
         set_error(error, error_len, "route retirement key is not retained");
         return -1;
+    }
+    if (scope->has_predecessor &&
+        snapshot_key_equal(&scope->predecessor.key, key)) {
+        snapshot_clear(&scope->predecessor);
+        scope->has_predecessor = 0;
+    } else if (scope->has_active && snapshot_key_equal(&scope->active.key, key) &&
+               !scope->has_predecessor) {
+        snapshot_clear(&scope->active);
+        scope->has_active = 0;
+    } else {
+        pthread_rwlock_unlock(&runtime->lock);
+        set_error(error, error_len, "route retirement key is not retired safely");
+        return -1;
+    }
+    if (!scope->has_active && !scope->has_prepared && !scope->has_predecessor) {
+        scopes = scope_slots(runtime);
+        scope_index = (size_t)(scope - scopes);
+        if (scope_index + 1U != runtime->scope_count) {
+            scopes[scope_index] = scopes[runtime->scope_count - 1U];
+        }
+        memset(&scopes[runtime->scope_count - 1U], 0,
+               sizeof(scopes[runtime->scope_count - 1U]));
+        runtime->scope_count--;
     }
     pthread_rwlock_unlock(&runtime->lock);
     return 0;
 }
 
-int wvm_route_runtime_lookup(
-    const struct wvm_route_runtime *runtime, uint32_t destination_id,
-    struct sockaddr_in *next_hop_out,
-    struct wvm_route_snapshot_key *key_out)
+int wvm_route_runtime_lookup_destination(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_route_snapshot_key *key, uint16_t destination_kind,
+    uint64_t destination_scope, uint32_t destination_vnode_or_endpoint,
+    struct wvm_route_runtime_next_hop *next_hop_out, char *error,
+    size_t error_len)
 {
-    size_t left;
-    size_t right;
-    const struct wvm_route_runtime_snapshot *snapshot;
+    const struct route_scope_slot *scope;
+    const struct wvm_route_rule_record *rule;
 
-    if (!runtime || !next_hop_out || destination_id == WVM_NODE_AUTO_ROUTE) {
+    if (!runtime || !next_hop_out ||
+        !key ||
+        wvm_route_snapshot_key_validate(key, error, error_len) != 0 ||
+        route_destination_fields_valid(
+            destination_kind, destination_scope,
+            destination_vnode_or_endpoint, error, error_len) != 0) {
         return -1;
     }
+
     pthread_rwlock_rdlock((pthread_rwlock_t *)&runtime->lock);
-    if (!runtime->has_active) {
+    scope = find_scope_const(runtime, &key->scope_key);
+    if (!scope || !scope->has_active ||
+        !snapshot_key_equal(&scope->active.key, key)) {
         pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
+        set_error(error, error_len, "route snapshot is unavailable or stale");
         return -1;
     }
-    snapshot = &runtime->active;
-    if (WVM_GET_VMID(destination_id) != 0 &&
-        WVM_GET_VMID(destination_id) != snapshot->key.scope_key.vm_id) {
+    rule = find_rule(&scope->active, WVM_ROUTE_DESTINATION_EXACT_VNODE,
+                     destination_scope, destination_vnode_or_endpoint);
+    if (!rule && destination_kind ==
+                     WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE) {
+        rule = find_rule(&scope->active, WVM_ROUTE_DESTINATION_PREFIX,
+                         destination_scope, 0);
+    }
+    if (!rule) {
         pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
+        set_error(error, error_len, "route destination is unknown");
         return -1;
     }
-    left = 0;
-    right = snapshot->entry_count;
-    while (left < right) {
-        size_t middle = left + (right - left) / 2U;
-        uint32_t current = snapshot->entries[middle].destination_id;
-
-        if (current == destination_id) {
-            *next_hop_out = snapshot->entries[middle].next_hop;
-            if (key_out) {
-                *key_out = snapshot->key;
-            }
-            pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
-            return 0;
-        }
-        if (current < destination_id) {
-            left = middle + 1U;
-        } else {
-            right = middle;
-        }
-    }
-    /*
-     * Raw IDs are legacy-only.  A nonzero VM namespace never falls through
-     * to the raw node entry, even when a compatibility route exists.
-     */
-    if (WVM_GET_VMID(destination_id) == 0) {
-        left = 0;
-        right = snapshot->entry_count;
-        while (left < right) {
-            size_t middle = left + (right - left) / 2U;
-            uint32_t current = snapshot->entries[middle].destination_id;
-
-            if (current == destination_id) {
-                *next_hop_out = snapshot->entries[middle].next_hop;
-                if (key_out) {
-                    *key_out = snapshot->key;
-                }
-                pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
-                return 0;
-            }
-            if (current < destination_id) {
-                left = middle + 1U;
-            } else {
-                right = middle;
-            }
-        }
-    }
+    memset(next_hop_out, 0, sizeof(*next_hop_out));
+    next_hop_out->matched_destination_kind = rule->destination_kind;
+    next_hop_out->next_hop_kind = rule->next_hop_kind;
+    next_hop_out->hop_limit = rule->hop_limit;
+    next_hop_out->next_hop_member = rule->next_hop_member;
+    next_hop_out->next_hop_endpoint = rule->next_hop_endpoint;
     pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
-    return -1;
+    return 0;
 }
 
+int wvm_route_runtime_lookup(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_envelope_v1 *envelope,
+    struct wvm_route_runtime_next_hop *next_hop_out, char *error,
+    size_t error_len)
+{
+    struct wvm_route_snapshot_key key;
+
+    if (!envelope ||
+        route_destination_valid(envelope, error, error_len) != 0) {
+        return -1;
+    }
+    memset(&key, 0, sizeof(key));
+    key.scope_key.vm_id = envelope->vm_id;
+    key.scope_key.vm_incarnation = envelope->vm_incarnation;
+    key.scope_key.route_scope_id = envelope->route_scope_id;
+    key.topology_revision = envelope->topology_revision;
+    key.route_generation = envelope->route_generation;
+    memcpy(key.snapshot_digest, envelope->route_snapshot_digest,
+           sizeof(key.snapshot_digest));
+    if (wvm_route_runtime_lookup_destination(
+            runtime, &key, envelope->route.destination_kind,
+            envelope->route.destination_scope,
+            envelope->route.destination_vnode_or_endpoint, next_hop_out, error,
+            error_len) != 0) {
+        return -1;
+    }
+    if (envelope->route.hop_count >= next_hop_out->hop_limit) {
+        set_error(error, error_len, "route rule hop budget is exhausted");
+        return -1;
+    }
+    return 0;
+}
 int wvm_route_runtime_current_key(
     const struct wvm_route_runtime *runtime,
+    const struct wvm_vm_route_scope_key *scope_key,
     struct wvm_route_snapshot_key *key_out)
 {
-    if (!runtime || !key_out) {
+    const struct route_scope_slot *scope;
+
+    if (!runtime || !scope_key || !key_out) {
         return -1;
     }
     pthread_rwlock_rdlock((pthread_rwlock_t *)&runtime->lock);
-    if (!runtime->has_active) {
+    scope = find_scope_const(runtime, scope_key);
+    if (!scope || !scope->has_active) {
         pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
         return -1;
     }
-    *key_out = runtime->active.key;
+    *key_out = scope->active.key;
     pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
     return 0;
 }
 
 int wvm_route_runtime_predecessor_key(
     const struct wvm_route_runtime *runtime,
+    const struct wvm_vm_route_scope_key *scope_key,
     struct wvm_route_snapshot_key *key_out)
 {
-    if (!runtime || !key_out) {
+    const struct route_scope_slot *scope;
+
+    if (!runtime || !scope_key || !key_out) {
         return -1;
     }
     pthread_rwlock_rdlock((pthread_rwlock_t *)&runtime->lock);
-    if (!runtime->has_predecessor) {
+    scope = find_scope_const(runtime, scope_key);
+    if (!scope || !scope->has_predecessor) {
         pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
         return -1;
     }
-    *key_out = runtime->predecessor.key;
+    *key_out = scope->predecessor.key;
     pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
     return 0;
 }
@@ -340,16 +580,18 @@ int wvm_route_runtime_has_snapshot(
     const struct wvm_route_runtime *runtime,
     const struct wvm_route_snapshot_key *key)
 {
+    const struct route_scope_slot *scope;
     int found;
 
     if (!runtime || !key) {
         return 0;
     }
     pthread_rwlock_rdlock((pthread_rwlock_t *)&runtime->lock);
-    found = (runtime->has_active &&
-             route_key_equal(key, &runtime->active.key)) ||
-            (runtime->has_predecessor &&
-             route_key_equal(key, &runtime->predecessor.key));
+    scope = find_scope_const(runtime, &key->scope_key);
+    found = scope &&
+            ((scope->has_active && snapshot_key_equal(&scope->active.key, key)) ||
+             (scope->has_predecessor &&
+              snapshot_key_equal(&scope->predecessor.key, key)));
     pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
     return found;
 }

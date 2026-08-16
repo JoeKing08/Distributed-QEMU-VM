@@ -133,7 +133,7 @@ The V1 enum registry is:
 | `0x1025` | `StartupDependency` | `1:U16:dependency_kind`, `2:Record<MemberKey>:member_key`, `3:U16:required_state`, `4:Digest32:dependency_digest` |
 | `0x1026` | `ReservationRequirement` | `1:ID16:reservation_id`, `2:U32:physical_node_id`, `3:U64:node_instance_id`, `4:U64:inventory_revision`, `5:U32:guest_vcpu_slots`, `6:U64:guest_memory_bytes`, `7:U32:overhead_vcpu_slots`, `8:U64:overhead_memory_bytes`, `9:List<ExclusiveLease, lease_kind/lease_name>:exclusive_leases` |
 | `0x1027` | `AdmissionTransaction` | `1:ID16:request_id`, `2:Digest32:request_digest`, `3:U32:vm_id`, `4:U64:vm_incarnation`, `5:U64:manifest_generation`, `6:ID16:admission_tx_id`, `7:ID16:manifest_id`, `8:Record<VmRouteScopeKey>:route_scope_key`, `9:U16:lifecycle_state`, `10:Digest32:candidate_manifest_digest?`, `11:Digest32:activation_record_digest?`, `12:U64:transaction_sequence` |
-| `0x1028` | `RuntimeDispatchProjection` | `1:Digest32:candidate_manifest_digest`, `2:U32:vm_id`, `3:U64:vm_incarnation`, `4:U64:manifest_generation`, `5:U32:physical_node_id`, `6:U64:expected_node_instance_id`, `7:ID16:activation_fence`, `8:Record<RouteSnapshotKey>:required_route_snapshot_key`, `9:U32:local_primary_vnode`, `10:U32:route_vnode_count`, `11:Record<Endpoint>:local_sidecar_endpoint`, `12:List<(U32 guest_vcpu_index,U32 executor_vnode), guest_vcpu_index>:cpu_dispatch`, `13:List<(U64 gpa_start,U64 bytes,U32 directory_vnode,U32 executor_vnode,U16 consistency_policy), gpa_start>:memory_dispatch` |
+| `0x1028` | `RuntimeDispatchProjection` | `1:Digest32:candidate_manifest_digest`, `2:U32:vm_id`, `3:U64:vm_incarnation`, `4:U64:manifest_generation`, `5:U32:physical_node_id`, `6:U64:expected_node_instance_id`, `7:ID16:activation_fence`, `8:Record<RouteSnapshotKey>:required_route_snapshot_key`, `9:U16:route_topology_kind`, `10:U16:local_destination_kind`, `11:U64:local_destination_scope`, `12:U32:local_destination_vnode`, `13:Record<Endpoint>:local_sidecar_endpoint`, `14:List<(U32 guest_vcpu_index,U16 executor_destination_kind,U64 executor_destination_scope,U32 executor_destination_vnode), guest_vcpu_index>:cpu_dispatch`, `15:List<(U64 gpa_start,U64 bytes,U16 directory_destination_kind,U64 directory_destination_scope,U32 directory_destination_vnode,U16 executor_destination_kind,U64 executor_destination_scope,U32 executor_destination_vnode,U32 directory_physical_node_id,U64 directory_node_instance_id,U16 consistency_policy), gpa_start>:memory_dispatch` |
 
 ## 3. Cross-Record Constraints
 
@@ -149,16 +149,32 @@ The V1 enum registry is:
   snapshot digest. A standalone ACK set or a route transaction's ACK set uses
   final expected-key digests unchanged. `RouteSnapshot.required_ack_set` must
   match the transaction and eligibility-fence digest that prepared it.
-- `RuntimeDispatchProjection` is a node-local compatibility cache derived from
+- `RuntimeDispatchProjection` is a node-local dispatch cache derived from
   exactly one admitted `CandidateVmManifest`, activated
   `NodeRuntimeManifest`, canonical node-record set, and immutable route
   snapshot. It is not an additional placement, membership, or route authority.
   Its candidate digest, node instance, activation fence, and route snapshot key
-  must exactly equal the manifest accepted by the local node runtime.
+  must exactly equal the manifest accepted by the local node runtime. Its
+  topology kind and every local, CPU, directory, and executor destination are
+  complete V1 route keys: flat destinations use `{FLAT_VNODE, 0, vnode}` and
+  fractal destinations use `{FRACTAL_VNODE, pod_or_prefix, vnode}`. A route
+  scope must not be discarded while publishing, loading, or looking up this
+  projection. Every memory mapping also retains its selected directory's
+  physical-node and node-instance authority, which a returned memory ACK must
+  match before it can install an authoritative page.
 - The current legacy logic-core adapter consumes only flat exact-vnode routes
-  with IPv4/UDP local-sidecar endpoints. A non-flat route snapshot or any
-  missing exact route must reject dispatch publication for that adapter rather
-  than flattening a hierarchical route into guessed endpoints.
+  with IPv4/UDP local-sidecar endpoints. It must reject a non-flat projection
+  at legacy startup rather than flattening a hierarchical route into guessed
+  endpoints; the typed node-runtime path consumes both flat and fractal
+  projections.
+- `CandidateVmManifest.execution_plan.backend` and every
+  `PlacementPlan.vcpu_assignments[].backend` must agree. A VM may use KVM or
+  TCG, but never a mixed vCPU backend in one admitted incarnation.
+  `VmRequest.execution_backend_policy=AUTO` is resolved KVM-first and may
+  produce a new TCG plan only before activation; `fallback_decision` records
+  that result and its diagnostic reason. `MemoryChunkAssignment` has no KVM or
+  TCG backend field because memory placement is backend-neutral subject to the
+  selected memory capability/profile and route.
 - `RouteSnapshotKey.snapshot_digest` is a self-digest only when it identifies
   the enclosing `RouteSnapshot`. Its digest preimage zeros every self-reference
   described in Section 1.1, then inserts one final digest into each such

@@ -50,6 +50,7 @@
 
 #else
     #include <pthread.h>
+    #include <errno.h>
     #include <string.h>
     #include <sys/mman.h>
     #include <stdio.h>
@@ -625,6 +626,40 @@ static page_meta_t* find_or_create_page_meta(uint64_t gpa) {
     }
     return NULL;
 }
+
+/*
+ * Lookup-only companion for commit paths. A dirty commit must never
+ * materialize a page as a side effect of an invalid or stale submission.
+ * Callers must hold the corresponding directory shard lock.
+ */
+static page_meta_t *find_page_meta_locked(uint64_t gpa)
+{
+    uint64_t page_idx = gpa >> WVM_PAGE_SHIFT;
+    uint32_t hash = murmur3_32(page_idx);
+#ifdef __KERNEL__
+    uint32_t cap = DIR_TABLE_SIZE;
+#else
+    uint32_t cap = g_dir_capacity;
+#endif
+
+    for (int i = 0; i < DIR_MAX_PROBE; i++) {
+        uint32_t cur = (hash + i) % cap;
+
+        if (!g_dir_table[cur].is_valid) {
+            return NULL;
+        }
+        if (g_dir_table[cur].gpa == gpa) {
+            return &g_dir_table[cur];
+        }
+    }
+    return NULL;
+}
+
+static void broadcast_to_subscriber_ids(const uint32_t *subscriber_ids,
+                                        uint32_t subscriber_count,
+                                        uint32_t writer_node_id,
+                                        uint16_t msg_type, const void *payload,
+                                        int len, uint8_t flags);
 
 #ifndef __KERNEL__
 /*
@@ -1236,6 +1271,178 @@ int wvm_handle_local_fault_fastpath(uint64_t gpa, void* page_buffer, uint64_t *v
     return -1; // 失败
 }
 
+int wvm_handle_local_commit_v1(uint64_t gpa, uint64_t base_version,
+                               uint16_t offset, const uint8_t *data,
+                               size_t data_bytes, uint64_t *result_version)
+{
+    uint32_t lock_idx;
+    page_meta_t *page;
+    uint32_t epoch;
+    uint32_t counter;
+
+    if (!data || !result_version ||
+        (gpa & (WVM_PAGE_BYTES - 1UL)) != 0 ||
+        base_version == 0 || data_bytes == 0 ||
+        data_bytes > WVM_PAGE_BYTES ||
+        offset > WVM_PAGE_BYTES - data_bytes) {
+        return -EINVAL;
+    }
+#ifndef __KERNEL__
+    /*
+     * A local V1 success must be visible to the live QEMU RAM image. Do not
+     * fall back to the legacy heap-backed page allocation here, otherwise the
+     * caller could receive a successful ACK for bytes QEMU cannot read.
+     */
+    if (!g_shm_ptr || g_shm_size < WVM_PAGE_BYTES ||
+        gpa > g_shm_size - WVM_PAGE_BYTES) {
+        return -EOPNOTSUPP;
+    }
+#endif
+
+    lock_idx = get_lock_idx(gpa);
+    pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+    page = find_page_meta_locked(gpa);
+    if (!page) {
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        return -ENOENT;
+    }
+    if (page->version != base_version) {
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        return -ESTALE;
+    }
+
+    epoch = GET_EPOCH(page->version);
+    counter = GET_COUNTER(page->version);
+    if (epoch != g_curr_epoch || counter == UINT32_MAX) {
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        return epoch != g_curr_epoch ? -ESTALE : -EOVERFLOW;
+    }
+    memcpy(page->base_page_data + offset, data, data_bytes);
+    page->version = MAKE_VERSION(epoch, counter + 1U);
+    *result_version = page->version;
+    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+    return 0;
+}
+
+int wvm_publish_local_commit_v1(uint64_t gpa, uint64_t result_version,
+                                uint16_t offset, const uint8_t *data,
+                                size_t data_bytes, uint32_t writer_node_id)
+{
+    uint32_t *subscriber_ids;
+    uint8_t *full_page = NULL;
+    uint8_t *payload;
+    size_t payload_bytes;
+    uint32_t subscriber_count = 0;
+    uint32_t lock_idx;
+    page_meta_t *page;
+    int use_full_page = data_bytes >= SMALL_UPDATE_THRESHOLD;
+
+    if (!data || result_version == 0 ||
+        (gpa & (WVM_PAGE_BYTES - 1UL)) != 0 ||
+        data_bytes == 0 || data_bytes > WVM_PAGE_BYTES ||
+        offset > WVM_PAGE_BYTES - data_bytes) {
+        return -EINVAL;
+    }
+
+    subscriber_ids = wvm_alloc_local(sizeof(*subscriber_ids) *
+                                      WVM_MAX_SLAVES);
+    if (!subscriber_ids) {
+        return -ENOMEM;
+    }
+    if (use_full_page) {
+        full_page = wvm_alloc_local(WVM_PAGE_BYTES);
+        if (!full_page) {
+            wvm_free_local(subscriber_ids);
+            return -ENOMEM;
+        }
+    }
+
+    lock_idx = get_lock_idx(gpa);
+    pthread_mutex_lock(&g_dir_table_locks[lock_idx]);
+    page = find_page_meta_locked(gpa);
+    if (!page) {
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        wvm_free_local(full_page);
+        wvm_free_local(subscriber_ids);
+        return -ENOENT;
+    }
+    if (page->version != result_version) {
+        pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+        wvm_free_local(full_page);
+        wvm_free_local(subscriber_ids);
+        return -ESTALE;
+    }
+    if (use_full_page) {
+        memcpy(full_page, page->base_page_data, WVM_PAGE_BYTES);
+    }
+#ifdef __KERNEL__
+    for (uint32_t node_id = 0;
+         node_id < WVM_MAX_SLAVES && subscriber_count < WVM_MAX_SLAVES;
+         node_id++) {
+        if (page->subscribers.bits[node_id / 64] &
+            (1UL << (node_id % 64))) {
+            subscriber_ids[subscriber_count++] = node_id;
+        }
+    }
+#else
+    subscriber_count = page->subscribers.count;
+    if (subscriber_count > WVM_MAX_SLAVES) {
+        subscriber_count = WVM_MAX_SLAVES;
+    }
+    if (subscriber_count != 0) {
+        memcpy(subscriber_ids, page->subscribers.ids,
+               sizeof(*subscriber_ids) * subscriber_count);
+    }
+#endif
+    /*
+     * The writer now owns a valid cached copy. Add it after taking the
+     * subscriber snapshot so the current commit is not echoed to its source.
+     */
+    register_page_subscriber(page, writer_node_id);
+    pthread_mutex_unlock(&g_dir_table_locks[lock_idx]);
+
+    if (use_full_page) {
+        struct wvm_full_page_push *push;
+
+        payload_bytes = sizeof(*push);
+        payload = wvm_alloc_local(payload_bytes);
+        if (!payload) {
+            wvm_free_local(full_page);
+            wvm_free_local(subscriber_ids);
+            return -ENOMEM;
+        }
+        push = (struct wvm_full_page_push *)payload;
+        push->gpa = WVM_HTONLL(gpa);
+        push->version = WVM_HTONLL(result_version);
+        memcpy(push->data, full_page, WVM_PAGE_BYTES);
+    } else {
+        struct wvm_diff_log *diff;
+
+        payload_bytes = sizeof(*diff) + data_bytes;
+        payload = wvm_alloc_local(payload_bytes);
+        if (!payload) {
+            wvm_free_local(subscriber_ids);
+            return -ENOMEM;
+        }
+        diff = (struct wvm_diff_log *)payload;
+        diff->gpa = WVM_HTONLL(gpa);
+        diff->version = WVM_HTONLL(result_version);
+        diff->offset = htons(offset);
+        diff->size = htons((uint16_t)data_bytes);
+        memcpy(diff->data, data, data_bytes);
+    }
+
+    broadcast_to_subscriber_ids(
+        subscriber_ids, subscriber_count, writer_node_id,
+        use_full_page ? MSG_PAGE_PUSH_FULL : MSG_PAGE_PUSH_DIFF, payload,
+        (int)payload_bytes, 0);
+
+    wvm_free_local(payload);
+    wvm_free_local(full_page);
+    wvm_free_local(subscriber_ids);
+    return 0;
+}
+
 // [V29 Optimization] 指针队列，极大降低内存占用
 typedef struct {
     uint32_t msg_type;
@@ -1380,6 +1587,23 @@ static void enqueue_broadcast_to_target(uint32_t target_id, uint16_t msg_type,
     target_shard->tail = current_tail + 1; // 更新目标分片队列的tail
     
     pthread_spin_unlock(&target_shard->lock);
+}
+
+static void broadcast_to_subscriber_ids(const uint32_t *subscriber_ids,
+                                        uint32_t subscriber_count,
+                                        uint32_t writer_node_id,
+                                        uint16_t msg_type, const void *payload,
+                                        int len, uint8_t flags)
+{
+    if (!subscriber_ids || !payload || len <= 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < subscriber_count; i++) {
+        if (subscriber_ids[i] != writer_node_id) {
+            enqueue_broadcast_to_target(subscriber_ids[i], msg_type,
+                                         (void *)payload, len, flags);
+        }
+    }
 }
 
 /* 

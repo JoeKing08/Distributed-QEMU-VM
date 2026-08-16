@@ -2,91 +2,100 @@
 #define WAVEVM_ROUTE_RUNTIME_H
 
 /*
- * User-space runtime view of one immutable route snapshot.
- *
- * The control plane owns the snapshot.  Data-plane consumers only publish a
- * prepared copy and perform exact-key lookups.  This deliberately does not
- * implement discovery or route learning.
+ * Immutable, VM-scoped route snapshots consumed by node runtimes, sidecars,
+ * and gateways. The control plane owns the canonical snapshot record; this
+ * module owns only prepared/active/predecessor copies and exact-key lookup.
  */
 
-#include <netinet/in.h>
 #include <pthread.h>
 #include <stddef.h>
-#include <stdint.h>
 
-#include "wavevm_manifest.h"
+#include "wavevm_control.h"
+#include "wavevm_envelope_v1.h"
 
 #define WVM_ROUTE_RUNTIME_MAX_ENTRIES 65536U
+#define WVM_ROUTE_RUNTIME_MAX_SCOPES 1024U
 
-struct wvm_route_runtime_entry {
-    uint32_t destination_id;
-    struct sockaddr_in next_hop;
+struct wvm_route_runtime_next_hop {
+    uint16_t matched_destination_kind;
+    uint16_t next_hop_kind;
+    uint16_t hop_limit;
+    struct wvm_member_key next_hop_member;
+    struct wvm_endpoint next_hop_endpoint;
 };
 
-struct wvm_route_runtime_snapshot {
-    struct wvm_route_snapshot_key key;
-    struct wvm_route_runtime_entry *entries;
-    size_t entry_count;
-    size_t entry_capacity;
-    uint8_t content_digest[WVM_SHA256_DIGEST_BYTES];
-};
-
+/*
+ * The storage is intentionally opaque. Callers initialize it once, then use
+ * prepare/activate/retire from the control path and lookup from data workers.
+ */
 struct wvm_route_runtime {
     pthread_rwlock_t lock;
-    struct wvm_route_runtime_snapshot active;
-    struct wvm_route_runtime_snapshot prepared;
-    struct wvm_route_runtime_snapshot predecessor;
-    int has_active;
-    int has_prepared;
-    int has_predecessor;
+    void *scopes;
+    size_t scope_count;
+    size_t scope_capacity;
 };
 
 void wvm_route_runtime_init(struct wvm_route_runtime *runtime);
 void wvm_route_runtime_destroy(struct wvm_route_runtime *runtime);
 
 /*
- * Prepare an immutable copy.  The caller retains ownership of entries after
- * this call returns.  A prepared snapshot is not usable for data traffic
- * until activate() succeeds.
+ * Prepare a complete canonical snapshot. A caller cannot inject a route rule
+ * separately from its admitted snapshot key/digest.
  */
 int wvm_route_runtime_prepare(
     struct wvm_route_runtime *runtime,
-    const struct wvm_route_snapshot_key *key,
-    const struct wvm_route_runtime_entry *entries, size_t entry_count,
-    char *error, size_t error_len);
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len);
 
 int wvm_route_runtime_activate(struct wvm_route_runtime *runtime,
                                const struct wvm_route_snapshot_key *key,
                                char *error, size_t error_len);
 
 /*
- * Retire one exact active or retained predecessor snapshot. A route miss is
- * returned to the caller; callers must not retry by stripping a nonzero VM
- * namespace.
+ * Retire one exact active or retained predecessor. A successor activation
+ * retains one predecessor so control/query work can drain without exposing a
+ * partially replaced table to data traffic.
  */
 int wvm_route_runtime_retire(struct wvm_route_runtime *runtime,
                              const struct wvm_route_snapshot_key *key,
                              char *error, size_t error_len);
 
+/*
+ * Look up one prevalidated V1 routed frame. The envelope's complete snapshot
+ * key must equal the active key for its VM route scope. A predecessor is never
+ * selected for new data traffic; callers receive a route-stale failure instead.
+ */
 int wvm_route_runtime_lookup(
-    const struct wvm_route_runtime *runtime, uint32_t destination_id,
-    struct sockaddr_in *next_hop_out,
-    struct wvm_route_snapshot_key *key_out);
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_envelope_v1 *envelope,
+    struct wvm_route_runtime_next_hop *next_hop_out, char *error,
+    size_t error_len);
+
+/*
+ * Resolve one complete V1 leaf destination against an exact active immutable
+ * snapshot. This is the outbound counterpart to envelope lookup: node
+ * runtimes use it to derive a fresh route prefix without manufacturing a
+ * temporary legacy target ID.
+ */
+int wvm_route_runtime_lookup_destination(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_route_snapshot_key *key, uint16_t destination_kind,
+    uint64_t destination_scope, uint32_t destination_vnode_or_endpoint,
+    struct wvm_route_runtime_next_hop *next_hop_out, char *error,
+    size_t error_len);
 
 int wvm_route_runtime_current_key(
     const struct wvm_route_runtime *runtime,
+    const struct wvm_vm_route_scope_key *scope_key,
     struct wvm_route_snapshot_key *key_out);
 
-/*
- * A successor activation retains one exact predecessor for operation/query
- * drain. New data traffic always uses the active generation; callers must
- * explicitly retire the predecessor after its completion horizon.
- */
 int wvm_route_runtime_predecessor_key(
     const struct wvm_route_runtime *runtime,
+    const struct wvm_vm_route_scope_key *scope_key,
     struct wvm_route_snapshot_key *key_out);
+
 int wvm_route_runtime_has_snapshot(
     const struct wvm_route_runtime *runtime,
     const struct wvm_route_snapshot_key *key);
 
-#endif
+#endif /* WAVEVM_ROUTE_RUNTIME_H */

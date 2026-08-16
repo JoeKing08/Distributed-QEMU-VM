@@ -1,0 +1,61 @@
+#ifndef WAVEVM_ROUTE_CONTROL_H
+#define WAVEVM_ROUTE_CONTROL_H
+
+/*
+ * Durable local consumer for V1 route transactions.  A control transport
+ * authenticates the peer and passes decoded local-control envelopes here;
+ * this module records and replays only the participant-side route install
+ * state.  It is not a second membership or placement authority.
+ */
+
+#include <stddef.h>
+
+#include "wavevm_envelope_v1.h"
+#include "wavevm_route_runtime.h"
+
+#define WVM_ROUTE_CONTROL_MAX_OPERATIONS 65536U
+#define WVM_ROUTE_CONTROL_MAX_FRAME_BYTES \
+    (WVM_ENVELOPE_V1_HEADER_BYTES + WVM_ENVELOPE_V1_MAX_LOCAL_PAYLOAD)
+
+struct wvm_route_control_operation;
+
+struct wvm_route_control_result {
+    uint16_t recorded_state;
+    struct wvm_route_snapshot_key route_snapshot_key;
+    uint64_t operation_retention_horizon_ms;
+};
+
+struct wvm_route_control {
+    pthread_mutex_t lock;
+    struct wvm_route_runtime *runtime;
+    int journal_fd;
+    uint64_t next_sequence;
+    struct wvm_route_control_operation *operations;
+    size_t operation_count;
+    size_t operation_capacity;
+};
+
+/*
+ * Opens or creates one append-only participant journal and replays every
+ * completed V1 route control frame into RUNTIME.  A torn tail is discarded;
+ * a completed malformed frame rejects startup rather than guessing state.
+ */
+int wvm_route_control_open(struct wvm_route_control *control,
+                           struct wvm_route_runtime *runtime,
+                           const char *journal_path, char *error,
+                           size_t error_len);
+
+void wvm_route_control_close(struct wvm_route_control *control);
+
+/*
+ * Applies exactly one decoded V1 local-control frame.  Only
+ * ROUTE_PREPARE, ROUTE_COMMIT, and ROUTE_RETIRE are accepted.  The operation
+ * identity is idempotent per message type; reuse with a different semantic
+ * payload digest is rejected.
+ */
+int wvm_route_control_apply(struct wvm_route_control *control,
+                            const struct wvm_envelope_v1 *request,
+                            struct wvm_route_control_result *result_out,
+                            char *error, size_t error_len);
+
+#endif /* WAVEVM_ROUTE_CONTROL_H */

@@ -27,6 +27,9 @@
 #include <sys/sysinfo.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <inttypes.h>
 
@@ -35,6 +38,7 @@
 #include "../common_include/wavevm_membership.h"
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_route_runtime.h"
+#include "../common_include/wavevm_route_control.h"
 #include "../common_include/wavevm_runtime_gate.h"
 #include "uthash.h"
 
@@ -62,6 +66,11 @@ static struct wvm_route_runtime g_route_runtime;
 static int g_route_runtime_ready = 0;
 static uint32_t g_route_vm_id = 0;
 static int g_route_authority_active = 0;
+static struct wvm_route_control g_route_control;
+static int g_route_control_ready = 0;
+static char g_route_control_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static uint32_t g_route_control_physical_node_id = 0;
+static uint64_t g_route_control_instance_id = 0;
 #define BATCH_SIZE 64
 #define WVM_BIG_PKT_THRESHOLD 200
 #define WVM_RXQ_DROP_HEARTBEAT (512 * 1024)
@@ -183,6 +192,278 @@ static int g_nonblock_recv = 0;
 static int g_force_single_fd = 0;
 static int g_multi_queue = 1;
 
+#define WVM_V1_TX_BATCH_SIZE 32U
+#define WVM_V1_TX_QUEUE_CAPACITY 8192U
+#define WVM_V1_TX_HIGH_BURST 8U
+
+/*
+ * V1 frames are individually checksummed envelopes and cannot be concatenated
+ * into the legacy aggregation buffer.  The gateway still needs queueing,
+ * QoS, and batched syscalls, so V1 uses a separate bounded MPSC scheduler.
+ */
+struct v1_tx_item {
+    struct v1_tx_item *next;
+    struct sockaddr_in destination;
+    size_t bytes;
+    uint8_t frame[WVM_ENVELOPE_V1_MAX_NETWORK_FRAME_BYTES];
+};
+
+struct v1_tx_queue {
+    struct v1_tx_item *head;
+    struct v1_tx_item *tail;
+    size_t count;
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+};
+
+struct v1_tx_scheduler {
+    struct v1_tx_queue high;
+    struct v1_tx_queue normal;
+    pthread_t thread;
+    int socket_fd;
+    int started;
+};
+
+static struct v1_tx_scheduler g_v1_tx_scheduler = {
+    .socket_fd = -1,
+};
+
+static int v1_message_is_latency_sensitive(uint16_t message_type)
+{
+    switch (message_type) {
+    case WVM_ENVELOPE_V1_MSG_MEM_READ:
+    case WVM_ENVELOPE_V1_MSG_MEM_ACK:
+    case WVM_ENVELOPE_V1_MSG_VCPU_RUN:
+    case WVM_ENVELOPE_V1_MSG_VCPU_EXIT:
+    case WVM_ENVELOPE_V1_MSG_VFIO_IRQ:
+    case WVM_ENVELOPE_V1_MSG_BLOCK_ACK:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void v1_tx_queue_init(struct v1_tx_queue *queue)
+{
+    memset(queue, 0, sizeof(*queue));
+    pthread_mutex_init(&queue->lock, NULL);
+    pthread_cond_init(&queue->ready, NULL);
+}
+
+static int v1_tx_enqueue(struct v1_tx_item *item, int high_priority)
+{
+    struct v1_tx_queue *queue =
+        high_priority ? &g_v1_tx_scheduler.high : &g_v1_tx_scheduler.normal;
+    size_t total_count;
+
+    if (!item || !g_v1_tx_scheduler.started) {
+        return -EPIPE;
+    }
+
+    /*
+     * Lock both queues in a fixed order to enforce one scheduler-wide
+     * capacity without introducing a data-plane global routing lock.
+     */
+    pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
+    pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
+    total_count = g_v1_tx_scheduler.high.count + g_v1_tx_scheduler.normal.count;
+    if (total_count >= WVM_V1_TX_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
+        pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+        return -EAGAIN;
+    }
+    if (queue->tail) {
+        queue->tail->next = item;
+    } else {
+        queue->head = item;
+    }
+    queue->tail = item;
+    queue->count++;
+    /* One scheduler worker waits on the high queue's shared wakeup. */
+    pthread_cond_signal(&g_v1_tx_scheduler.high.ready);
+    pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
+    pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+    return 0;
+}
+
+static struct v1_tx_item *v1_tx_take_one(unsigned int *high_streak)
+{
+    struct v1_tx_item *item = NULL;
+    struct v1_tx_queue *selected = NULL;
+
+    pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
+    pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
+    while (!g_v1_tx_scheduler.high.head && !g_v1_tx_scheduler.normal.head) {
+        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
+        pthread_cond_wait(&g_v1_tx_scheduler.high.ready,
+                          &g_v1_tx_scheduler.high.lock);
+        pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
+    }
+    if (g_v1_tx_scheduler.high.head &&
+        (!g_v1_tx_scheduler.normal.head ||
+         *high_streak < WVM_V1_TX_HIGH_BURST)) {
+        selected = &g_v1_tx_scheduler.high;
+        (*high_streak)++;
+    } else {
+        selected = &g_v1_tx_scheduler.normal;
+        *high_streak = 0;
+    }
+    item = selected->head;
+    selected->head = item->next;
+    if (!selected->head) {
+        selected->tail = NULL;
+    }
+    selected->count--;
+    item->next = NULL;
+    pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
+    pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+    return item;
+}
+
+static size_t v1_tx_take_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
+                               unsigned int *high_streak)
+{
+    size_t count = 0;
+
+    items[count++] = v1_tx_take_one(high_streak);
+    while (count < WVM_V1_TX_BATCH_SIZE) {
+        struct v1_tx_item *item = NULL;
+
+        pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
+        pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
+        if (g_v1_tx_scheduler.high.head &&
+            (!g_v1_tx_scheduler.normal.head ||
+             *high_streak < WVM_V1_TX_HIGH_BURST)) {
+            item = g_v1_tx_scheduler.high.head;
+            g_v1_tx_scheduler.high.head = item->next;
+            if (!g_v1_tx_scheduler.high.head) {
+                g_v1_tx_scheduler.high.tail = NULL;
+            }
+            g_v1_tx_scheduler.high.count--;
+            (*high_streak)++;
+        } else if (g_v1_tx_scheduler.normal.head) {
+            item = g_v1_tx_scheduler.normal.head;
+            g_v1_tx_scheduler.normal.head = item->next;
+            if (!g_v1_tx_scheduler.normal.head) {
+                g_v1_tx_scheduler.normal.tail = NULL;
+            }
+            g_v1_tx_scheduler.normal.count--;
+            *high_streak = 0;
+        }
+        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
+        pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+        if (!item) {
+            break;
+        }
+        item->next = NULL;
+        items[count++] = item;
+    }
+    return count;
+}
+
+static void v1_tx_send_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
+                             size_t count)
+{
+    size_t offset = 0;
+
+    while (offset < count) {
+        struct mmsghdr messages[WVM_V1_TX_BATCH_SIZE];
+        struct iovec iovecs[WVM_V1_TX_BATCH_SIZE];
+        size_t remaining = count - offset;
+        int sent;
+        size_t i;
+
+        memset(messages, 0, sizeof(messages));
+        for (i = 0; i < remaining; i++) {
+            iovecs[i].iov_base = items[offset + i]->frame;
+            iovecs[i].iov_len = items[offset + i]->bytes;
+            messages[i].msg_hdr.msg_iov = &iovecs[i];
+            messages[i].msg_hdr.msg_iovlen = 1;
+            messages[i].msg_hdr.msg_name = &items[offset + i]->destination;
+            messages[i].msg_hdr.msg_namelen = sizeof(items[offset + i]->destination);
+        }
+        sent = sendmmsg(g_v1_tx_scheduler.socket_fd, messages,
+                        (unsigned int)remaining, MSG_DONTWAIT);
+        if (sent > 0) {
+            for (i = 0; i < (size_t)sent; i++) {
+                free(items[offset + i]);
+            }
+            offset += (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd writable = {
+                .fd = g_v1_tx_scheduler.socket_fd,
+                .events = POLLOUT,
+            };
+
+            /*
+             * This is kernel transport backpressure, not a semantic timeout.
+             * Waiting for POLLOUT avoids a retry spin and keeps unsent frames
+             * in their original order.
+             */
+            if (poll(&writable, 1, -1) >= 0) {
+                continue;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+        }
+        fprintf(stderr, "[Gateway] V1 transmit failed errno=%d; dropping %zu frames\n",
+                errno, remaining);
+        while (offset < count) {
+            free(items[offset++]);
+        }
+    }
+}
+
+static void *v1_tx_worker(void *opaque)
+{
+    unsigned int high_streak = 0;
+
+    (void)opaque;
+    for (;;) {
+        struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE];
+        size_t count = v1_tx_take_batch(items, &high_streak);
+
+        v1_tx_send_batch(items, count);
+    }
+    return NULL;
+}
+
+static int v1_tx_scheduler_start(void)
+{
+    int flags;
+
+    if (g_v1_tx_scheduler.started) {
+        return 0;
+    }
+    v1_tx_queue_init(&g_v1_tx_scheduler.high);
+    v1_tx_queue_init(&g_v1_tx_scheduler.normal);
+    g_v1_tx_scheduler.socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_v1_tx_scheduler.socket_fd < 0) {
+        return -errno;
+    }
+    flags = fcntl(g_v1_tx_scheduler.socket_fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(g_v1_tx_scheduler.socket_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    if (pthread_create(&g_v1_tx_scheduler.thread, NULL, v1_tx_worker, NULL) !=
+        0) {
+        int result = -errno;
+
+        close(g_v1_tx_scheduler.socket_fd);
+        g_v1_tx_scheduler.socket_fd = -1;
+        return result;
+    }
+    pthread_detach(g_v1_tx_scheduler.thread);
+    g_v1_tx_scheduler.started = 1;
+    return 0;
+}
+
 static int parse_u64_env(const char *name, uint64_t *value)
 {
     const char *text = getenv(name);
@@ -217,20 +498,6 @@ static int parse_hex_digest_env(const char *name, uint8_t digest[32])
             return -1;
         }
         digest[i] = (uint8_t)value;
-    }
-    return 0;
-}
-
-static int route_entry_compare(const void *left, const void *right)
-{
-    const struct wvm_route_runtime_entry *a = left;
-    const struct wvm_route_runtime_entry *b = right;
-
-    if (a->destination_id < b->destination_id) {
-        return -1;
-    }
-    if (a->destination_id > b->destination_id) {
-        return 1;
     }
     return 0;
 }
@@ -278,10 +545,80 @@ void detect_cpu_env() {
     if (get_nprocs() <= 1) g_is_single_core = 1;
 }
 
+static int endpoint_to_sockaddr_in(const struct wvm_endpoint *endpoint,
+                                   struct sockaddr_in *address)
+{
+    if (!endpoint || !address ||
+        endpoint->data_transport != WVM_DATA_TRANSPORT_UDP ||
+        endpoint->data_address_bytes != 4 || endpoint->data_port == 0) {
+        return -1;
+    }
+    memset(address, 0, sizeof(*address));
+    address->sin_family = AF_INET;
+    memcpy(&address->sin_addr.s_addr, endpoint->data_address, 4);
+    address->sin_port = htons(endpoint->data_port);
+    return 0;
+}
+
+static int gateway_forward_v1(int local_fd, const uint8_t *packet,
+                              size_t packet_bytes)
+{
+    struct wvm_envelope_v1 envelope;
+    struct wvm_route_runtime_next_hop next_hop;
+    struct sockaddr_in destination;
+    struct v1_tx_item *item = NULL;
+    size_t forwarded_bytes = 0;
+    char error[256] = {0};
+
+    (void)local_fd;
+
+    if (!g_route_authority_active ||
+        wvm_envelope_v1_decode(packet, packet_bytes,
+                               WVM_ENVELOPE_V1_TRANSPORT_NETWORK, &envelope,
+                               error, sizeof(error)) != 0 ||
+        wvm_route_runtime_lookup(&g_route_runtime, &envelope, &next_hop,
+                                 error, sizeof(error)) != 0 ||
+        endpoint_to_sockaddr_in(&next_hop.next_hop_endpoint, &destination) !=
+            0 ||
+        wvm_envelope_v1_route_advance(&envelope, error, sizeof(error)) != 0 ||
+        !(item = calloc(1, sizeof(*item))) ||
+        wvm_envelope_v1_encode(&envelope, WVM_ENVELOPE_V1_TRANSPORT_NETWORK,
+                               item->frame, sizeof(item->frame),
+                               &forwarded_bytes, error, sizeof(error)) != 0) {
+        static unsigned int rejected;
+
+        if (rejected++ < 16U) {
+            fprintf(stderr, "[Gateway] rejected V1 frame: %s\n",
+                    error[0] ? error : "route endpoint is unsupported");
+        }
+        free(item);
+        return -EPROTO;
+    }
+    item->destination = destination;
+    item->bytes = forwarded_bytes;
+    if (v1_tx_enqueue(item, v1_message_is_latency_sensitive(
+                                envelope.message_type)) != 0) {
+        static unsigned int backpressured;
+
+        if (backpressured++ < 16U) {
+            fprintf(stderr, "[Gateway] V1 transmit queue is backpressured\n");
+        }
+        free(item);
+        return -EAGAIN;
+    }
+    return 0;
+}
+
 static inline void gateway_process_packet(int local_fd,
                                           uint8_t *ptr,
                                           int pkt_len,
                                           struct sockaddr_in *src) {
+    if (pkt_len >= 4 && ptr[0] == 'W' && ptr[1] == 'V' &&
+        ptr[2] == 'M' && ptr[3] == '1') {
+        (void)src;
+        (void)gateway_forward_v1(local_fd, ptr, (size_t)pkt_len);
+        return;
+    }
     if (pkt_len < (int)sizeof(struct wvm_header)) return;
     struct wvm_header *hdr = (struct wvm_header *)ptr;
     if (pkt_len >= 200) {
@@ -549,18 +886,13 @@ out:
 static int init_route_runtime_from_snapshot_file(const char *path)
 {
     struct wvm_route_snapshot_record snapshot;
-    struct wvm_route_runtime_entry *entries = NULL;
     struct wvm_route_rule_record *rules = NULL;
     struct wvm_required_ack_entry *ack_entries = NULL;
     struct wvm_route_snapshot_key key;
-    size_t count;
-    size_t i;
     char error[256] = {0};
-    uint64_t vm_id;
 
-    if (!path || parse_u64_env("WVM_VM_ID", &vm_id) != 0 ||
-        vm_id == 0 || vm_id > 0xffU || g_route_vm_id != (uint32_t)vm_id) {
-        fprintf(stderr, "[Gateway] admitted route identity is incomplete\n");
+    if (!path) {
+        fprintf(stderr, "[Gateway] route snapshot path is missing\n");
         return -EINVAL;
     }
     rules = calloc(WVM_ROUTE_RUNTIME_MAX_ENTRIES, sizeof(*rules));
@@ -581,93 +913,53 @@ static int init_route_runtime_from_snapshot_file(const char *path)
         return -EINVAL;
     }
     key = snapshot.route_snapshot_key;
-    if (key.scope_key.vm_id != g_route_vm_id ||
-        key.scope_key.vm_incarnation == 0 ||
-        snapshot.topology_kind != WVM_ROUTE_TOPOLOGY_FLAT) {
-        fprintf(stderr,
-                "[Gateway] route snapshot is not representable by the "
-                "compatibility data-plane\n");
-        free(rules);
-        free(ack_entries);
-        return -ENOTSUP;
+    if (!g_route_runtime_ready) {
+        wvm_route_runtime_init(&g_route_runtime);
+        g_route_runtime_ready = 1;
     }
-
-    count = snapshot.next_hop_rules.count;
-    entries = calloc(count ? count : 1, sizeof(*entries));
-    if (!entries) {
-        free(rules);
-        free(ack_entries);
-        return -ENOMEM;
-    }
-    for (i = 0; i < count; i++) {
-        const struct wvm_route_rule_record *rule =
-            &snapshot.next_hop_rules.entries[i];
-        const struct wvm_endpoint *endpoint = &rule->next_hop_endpoint;
-        gateway_node_t *node;
-        uint32_t destination;
+    {
+        struct wvm_route_snapshot_key current;
 
         /*
-         * The current wire carries one 24-bit node field.  Only exact vnode
-         * rules with an IPv4 UDP endpoint can be projected into it.  Prefix
-         * rules remain a control-plane concern until the versioned route
-         * envelope carries their scope explicitly.
+         * A recovered route-control journal is newer authority than the
+         * bootstrap artifact.  Do not regress a live scope by replaying the
+         * manifest's initial route snapshot over its durable successor.
          */
-        if (rule->destination_kind != WVM_ROUTE_DESTINATION_EXACT_VNODE ||
-            rule->destination_scope != 0 ||
-            rule->destination_vnode_or_endpoint > WVM_NODEID_MASK ||
-            endpoint->data_transport != WVM_DATA_TRANSPORT_UDP ||
-            endpoint->data_address_bytes != 4 || endpoint->data_port == 0) {
+        if (wvm_route_runtime_current_key(
+                &g_route_runtime, &key.scope_key, &current) == 0) {
+            free(rules);
+            free(ack_entries);
+            g_route_authority_active = 1;
             fprintf(stderr,
-                    "[Gateway] route rule %zu needs a versioned scoped "
-                    "data-plane identity\n", i);
-            free(entries);
-            free(rules);
-            free(ack_entries);
-            return -ENOTSUP;
+                    "[Gateway] retained journal route snapshot vm=%u "
+                    "incarnation=%" PRIu64 " scope=%" PRIu64
+                    " topology=%" PRIu64 " generation=%" PRIu64 "\n",
+                    current.scope_key.vm_id,
+                    current.scope_key.vm_incarnation,
+                    current.scope_key.route_scope_id,
+                    current.topology_revision, current.route_generation);
+            return 0;
         }
-        destination = WVM_ENCODE_ID(
-            g_route_vm_id, rule->destination_vnode_or_endpoint);
-        entries[i].destination_id = destination;
-        entries[i].next_hop.sin_family = AF_INET;
-        memcpy(&entries[i].next_hop.sin_addr.s_addr, endpoint->data_address, 4);
-        entries[i].next_hop.sin_port = htons(endpoint->data_port);
-
-        node = find_or_create_node(destination);
-        if (!node) {
-            free(entries);
-            free(rules);
-            free(ack_entries);
-            return -ENOMEM;
-        }
-        pthread_mutex_lock(&node->lock);
-        node->addr = entries[i].next_hop;
-        node->static_pinned = 1;
-        pthread_mutex_unlock(&node->lock);
     }
-
-    wvm_route_runtime_init(&g_route_runtime);
-    g_route_runtime_ready = 1;
-    if (wvm_route_runtime_prepare(&g_route_runtime, &key, entries, count,
-                                  error, sizeof(error)) != 0 ||
+    if (wvm_route_runtime_prepare(&g_route_runtime, &snapshot, error,
+                                  sizeof(error)) != 0 ||
         wvm_route_runtime_activate(&g_route_runtime, &key, error,
                                    sizeof(error)) != 0) {
         fprintf(stderr, "[Gateway] route snapshot activation rejected: %s\n",
                 error[0] ? error : "invalid snapshot");
-        free(entries);
         free(rules);
         free(ack_entries);
-        wvm_route_runtime_destroy(&g_route_runtime);
-        g_route_runtime_ready = 0;
         return -EINVAL;
     }
-    free(entries);
     free(rules);
     free(ack_entries);
     g_route_authority_active = 1;
     fprintf(stderr,
-            "[Gateway] active route snapshot vm=%u scope=%" PRIu64
-            " topology=%" PRIu64 " generation=%" PRIu64 "\n",
-            g_route_vm_id, key.scope_key.route_scope_id,
+            "[Gateway] active V1 route snapshot vm=%u incarnation=%" PRIu64
+            " scope=%" PRIu64 " topology=%" PRIu64 " generation=%" PRIu64
+            "\n",
+            key.scope_key.vm_id, key.scope_key.vm_incarnation,
+            key.scope_key.route_scope_id,
             key.topology_revision, key.route_generation);
     return 0;
 }
@@ -678,6 +970,59 @@ static int init_route_runtime_from_environment(void)
 
     if (path && path[0] != '\0')
         return init_route_runtime_from_snapshot_file(path);
+    return 0;
+}
+
+static int init_route_control_from_environment(void)
+{
+    const char *journal_path = getenv("WVM_GATEWAY_ROUTE_JOURNAL_PATH");
+    const char *socket_path = getenv("WVM_GATEWAY_CONTROL_SOCKET");
+    uint64_t parsed_physical_node_id;
+
+    if ((!journal_path || journal_path[0] == '\0') &&
+        (!socket_path || socket_path[0] == '\0')) {
+        return 0;
+    }
+    if (!journal_path || journal_path[0] == '\0') {
+        fprintf(stderr,
+                "[Gateway] V1 control socket requires "
+                "WVM_GATEWAY_ROUTE_JOURNAL_PATH\n");
+        return -EINVAL;
+    }
+    if (!g_route_runtime_ready) {
+        wvm_route_runtime_init(&g_route_runtime);
+        g_route_runtime_ready = 1;
+    }
+    {
+        char error[256] = {0};
+
+        if (wvm_route_control_open(&g_route_control, &g_route_runtime,
+                                   journal_path, error, sizeof(error)) != 0) {
+            fprintf(stderr, "[Gateway] route control journal rejected: %s\n",
+                    error[0] ? error : "invalid journal");
+            return -EINVAL;
+        }
+    }
+    g_route_control_ready = 1;
+    if (!socket_path || socket_path[0] == '\0') {
+        return 0;
+    }
+    if (strlen(socket_path) >= sizeof(g_route_control_socket_path) ||
+        parse_u64_env("WVM_RUNTIME_PHYSICAL_NODE_ID",
+                      &parsed_physical_node_id) != 0 ||
+        parsed_physical_node_id > UINT32_MAX ||
+        parse_u64_env("WVM_NODE_INSTANCE_ID",
+                      &g_route_control_instance_id) != 0) {
+        fprintf(stderr,
+                "[Gateway] V1 control listener identity or socket path is "
+                "invalid\n");
+        wvm_route_control_close(&g_route_control);
+        g_route_control_ready = 0;
+        return -EINVAL;
+    }
+    g_route_control_physical_node_id = (uint32_t)parsed_physical_node_id;
+    snprintf(g_route_control_socket_path, sizeof(g_route_control_socket_path),
+             "%s", socket_path);
     return 0;
 }
 
@@ -808,18 +1153,6 @@ static void smart_backoff(int attempts) {
  * [后果] 这一步保证了包序的“因果一致性”。它确保了全量更新包不会被后续的小增量包在网关缓冲区内超越。
  */
 static int internal_push(int fd, uint32_t slave_id, void *data, int len) {
-    if (g_route_authority_active) {
-        struct sockaddr_in route_next_hop;
-
-        if (wvm_route_runtime_lookup(&g_route_runtime, slave_id,
-                                     &route_next_hop, NULL) != 0) {
-        /*
-         * A V1 route miss is a scoped miss.  Do not strip a nonzero VM ID and
-         * accidentally deliver another VM's packet to the same raw vnode.
-         */
-            return -EHOSTUNREACH;
-        }
-    }
     // 1. 读锁保护查找，防止与动态路由更新冲突
     pthread_rwlock_rdlock(&g_map_lock);
     gateway_node_t *node = find_node(slave_id);
@@ -1318,6 +1651,185 @@ static void* control_plane_thread(void *arg) {
     return NULL;
 }
 
+static void control_write_be16(uint8_t *bytes, uint16_t value)
+{
+    bytes[0] = (uint8_t)(value >> 8);
+    bytes[1] = (uint8_t)value;
+}
+
+static void control_write_be64(uint8_t *bytes, uint64_t value)
+{
+    size_t i;
+
+    for (i = 0; i < 8; i++) {
+        bytes[7U - i] = (uint8_t)(value >> (i * 8U));
+    }
+}
+
+static uint16_t control_status_from_error(const char *error)
+{
+    if (!error || error[0] == '\0') {
+        return 12; /* INTERNAL_FAILURE */
+    }
+    if (strstr(error, "unsupported") || strstr(error, "unknown")) {
+        return 11; /* UNSUPPORTED */
+    }
+    if (strstr(error, "payload") || strstr(error, "record") ||
+        strstr(error, "envelope")) {
+        return 2; /* INVALID_RECORD */
+    }
+    if (strstr(error, "conflict")) {
+        return 7; /* OPERATION_ID_CONFLICT */
+    }
+    return 6; /* PRECONDITION_FAILED */
+}
+
+static void send_route_control_result(
+    int client_fd, const struct wvm_envelope_v1 *request,
+    const struct wvm_route_control_result *result, uint16_t status_code)
+{
+    uint8_t payload[72];
+    uint8_t frame[WVM_ENVELOPE_V1_HEADER_BYTES + sizeof(payload)];
+    struct wvm_envelope_v1 response;
+    size_t frame_bytes = 0;
+    char error[128] = {0};
+
+    if (!request || g_route_control_physical_node_id == 0 ||
+        g_route_control_instance_id == 0) {
+        return;
+    }
+    memset(payload, 0, sizeof(payload));
+    control_write_be16(payload + 0, status_code);
+    if (status_code == 0 && result) {
+        control_write_be16(payload + 2, result->recorded_state);
+        memcpy(payload + 8, request->operation_id,
+               sizeof(request->operation_id));
+        memcpy(payload + 24, result->route_snapshot_key.snapshot_digest,
+               sizeof(result->route_snapshot_key.snapshot_digest));
+        control_write_be64(payload + 56,
+                           result->route_snapshot_key.route_generation);
+        /*
+         * The fixed result field is an absolute expiry/deadline. A participant
+         * stores a retention horizon, not a clock-domain-specific deadline,
+         * so V1 returns zero rather than inventing one.
+         */
+        control_write_be64(payload + 64, 0);
+    } else {
+        memcpy(payload + 8, request->operation_id,
+               sizeof(request->operation_id));
+    }
+    memset(&response, 0, sizeof(response));
+    response.message_type = WVM_ENVELOPE_V1_MSG_CTRL_RESULT;
+    response.vm_id = request->vm_id;
+    response.vm_incarnation = request->vm_incarnation;
+    response.manifest_generation = request->manifest_generation;
+    response.origin_physical_node_id = g_route_control_physical_node_id;
+    response.origin_runtime_instance_id = g_route_control_instance_id;
+    memcpy(response.operation_id, request->operation_id,
+           sizeof(response.operation_id));
+    response.delivery_attempt_id = 1;
+    response.payload = payload;
+    response.payload_bytes = sizeof(payload);
+    if (wvm_envelope_v1_encode(&response, WVM_ENVELOPE_V1_TRANSPORT_LOCAL,
+                               frame, sizeof(frame), &frame_bytes, error,
+                               sizeof(error)) == 0) {
+        (void)send(client_fd, frame, frame_bytes, MSG_NOSIGNAL);
+    }
+}
+
+static void handle_route_control_client(int client_fd)
+{
+    struct ucred credentials;
+    socklen_t credentials_bytes = sizeof(credentials);
+    struct msghdr message;
+    struct iovec iovec;
+    struct wvm_envelope_v1 request;
+    struct wvm_route_control_result result;
+    uint8_t *frame;
+    ssize_t received;
+    char error[256] = {0};
+    int apply_result;
+
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &credentials,
+                   &credentials_bytes) != 0 ||
+        credentials_bytes != sizeof(credentials) ||
+        credentials.uid != geteuid()) {
+        return;
+    }
+    frame = malloc(WVM_ROUTE_CONTROL_MAX_FRAME_BYTES);
+    if (!frame) {
+        return;
+    }
+    memset(&message, 0, sizeof(message));
+    iovec.iov_base = frame;
+    iovec.iov_len = WVM_ROUTE_CONTROL_MAX_FRAME_BYTES;
+    message.msg_iov = &iovec;
+    message.msg_iovlen = 1;
+    received = recvmsg(client_fd, &message, 0);
+    if (received <= 0 || (message.msg_flags & MSG_TRUNC) != 0 ||
+        wvm_envelope_v1_decode(frame, (size_t)received,
+                               WVM_ENVELOPE_V1_TRANSPORT_LOCAL, &request,
+                               error, sizeof(error)) != 0) {
+        free(frame);
+        return;
+    }
+    memset(&result, 0, sizeof(result));
+    apply_result = wvm_route_control_apply(&g_route_control, &request, &result,
+                                           error, sizeof(error));
+    send_route_control_result(client_fd, &request,
+                              apply_result == 0 ? &result : NULL,
+                              apply_result == 0 ? 0
+                                                : control_status_from_error(
+                                                      error));
+    free(frame);
+}
+
+static void *route_control_thread(void *arg)
+{
+    struct sockaddr_un address;
+    int server_fd;
+
+    (void)arg;
+    if (!g_route_control_ready || g_route_control_socket_path[0] == '\0') {
+        return NULL;
+    }
+    server_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (server_fd < 0) {
+        perror("[Gateway] V1 control socket");
+        return NULL;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    snprintf(address.sun_path, sizeof(address.sun_path), "%s",
+             g_route_control_socket_path);
+    unlink(g_route_control_socket_path);
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        chmod(g_route_control_socket_path, S_IRUSR | S_IWUSR) != 0 ||
+        listen(server_fd, 16) != 0) {
+        perror("[Gateway] V1 control bind/listen");
+        close(server_fd);
+        unlink(g_route_control_socket_path);
+        return NULL;
+    }
+    fprintf(stderr, "[Gateway] V1 route control socket=%s\n",
+            g_route_control_socket_path);
+    for (;;) {
+        int client_fd = accept(server_fd, NULL, NULL);
+
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        handle_route_control_client(client_fd);
+        close(client_fd);
+    }
+    close(server_fd);
+    unlink(g_route_control_socket_path);
+    return NULL;
+}
+
 int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, const char *config_path) {
     if (g_primary_socket >= 0) return 0;
 
@@ -1343,7 +1855,8 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
         const char *snapshot_path =
             getenv("WVM_RUNTIME_ROUTE_SNAPSHOT_PATH");
 
-        if (!snapshot_path || snapshot_path[0] == '\0' ||
+        if (init_route_control_from_environment() != 0 ||
+            !snapshot_path || snapshot_path[0] == '\0' ||
             init_route_runtime_from_snapshot_file(snapshot_path) != 0) {
             fprintf(stderr,
                     "[Gateway] active runtime requires a valid route "
@@ -1353,6 +1866,10 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
     } else {
         if (load_slave_config(config_path) != 0) return -ENOENT;
         if (init_route_runtime_from_environment() != 0) return -EINVAL;
+    }
+    if (g_route_authority_active && v1_tx_scheduler_start() != 0) {
+        fprintf(stderr, "[Gateway] cannot start V1 transmit scheduler\n");
+        return -ENOMEM;
     }
 
     g_upstream_addr.sin_family = AF_INET;
@@ -1407,9 +1924,15 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
 
     detect_cpu_env();
     
-    // [PATCH] 启动控制线程
     pthread_t ctrl_tid;
-    pthread_create(&ctrl_tid, NULL, control_plane_thread, NULL);
-    pthread_detach(ctrl_tid);
+    if (g_route_authority_active) {
+        if (g_route_control_ready && g_route_control_socket_path[0] != '\0' &&
+            pthread_create(&ctrl_tid, NULL, route_control_thread, NULL) == 0) {
+            pthread_detach(ctrl_tid);
+        }
+    } else if (pthread_create(&ctrl_tid, NULL, control_plane_thread, NULL) ==
+               0) {
+        pthread_detach(ctrl_tid);
+    }
 
     return 0;}

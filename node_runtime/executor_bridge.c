@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -21,6 +22,39 @@ struct bridge_state {
     struct wvm_executor_bridge_config config;
     char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 };
+
+static void set_error(char *error, size_t error_len, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!error || error_len == 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(error, error_len, fmt, ap);
+    va_end(ap);
+}
+
+int wvm_executor_bridge_v1_compat_dispatch(
+    void *opaque, const struct wvm_envelope_v1 *envelope, char *error,
+    size_t error_len)
+{
+    (void)opaque;
+
+    if (!envelope) {
+        set_error(error, error_len, "missing V1 envelope for executor adapter");
+        return -EINVAL;
+    }
+    /*
+     * Do not cast envelope->payload to struct wvm_header here. That would
+     * silently treat an incomplete V1 semantic schema as legacy traffic and
+     * bypass the node-runtime/executor ABI migration boundary.
+     */
+    set_error(error, error_len,
+              "V1 message type %u has no typed executor ABI adapter",
+              (unsigned)envelope->message_type);
+    return -ENOTSUP;
+}
 
 static int send_result(int fd, const struct wvm_executor_abi_frame *request,
                        uint16_t status)

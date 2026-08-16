@@ -232,7 +232,7 @@ static void fill_dispatch_endpoint(struct wvm_endpoint *endpoint,
 static void fill_dispatch_node(struct wvm_node_record *node,
                                uint32_t physical_node_id,
                                uint64_t node_instance_id,
-                               uint32_t local_vnode_first)
+                               uint32_t local_vnode_first, uint64_t pod_id)
 {
     memset(node, 0, sizeof(*node));
     node->physical_node_id = physical_node_id;
@@ -245,6 +245,7 @@ static void fill_dispatch_node(struct wvm_node_record *node,
     node->role_bits = 1;
     node->local_vnode_first = local_vnode_first;
     node->local_vnode_count = 1;
+    node->pod_id = pod_id;
     node->inventory.physical_node_id = physical_node_id;
     node->inventory.node_instance_id = node_instance_id;
     node->inventory.failure_domain_id = node->failure_domain_id;
@@ -273,11 +274,12 @@ static void fill_dispatch_node(struct wvm_node_record *node,
 }
 
 static void fill_dispatch_route_rule(struct wvm_route_rule_record *rule,
-                                     uint32_t vnode,
+                                     uint64_t scope, uint32_t vnode,
                                      const struct wvm_node_record *node)
 {
     memset(rule, 0, sizeof(*rule));
     rule->destination_kind = WVM_ROUTE_DESTINATION_EXACT_VNODE;
+    rule->destination_scope = scope;
     rule->destination_vnode_or_endpoint = vnode;
     rule->next_hop_kind = WVM_ROUTE_NEXT_HOP_ENDPOINT;
     rule->next_hop_member.role_type = WVM_MANIFEST_ROLE_NODE_RUNTIME;
@@ -337,8 +339,8 @@ static int test_runtime_dispatch_projection(
     char dispatch_path[WVM_RUNTIME_DISPATCH_PATH_MAX];
     int fd;
 
-    fill_dispatch_node(&nodes[0], 17, 101, 0);
-    fill_dispatch_node(&nodes[1], 99, 202, 1);
+    fill_dispatch_node(&nodes[0], 17, 101, 0, 41);
+    fill_dispatch_node(&nodes[1], 99, 202, 1, 99);
     memset(&records, 0, sizeof(records));
     records.nodes = nodes;
     records.node_count = 2;
@@ -347,8 +349,8 @@ static int test_runtime_dispatch_projection(
     records.topology_revision = 1;
     records.capability_profile_generation = 1;
 
-    fill_dispatch_route_rule(&rules[0], 0, &nodes[0]);
-    fill_dispatch_route_rule(&rules[1], 1, &nodes[1]);
+    fill_dispatch_route_rule(&rules[0], 0, 0, &nodes[0]);
+    fill_dispatch_route_rule(&rules[1], 0, 1, &nodes[1]);
     fill_dispatch_ack(&acks[0], &nodes[0],
                       &candidate->prepared_route_snapshot_key);
     fill_dispatch_ack(&acks[1], &nodes[1],
@@ -374,12 +376,19 @@ static int test_runtime_dispatch_projection(
     if (expect(wvm_runtime_dispatch_projection_build(
                    candidate, runtime_manifest, &records, &snapshot,
                    &projection, error, error_len) == 0 &&
-                   projection.local_primary_vnode == 0 &&
-                   projection.route_vnode_count == 2 &&
+                   projection.route_topology_kind == WVM_ROUTE_TOPOLOGY_FLAT &&
+                   projection.local_primary.destination_kind ==
+                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+                   projection.local_primary.destination_scope == 0 &&
+                   projection.local_primary.destination_vnode == 0 &&
                    projection.cpu_dispatch.count == 2 &&
                    projection.memory_dispatch.count == 2 &&
                    projection.memory_dispatch.entries[1].gpa_start ==
-                       2 * 1024 * 1024,
+                       2 * 1024 * 1024 &&
+                   projection.memory_dispatch.entries[1]
+                           .directory_physical_node_id == 99 &&
+                   projection.memory_dispatch.entries[1]
+                           .directory_node_instance_id == 202,
                "build manifest-bound dispatch projection")) {
         return -1;
     }
@@ -395,10 +404,91 @@ static int test_runtime_dispatch_projection(
                    wvm_runtime_dispatch_projection_decode(
                        bytes, encoded_bytes, &decoded, error, error_len) == 0 &&
                    decoded.memory_dispatch.count == 2 &&
-                   decoded.cpu_dispatch.entries[1].executor_vnode == 1,
+                   decoded.cpu_dispatch.entries[1].executor.destination_kind ==
+                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+                   decoded.cpu_dispatch.entries[1].executor.destination_scope ==
+                       0 &&
+                   decoded.cpu_dispatch.entries[1].executor.destination_vnode ==
+                       1 &&
+                   decoded.memory_dispatch.entries[1]
+                           .directory_physical_node_id == 99 &&
+                   decoded.memory_dispatch.entries[1]
+                           .directory_node_instance_id == 202,
                "round trip dispatch projection")) {
         return -1;
     }
+
+    /*
+     * The runtime projection is the typed boundary between placement and
+     * routing. A fractal route must retain its Pod scope at every placement;
+     * it must never be reconstructed from a raw vnode in a legacy table.
+     */
+    snapshot.topology_kind = WVM_ROUTE_TOPOLOGY_FRACTAL;
+    rules[0].destination_scope = nodes[0].pod_id;
+    rules[1].destination_scope = nodes[1].pod_id;
+    if (expect(wvm_runtime_dispatch_projection_build(
+                   candidate, runtime_manifest, &records, &snapshot,
+                   &projection, error, error_len) == 0 &&
+                   projection.route_topology_kind ==
+                       WVM_ROUTE_TOPOLOGY_FRACTAL &&
+                   projection.local_primary.destination_kind ==
+                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+                   projection.local_primary.destination_scope == 41 &&
+                   projection.local_primary.destination_vnode == 0 &&
+                   projection.cpu_dispatch.entries[1].executor
+                           .destination_kind ==
+                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+                   projection.cpu_dispatch.entries[1].executor
+                           .destination_scope == 99 &&
+                   projection.cpu_dispatch.entries[1].executor
+                           .destination_vnode == 1 &&
+                   projection.memory_dispatch.entries[1].directory
+                           .destination_scope == 99 &&
+                   projection.memory_dispatch.entries[1].executor
+                           .destination_scope == 99 &&
+                   projection.memory_dispatch.entries[1]
+                           .directory_physical_node_id == 99 &&
+                   projection.memory_dispatch.entries[1]
+                           .directory_node_instance_id == 202 &&
+                   wvm_runtime_dispatch_find_cpu(&projection, 1) ==
+                       &projection.cpu_dispatch.entries[1] &&
+                   wvm_runtime_dispatch_find_memory(
+                       &projection, 2 * 1024 * 1024) ==
+                       &projection.memory_dispatch.entries[1] &&
+                   wvm_runtime_dispatch_find_memory(
+                       &projection, 4 * 1024 * 1024) == NULL,
+               "build scoped fractal dispatch projection")) {
+        return -1;
+    }
+    memset(&decoded, 0, sizeof(decoded));
+    decoded.cpu_dispatch.entries = decoded_cpu_entries;
+    decoded.cpu_dispatch.capacity = 2;
+    decoded.memory_dispatch.entries = decoded_memory_entries;
+    decoded.memory_dispatch.capacity = 2;
+    if (expect(wvm_runtime_dispatch_projection_encode(
+                   &projection, bytes, sizeof(bytes), &encoded_bytes, error,
+                   error_len) == 0 &&
+                   wvm_runtime_dispatch_projection_decode(
+                       bytes, encoded_bytes, &decoded, error, error_len) == 0 &&
+                   decoded.route_topology_kind ==
+                       WVM_ROUTE_TOPOLOGY_FRACTAL &&
+                   decoded.local_primary.destination_scope == 41 &&
+                   decoded.cpu_dispatch.entries[1].executor
+                           .destination_scope == 99 &&
+                   decoded.memory_dispatch.entries[1].directory
+                           .destination_scope == 99 &&
+                   decoded.memory_dispatch.entries[1].executor
+                           .destination_scope == 99 &&
+                   decoded.memory_dispatch.entries[1]
+                           .directory_physical_node_id == 99 &&
+                   decoded.memory_dispatch.entries[1]
+                           .directory_node_instance_id == 202,
+               "round trip scoped fractal dispatch projection")) {
+        return -1;
+    }
+    snapshot.topology_kind = WVM_ROUTE_TOPOLOGY_FLAT;
+    rules[0].destination_scope = 0;
+    rules[1].destination_scope = 0;
 
     fd = mkstemp(manifest_path);
     if (fd < 0) {
