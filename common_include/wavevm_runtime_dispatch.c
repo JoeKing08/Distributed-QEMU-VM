@@ -163,13 +163,13 @@ static int route_destination_validate(
     }
     if (topology_kind == WVM_ROUTE_TOPOLOGY_FLAT &&
         destination->destination_kind ==
-            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+            WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE &&
         destination->destination_scope == 0) {
         return 0;
     }
     if (topology_kind == WVM_ROUTE_TOPOLOGY_FRACTAL &&
         destination->destination_kind ==
-            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+            WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE &&
         destination->destination_scope != 0) {
         return 0;
     }
@@ -202,8 +202,8 @@ static int primary_destination_for_node(
     memset(destination, 0, sizeof(*destination));
     destination->destination_kind =
         topology_kind == WVM_ROUTE_TOPOLOGY_FLAT
-            ? WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE
-            : WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE;
+            ? WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE
+            : WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE;
     destination->destination_scope =
         topology_kind == WVM_ROUTE_TOPOLOGY_FLAT ? 0 : node->pod_id;
     destination->destination_vnode = node->local_vnode_first;

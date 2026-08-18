@@ -11,7 +11,7 @@
 
 enum wvm_namespace_abi {
     WVM_NAMESPACE_ABI_LEGACY = 1,
-    WVM_NAMESPACE_ABI_V1_U32 = 2,
+    WVM_NAMESPACE_ABI_U32 = 2,
 };
 
 enum wvm_vm_namespace_state {
@@ -41,7 +41,7 @@ struct wvm_vm_namespace_allocator {
     struct wvm_vm_namespace_record *records;
     size_t record_capacity;
     size_t record_count;
-    uint32_t next_v1_vm_id;
+    uint32_t next_vm_id;
     uint32_t next_legacy_vm_id;
     uint64_t legacy_cluster_epoch;
 };

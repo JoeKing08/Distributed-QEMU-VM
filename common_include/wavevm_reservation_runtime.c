@@ -34,11 +34,20 @@ static uint64_t reservation_memory(
     return reservation->guest_memory_bytes + reservation->overhead_memory_bytes;
 }
 
-static int lease_equal(const struct wvm_exclusive_lease *left,
-                       const struct wvm_exclusive_lease *right)
+/* A replay must preserve the complete immutable lease record. */
+static int lease_record_equal(const struct wvm_exclusive_lease *left,
+                              const struct wvm_exclusive_lease *right)
 {
     return left->lease_kind == right->lease_kind &&
            left->lease_generation == right->lease_generation &&
+           strcmp(left->lease_name, right->lease_name) == 0;
+}
+
+/* Generation identifies an acquisition epoch, not a different local resource. */
+static int lease_resource_equal(const struct wvm_exclusive_lease *left,
+                                const struct wvm_exclusive_lease *right)
+{
+    return left->lease_kind == right->lease_kind &&
            strcmp(left->lease_name, right->lease_name) == 0;
 }
 
@@ -79,8 +88,8 @@ static int reservation_equal(
         return 0;
     }
     for (i = 0; i < left->exclusive_leases.count; i++) {
-        if (!lease_equal(&left->exclusive_leases.entries[i],
-                         &right->exclusive_leases.entries[i])) {
+        if (!lease_record_equal(&left->exclusive_leases.entries[i],
+                                &right->exclusive_leases.entries[i])) {
             return 0;
         }
     }
@@ -139,8 +148,9 @@ static int leases_conflict(
             size_t k;
 
             for (k = 0; k < existing->exclusive_leases.count; k++) {
-                if (lease_equal(&candidate->exclusive_leases.entries[j],
-                                &existing->exclusive_leases.entries[k])) {
+                if (lease_resource_equal(
+                        &candidate->exclusive_leases.entries[j],
+                        &existing->exclusive_leases.entries[k])) {
                     return 1;
                 }
             }

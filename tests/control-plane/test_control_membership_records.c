@@ -208,6 +208,7 @@ int main(void)
     fence.admission_tx_id[15] = 0x44;
     fence.membership_revision = 4;
     fence.topology_revision = 5;
+    fence.admission_eligibility_revision = 6;
     fence.inventory_revision = 3;
     fence.capability_profile_generation = 7;
     fence.selected_members.entries = selected_members;

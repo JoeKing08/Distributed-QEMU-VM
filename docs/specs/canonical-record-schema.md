@@ -91,6 +91,7 @@ The V1 enum registry is:
 | capability ID | `1=EXECUTION_KVM`, `2=EXECUTION_TCG`, `3=MODE_B_MEMORY`, `4=V1_VM_ID_U32`, `5=KERNEL_ACCELERATION`. |
 | route topology kind | `1=FLAT`, `2=FRACTAL`. |
 | route transaction state | `1=PREPARING`, `2=ACTIVATED`, `3=RETIRING`, `4=RETIRED`, `5=ABORTED`. |
+| gateway drain action | `1=PREPARE`, `2=COMMIT`, `3=ABORT`. |
 
 | Type | Record | Fields |
 | --- | --- | --- |
@@ -107,7 +108,7 @@ The V1 enum registry is:
 | `0x100b` | `NodeInventory` | `1:U32:physical_node_id`, `2:U64:node_instance_id`, `3:U64:failure_domain_id`, `4:U64:inventory_revision`, `5:U32:registered_vcpu_slots`, `6:U64:registered_memory_bytes`, `7:U32:reserved_host_cpu_slots`, `8:U64:reserved_host_memory_bytes`, `9:U32:reserved_gateway_cpu_slots`, `10:U64:reserved_gateway_memory_bytes`, `11:List<U32, value>:hosted_gateway_role_ids`, `12:U32:allocatable_vcpu_slots`, `13:U64:allocatable_memory_bytes`, `14:Digest32:storage_capabilities_digest`, `15:Digest32:accelerator_fault_capabilities_digest`, `16:Digest32:exclusive_resource_inventory_digest` |
 | `0x100c` | `NodeRecord` | `1:U32:physical_node_id`, `2:U64:node_instance_id`, `3:U64:failure_domain_id`, `4:Record<Endpoint>:control_endpoint`, `5:Record<Endpoint>:sidecar_endpoint`, `6:U64:role_bits`, `7:U64:pod_id`, `8:U32:local_vnode_first`, `9:U32:local_vnode_count`, `10:Record<NodeInventory>:inventory`, `11:Record<CapabilityRef>:capability`, `12:U16:desired_membership_state`, `13:U16:observed_health_state`, `14:U64:membership_revision`, `15:U64:topology_revision` |
 | `0x100d` | `GatewayRecord` | `1:U32:gateway_id`, `2:U64:gateway_instance_id`, `3:U32:hosting_physical_node_id`, `4:U64:failure_domain_id`, `5:Record<Endpoint>:endpoint`, `6:U64:role_bits`, `7:U64:pod_id_or_scope`, `8:List<U32, value>:parent_gateway_ids`, `9:List<U32, value>:child_gateway_ids`, `10:U16:desired_membership_state`, `11:U16:observed_health_state`, `12:U64:membership_revision`, `13:U64:topology_revision` |
-| `0x100e` | `AdmissionEligibilityFence` | `1:ID16:admission_tx_id`, `2:U64:membership_revision`, `3:U64:topology_revision`, `4:U64:inventory_revision`, `5:U64:capability_profile_generation`, `6:List<RequiredMember, member_key>:selected_members`, `7:Record<VmRouteScopeKey>:required_route_scope_key`, `8:Digest32:required_ack_set_digest`, `9:Digest32:fence_digest` |
+| `0x100e` | `AdmissionEligibilityFence` | `1:ID16:admission_tx_id`, `2:U64:membership_revision`, `3:U64:topology_revision`, `4:U64:inventory_revision`, `5:U64:capability_profile_generation`, `6:List<RequiredMember, member_key>:selected_members`, `7:Record<VmRouteScopeKey>:required_route_scope_key`, `8:Digest32:required_ack_set_digest`, `9:Digest32:fence_digest`, `10:U64:admission_eligibility_revision` |
 | `0x100f` | `VcpuAssignment` | `1:U32:guest_vcpu_index`, `2:U32:executor_physical_node_id`, `3:U16:backend`, `4:U16:executor_class`, `5:U32:executor_slot`, `6:ID16:reservation_id` |
 | `0x1010` | `MemoryChunkAssignment` | `1:U64:gpa_start`, `2:U64:bytes`, `3:U32:directory_physical_node_id`, `4:U32:executor_physical_node_id`, `5:U16:consistency_policy`, `6:ID16:reservation_id` |
 | `0x1011` | `StorageAssignment` | `1:U32:device_index`, `2:U32:storage_physical_node_id`, `3:U16:backend_kind`, `4:ID16:reservation_id`, `5:Digest32:device_contract_digest` |
@@ -123,7 +124,7 @@ The V1 enum registry is:
 | `0x101b` | `LocalNameNamespace` | `1:Text<128>:namespace`, `2:Digest32:derivation_salt_digest`, `3:U64:name_generation` |
 | `0x101c` | `LifecyclePolicy` | `1:U16:start_policy`, `2:U16:failure_policy`, `3:U64:completion_query_horizon_ms`, `4:U64:route_retention_horizon_ms` |
 | `0x101d` | `CandidateVmManifest` | `1:ID16:manifest_id`, `2:U16:manifest_schema_version`, `3:Digest32:manifest_digest`, `4:U32:vm_id`, `5:U64:vm_incarnation`, `6:U64:manifest_generation`, `7:ID16:request_id`, `8:ID16:admission_tx_id`, `9:Digest32:eligibility_fence_digest`, `10:U64:candidate_created_at`, `11:Record<MachineConfig>:guest_machine`, `12:Record<GuestTopology>:guest_topology`, `13:Record<ExecutionFaultProfile>:execution_plan`, `14:Record<ConsistencyPolicy>:consistency_policy`, `15:Record<StorageDevicePlan>:storage_device_plan`, `16:U32:host_node`, `17:List<VcpuAssignment, guest_vcpu_index>:vcpu_placements`, `18:List<MemoryChunkAssignment, gpa_start>:memory_placements`, `19:List<RequiredMember, member_key>:required_members`, `20:List<CapabilityRef, physical_node_id>:required_capabilities`, `21:List<ReservationRequirement, reservation_id>:reservation_requirements`, `22:Record<VmRouteScopeKey>:route_scope_key`, `23:Record<RouteSnapshotKey>:prepared_route_snapshot_key`, `24:Digest32:plan_digest`, `25:Record<LocalNameNamespace>:local_name_namespace`, `26:Record<LifecyclePolicy>:lifecycle_policy`, `27:U16:namespace_abi` |
-| `0x101e` | `NodeRuntimeManifest` | `1:Digest32:candidate_manifest_digest`, `2:U32:vm_id`, `3:U64:vm_incarnation`, `4:U64:manifest_generation`, `5:ID16:admission_tx_id`, `6:Digest32:eligibility_fence_digest`, `7:ID16:activation_fence?`, `8:U32:physical_node_id`, `9:U64:expected_node_instance_id`, `10:U64:local_role_bits`, `11:List<VcpuAssignment, guest_vcpu_index>:local_vcpu_assignments`, `12:List<MemoryChunkAssignment, gpa_start>:local_memory_assignments`, `13:List<StorageAssignment, device_index>:local_storage_assignments`, `14:Record<RouteSnapshotKey>:required_route_snapshot_key`, `15:Record<LocalNameNamespace>:local_names`, `16:Record<ExecutionFaultProfile>:negotiated_profile`, `17:ID16:reservation_id`, `18:List<StartupDependency, dependency_kind/member_key>:startup_dependencies` |
+| `0x101e` | `NodeRuntimeManifest` | `1:Digest32:candidate_manifest_digest`, `2:U32:vm_id`, `3:U64:vm_incarnation`, `4:U64:manifest_generation`, `5:ID16:admission_tx_id`, `6:Digest32:eligibility_fence_digest`, `7:ID16:activation_fence?`, `8:U32:physical_node_id`, `9:U64:expected_node_instance_id`, `10:U64:local_role_bits`, `11:List<VcpuAssignment, guest_vcpu_index>:local_vcpu_assignments`, `12:List<MemoryChunkAssignment, gpa_start>:local_memory_assignments`, `13:List<StorageAssignment, device_index>:local_storage_assignments`, `14:Record<RouteSnapshotKey>:required_route_snapshot_key`, `15:Record<LocalNameNamespace>:local_names`, `16:Record<ExecutionFaultProfile>:negotiated_profile`, `17:ID16:reservation_id`, `18:List<StartupDependency, dependency_kind/member_key>:startup_dependencies`, `19:Record<NodeRuntimeLaunchPlan>:launch_plan` |
 | `0x101f` | `ActivationRecord` | `1:ID16:admission_tx_id`, `2:Digest32:candidate_manifest_digest`, `3:ID16:activation_fence?`, `4:U64:coordinator_instance_id`, `5:Digest32:required_participant_set_digest`, `6:List<RouteSnapshotKey, scope_key/topology_revision/route_generation>:required_route_snapshot_keys`, `7:U16:decision`, `8:U64:durable_decision_sequence`, `9:U64:decided_at` |
 | `0x1020` | `RouteTransaction` | `1:ID16:operation_id`, `2:Record<RouteSnapshotKey>:route_snapshot_key`, `3:Record<RouteSnapshotKey>:predecessor_snapshot_key?`, `4:Record<RequiredAckSet>:required_ack_set`, `5:List<RequiredAckEntry, member_key>:optional_departure_drain_set`, `6:U64:operation_retention_horizon_ms`, `7:U16:state` |
 | `0x1021` | `CapabilityLimit` | `1:U16:limit_kind`, `2:U64:value` |
@@ -134,6 +135,10 @@ The V1 enum registry is:
 | `0x1026` | `ReservationRequirement` | `1:ID16:reservation_id`, `2:U32:physical_node_id`, `3:U64:node_instance_id`, `4:U64:inventory_revision`, `5:U32:guest_vcpu_slots`, `6:U64:guest_memory_bytes`, `7:U32:overhead_vcpu_slots`, `8:U64:overhead_memory_bytes`, `9:List<ExclusiveLease, lease_kind/lease_name>:exclusive_leases` |
 | `0x1027` | `AdmissionTransaction` | `1:ID16:request_id`, `2:Digest32:request_digest`, `3:U32:vm_id`, `4:U64:vm_incarnation`, `5:U64:manifest_generation`, `6:ID16:admission_tx_id`, `7:ID16:manifest_id`, `8:Record<VmRouteScopeKey>:route_scope_key`, `9:U16:lifecycle_state`, `10:Digest32:candidate_manifest_digest?`, `11:Digest32:activation_record_digest?`, `12:U64:transaction_sequence` |
 | `0x1028` | `RuntimeDispatchProjection` | `1:Digest32:candidate_manifest_digest`, `2:U32:vm_id`, `3:U64:vm_incarnation`, `4:U64:manifest_generation`, `5:U32:physical_node_id`, `6:U64:expected_node_instance_id`, `7:ID16:activation_fence`, `8:Record<RouteSnapshotKey>:required_route_snapshot_key`, `9:U16:route_topology_kind`, `10:U16:local_destination_kind`, `11:U64:local_destination_scope`, `12:U32:local_destination_vnode`, `13:Record<Endpoint>:local_sidecar_endpoint`, `14:List<(U32 guest_vcpu_index,U16 executor_destination_kind,U64 executor_destination_scope,U32 executor_destination_vnode), guest_vcpu_index>:cpu_dispatch`, `15:List<(U64 gpa_start,U64 bytes,U16 directory_destination_kind,U64 directory_destination_scope,U32 directory_destination_vnode,U16 executor_destination_kind,U64 executor_destination_scope,U32 executor_destination_vnode,U32 directory_physical_node_id,U64 directory_node_instance_id,U16 consistency_policy), gpa_start>:memory_dispatch` |
+| `0x1029` | `NodeRuntimeLaunchPlan` | `1:U16:plan_version`, `2:U16:node_runtime_data_port`, `3:U16:node_runtime_control_port`, `4:U16:local_executor_service_port`, `5:U16:local_executor_control_port`, `6:U32:executor_worker_count`, `7:U32:sync_batch_size`, `8:U64:guest_total_memory_bytes`, `9:Record<MachineConfig>:guest_machine`, `10:Record<ConsistencyPolicy>:consistency_policy`, `11:U32:vcpu_handoff_record_capacity` |
+| `0x102a` | `RejoinMemberRequest` | `1:Record<NodeRecord or GatewayRecord>:member_record`, `2:Record<MemberKey>:prior_member_key?`, `3:Digest32:recovery_evidence_digest` |
+| `0x102b` | `GatewayDrainRequest` | `1:U16:action`, `2:Record<MemberKey>:target_gateway_member_key`, `3:U64:expected_membership_revision`, `4:U64:expected_topology_revision`, `5:U64:expected_admission_eligibility_revision`, `6:Record<RouteTransaction>:successor_transaction?`, `7:Record<RouteSnapshot>:successor_snapshot?`, `8:ID16:route_operation_id` |
+| `0x102c` | `MemberCordonRequest` | `1:Record<MemberKey>:target_member_key`, `2:U64:expected_membership_revision`, `3:U64:expected_topology_revision`, `4:U64:expected_admission_eligibility_revision`, `5:U16:reason_code` |
 
 ## 3. Cross-Record Constraints
 
@@ -175,6 +180,21 @@ The V1 enum registry is:
   that result and its diagnostic reason. `MemoryChunkAssignment` has no KVM or
   TCG backend field because memory placement is backend-neutral subject to the
   selected memory capability/profile and route.
+- `GatewayDrainRequest.target_gateway_member_key` is a `GATEWAY` key and all
+  three expected revisions are nonzero exact fences. Fields six and seven are
+  present exactly for `action=PREPARE`; they are absent for `COMMIT` and
+  `ABORT`. The prepare transaction operation ID must equal field eight, the
+  transaction and snapshot keys must be identical, and the successor snapshot's
+  membership revision must equal field three. The successor material is a
+  complete immutable replacement route, not a reference to mutable gateway
+  cache state.
+- `MemberCordonRequest.target_member_key` is a `NODE_RUNTIME` or `GATEWAY`
+  key. All three expected revisions are nonzero exact fences, and
+  `reason_code` is a nonzero implementation-independent audit code. Cordon
+  advances membership and admission-eligibility revisions by one while
+  leaving topology revision unchanged. It changes only an `ACTIVE` member to
+  `CORDONED`; a retry with the old fence is accepted only when the target is
+  already `CORDONED` and all three post-state revisions match exactly.
 - `RouteSnapshotKey.snapshot_digest` is a self-digest only when it identifies
   the enclosing `RouteSnapshot`. Its digest preimage zeros every self-reference
   described in Section 1.1, then inserts one final digest into each such
@@ -195,7 +215,7 @@ The V1 enum registry is:
   nonoverlapping, and cover the requested memory exactly once.
 - `CandidateVmManifest.plan_digest` must equal the complete placement-plan
   digest. `namespace_abi=V1_U32` requires every selected participant to
-  advertise `WVM_CAP_V1_VM_ID_U32`; `LEGACY` requires `vm_id <= 255`.
+  advertise `WVM_CAP_VM_ID_U32`; `LEGACY` requires `vm_id <= 255`.
 - `LocalNameNamespace.derivation_salt_digest` is calculated before
   `CandidateVmManifest.manifest_digest` from the allocated `manifest_id`,
   `admission_tx_id`, VM identity/generation, and target physical node. The
@@ -221,7 +241,10 @@ The V1 enum registry is:
 - `NodeRuntimeManifest` is a filtered projection of exactly one candidate
   manifest. It contains only assignments on `physical_node_id`; its
   `candidate_manifest_digest`, route key, profile, and reservation must match
-  the authoritative candidate.
+  the authoritative candidate. Its `launch_plan` is controller-selected:
+  machine and consistency fields exactly equal the candidate, guest memory
+  equals the complete admitted placement total, and local executor ports are
+  implementation-local rather than route or membership identities.
 - The durable control-plane projection set contains exactly one activated
   `NodeRuntimeManifest` for each candidate `ReservationRequirement`, keyed by
   candidate digest plus physical node, expected node instance, and reservation
@@ -248,6 +271,12 @@ The V1 enum registry is:
   instance_id=gateway_instance_id}`. QEMU/executor/kernel process identities
   are created only during manifest preparation and cannot be substituted into
   a route ACK set.
+- `RejoinMemberRequest.member_record` derives the new member key; it never
+  carries a second caller-selected current identity. When
+  `prior_member_key` is present, it has the same role type and stable role ID
+  as the derived key but a different instance ID. `recovery_evidence_digest`
+  is nonzero audit evidence only: it cannot rebind a running V1 VM, route,
+  reservation, or runtime manifest to the new instance.
 
 ## 4. Canonical Examples
 

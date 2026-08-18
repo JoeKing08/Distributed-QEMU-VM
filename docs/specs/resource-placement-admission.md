@@ -53,8 +53,9 @@ Non-goals for V1:
 | Host node and guest topology choice | Admitted VM manifest | Completed plan and request policy. |
 | Runtime queue scheduling | Node runtime and local executor | The admitted plan, not this specification. |
 
-`membership_revision`, topology revision, capability profile generation, and
-inventory revision must be captured with a placement attempt. The resulting
+`membership_revision`, topology revision, admission-eligibility revision,
+capability profile generation, and inventory revision must be captured with a
+placement attempt. The resulting
 `AdmissionEligibilityFence` names every required node/gateway role, instance,
 capability profile, route scope, and ACK-set digest. The planner must not
 combine one node's old capacity with another node's new capability profile and
@@ -79,6 +80,21 @@ V1 uses conservative, integer, non-overcommitted accounting:
 | QEMU/node-runtime/executor overhead | bytes and optional `vcpu_slot` | Reserved separately from guest request so it is not hidden inside guest capacity. |
 | Storage | backend-specific capacity/IO capability | Must satisfy the device plan; capacity alone does not prove flush semantics. |
 | Exclusive local resources | named lease | Ports, socket paths, SHM names, accelerator contexts, GPU/VFIO assignment, and other non-shareable resources. |
+
+An `ExclusiveLease` identifies a local resource by `(lease_kind, lease_name)`.
+`lease_generation` records the acquisition/owner epoch and is part of exact
+replay equality, but it does not make two uses of the same resource distinct.
+Therefore the same lease kind and name conflict even when their generations
+differ. The canonical lease list is strictly ordered and unique by
+`lease_kind/lease_name`.
+
+For the node-runtime launch plan, placement emits leases for the two listeners
+that are actually bound by the current runtime path: the wildcard UDP
+node-runtime data listener and the loopback UDP local-executor service
+listener. Control-port fields that are only adapter metadata are not treated
+as bound resources until an implementation creates a corresponding listener.
+The listener port and binding scope come from the controller-selected launch
+plan; the planner does not choose a hard-coded port range.
 
 Every `NodeRecord` exposes:
 
@@ -369,6 +385,44 @@ the requirement-to-reservation audit chain.
    reservation. If activation exists, crash recovery completes activation or
    compensating teardown before release.
 
+### 6.3 Durable Admission Orchestration
+
+The coordinator-owned admission orchestrator is the only composition point for
+the create transaction. Transport adapters are callbacks at explicit stage
+boundaries; they are not allowed to create a second placement or lifecycle
+authority. The normal order is:
+
+```text
+CONTROL_PLANE_BEGIN
+  -> ROUTE_PLAN (after route_scope_id allocation)
+  -> COORDINATOR_PREPARE
+  -> durable candidate + PREPARING route
+  -> route prepare
+  -> durable ROUTE_SCOPE_PREPARED
+  -> reservation prepare
+  -> durable RESERVATIONS_PREPARED
+  -> participant prepare
+  -> durable PARTICIPANTS_PREPARED
+  -> durable ACTIVATE decision
+  -> local/remote reservation and participant commit
+  -> durable per-node runtime projections
+  -> route commit + durable route activation
+  -> durable COMMITTED
+  -> identity-bound readiness
+  -> STARTING -> RUNNING
+```
+
+Every route, reservation, and participant callback is idempotent for the
+admission transaction and manifest identity. A failure before the durable
+`ACTIVATE` decision records `ABORT`, invokes only prepared-resource cleanup,
+and reaches `ABORTED` only after route, participant, reservation, and local
+cleanup succeeds. A failure after `ACTIVATE` is not converted into a new
+pre-activation abort: the durable state remains `ACTIVATION_DECIDED` (or a
+later state) for recovery and compensating teardown. After process loss, the
+recovery runner accepts only identity-validated projections reconstructed from
+durable candidate/runtime records; it resumes `ACTIVATION_DECIDED` forward and
+cleans `ABORTING` toward `ABORTED`, never choosing a new placement or route.
+
 No node independently upgrades a reservation to `COMMITTED` based solely on a
 local process start, an old route, or a surviving socket. No process may consume
 a `PREPARED` reservation for guest traffic before activation.
@@ -426,6 +480,8 @@ a member with active VM allocations is governed by the drain restrictions in
 | --- | --- | --- |
 | `common_include/wavevm_resources.[ch]` | Defines static CPU/memory resource descriptions and placement helpers. | Become a parser/compatibility adapter for versioned inventory, eligibility fences, complete plans, explicit reservations, and host overhead. |
 | `common_include/wavevm_admission.[ch]` | Validates captured V1 inventory, normalized requests, and complete pre-activation reservations without mutating runtime state. | Grow into the coordinator-owned admission model and canonical-record renderer before it drives live reservation RPCs. |
+| `common_include/wavevm_admission_orchestrator.[ch]` | Composes durable begin/prepare/activate/commit/abort stages around route, reservation, and participant callbacks. | Connect production control transports and recovery reconciliation; do not bypass the durable coordinator with launch-script policy. |
+| `common_include/wavevm_admission_recovery.c` | Reconciles durable `ACTIVATION_DECIDED`, `COMMITTED`, `RUNNING`, and `ABORTING` states using identity-bound projections and idempotent transport callbacks. | Replace fixture-owned reconstruction with the production journal/recovery loader and participant query protocol. |
 | `ctl_tool/main.c` | Builds test-oriented node/resource configuration. | Submit normalized VM requests, report deterministic plans/rejections, and drive reservation/lifecycle APIs. |
 | `master_core/logic_core.c` | Consumes CPU/memory route state after launch. | Consume only manifest-derived per-VM placement and reject unreserved assignments. |
 | `gateway_service/aggregator.c` | Forwards according to static/learned routes. | Consume route snapshots generated for admitted participants; never decide capacity or placement. |

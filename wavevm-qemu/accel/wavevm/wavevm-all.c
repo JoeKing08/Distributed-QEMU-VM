@@ -1177,13 +1177,13 @@ static int connect_to_master_helper_role(uint32_t role) {
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     
-    // [V28 Fix] Dynamic Path
-    const char *env_path = getenv("WVM_ENV_SOCK_PATH");
+    // Manifest-gated launches must use a manifest-derived endpoint.
+    const char *env_path = wavevm_qemu_runtime_socket_path();
     if (!env_path) {
-        char *inst_id = getenv("WVM_INSTANCE_ID");
-        static char fallback[128]; // static to be safe scope-wise though redundant here
-        snprintf(fallback, sizeof(fallback), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
-        env_path = fallback;
+        fprintf(stderr,
+                "[WVM] manifest-derived QEMU socket path is missing\n");
+        close(sock);
+        return -1;
     }
 
     strncpy(addr.sun_path, env_path, sizeof(addr.sun_path) - 1);
@@ -1659,7 +1659,11 @@ static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
         // [Master Mode]
         // 读取环境变量以支持单机多实例
         const char *shm_path = getenv("WVM_SHM_FILE");
-        if (!shm_path) shm_path = "/wavevm_ram"; // Default fallback (Keep sync with config.h)
+        if (!shm_path) {
+            fprintf(stderr,
+                    "WaveVM: manifest-derived SHM name is missing\n");
+            return -EINVAL;
+        }
 
         int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0666);
         if (shm_fd < 0) {

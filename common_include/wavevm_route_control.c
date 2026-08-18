@@ -141,13 +141,13 @@ static int read_full(int fd, uint8_t *bytes, size_t byte_count)
 
 static int operation_type_valid(uint16_t message_type)
 {
-    return message_type == WVM_ENVELOPE_V1_MSG_ROUTE_PREPARE ||
-           message_type == WVM_ENVELOPE_V1_MSG_ROUTE_COMMIT ||
-           message_type == WVM_ENVELOPE_V1_MSG_ROUTE_RETIRE;
+    return message_type == WVM_ENVELOPE_MSG_ROUTE_PREPARE ||
+           message_type == WVM_ENVELOPE_MSG_ROUTE_COMMIT ||
+           message_type == WVM_ENVELOPE_MSG_ROUTE_RETIRE;
 }
 
 static int request_matches_route_key(
-    const struct wvm_envelope_v1 *request,
+    const struct wvm_envelope *request,
     const struct wvm_route_snapshot_key *key, char *error, size_t error_len)
 {
     if (!request || !key || request->vm_id != key->scope_key.vm_id ||
@@ -261,7 +261,7 @@ static int route_snapshot_decode_alloc(const uint8_t *bytes, size_t byte_count,
 }
 
 static struct wvm_route_control_operation *find_operation(
-    struct wvm_route_control *control, const struct wvm_envelope_v1 *request)
+    struct wvm_route_control *control, const struct wvm_envelope *request)
 {
     size_t i;
 
@@ -279,7 +279,7 @@ static struct wvm_route_control_operation *find_operation(
 }
 
 static int remember_operation(struct wvm_route_control *control,
-                              const struct wvm_envelope_v1 *request,
+                              const struct wvm_envelope *request,
                               const struct wvm_route_control_result *result,
                               char *error, size_t error_len)
 {
@@ -321,7 +321,7 @@ static int remember_operation(struct wvm_route_control *control,
 }
 
 static int apply_unlogged(struct wvm_route_control *control,
-                          const struct wvm_envelope_v1 *request, char *error,
+                          const struct wvm_envelope *request, char *error,
                           size_t error_len,
                           struct wvm_route_control_result *result_out)
 {
@@ -334,7 +334,7 @@ static int apply_unlogged(struct wvm_route_control *control,
         set_error(error, error_len, "route control request is invalid");
         return -1;
     }
-    if (request->message_type == WVM_ENVELOPE_V1_MSG_ROUTE_PREPARE) {
+    if (request->message_type == WVM_ENVELOPE_MSG_ROUTE_PREPARE) {
         memset(&storage, 0, sizeof(storage));
         if (route_snapshot_decode_alloc(request->payload, request->payload_bytes,
                                         &storage, error, error_len) != 0 ||
@@ -361,7 +361,7 @@ static int apply_unlogged(struct wvm_route_control *control,
         request_matches_route_key(request, &key, error, error_len) != 0) {
         return -1;
     }
-    if (request->message_type == WVM_ENVELOPE_V1_MSG_ROUTE_COMMIT) {
+    if (request->message_type == WVM_ENVELOPE_MSG_ROUTE_COMMIT) {
         result = wvm_route_runtime_activate(control->runtime, &key, error,
                                             error_len);
         if (result == 0 && result_out) {
@@ -379,7 +379,7 @@ static int apply_unlogged(struct wvm_route_control *control,
     return result;
 }
 
-static int encode_local_frame(const struct wvm_envelope_v1 *request,
+static int encode_local_frame(const struct wvm_envelope *request,
                               uint8_t **frame_out, size_t *frame_bytes_out,
                               char *error, size_t error_len)
 {
@@ -391,7 +391,7 @@ static int encode_local_frame(const struct wvm_envelope_v1 *request,
         set_error(error, error_len, "cannot allocate route control frame");
         return -1;
     }
-    if (wvm_envelope_v1_encode(request, WVM_ENVELOPE_V1_TRANSPORT_LOCAL,
+    if (wvm_envelope_encode(request, WVM_ENVELOPE_TRANSPORT_LOCAL,
                                frame, WVM_ROUTE_CONTROL_MAX_FRAME_BYTES,
                                &frame_bytes, error, error_len) != 0) {
         free(frame);
@@ -438,7 +438,7 @@ static int journal_append(struct wvm_route_control *control,
 }
 
 static int apply_and_record(struct wvm_route_control *control,
-                            const struct wvm_envelope_v1 *request,
+                            const struct wvm_envelope *request,
                             const uint8_t *frame, size_t frame_bytes,
                             int replaying,
                             struct wvm_route_control_result *result_out,
@@ -513,7 +513,7 @@ int wvm_route_control_open(struct wvm_route_control *control,
         uint8_t *frame = NULL;
         uint32_t frame_bytes;
         uint64_t sequence;
-        struct wvm_envelope_v1 request;
+        struct wvm_envelope request;
         int read_result = read_full(control->journal_fd, header, sizeof(header));
 
         if (read_result == 0) {
@@ -541,8 +541,8 @@ int wvm_route_control_open(struct wvm_route_control *control,
         }
         wvm_sha256_digest(frame, frame_bytes, digest);
         if (memcmp(digest, header + 24, sizeof(digest)) != 0 ||
-            wvm_envelope_v1_decode(frame, frame_bytes,
-                                   WVM_ENVELOPE_V1_TRANSPORT_LOCAL, &request,
+            wvm_envelope_decode(frame, frame_bytes,
+                                   WVM_ENVELOPE_TRANSPORT_LOCAL, &request,
                                    error, error_len) != 0 ||
             !operation_type_valid(request.message_type) ||
             apply_and_record(control, &request, frame, frame_bytes, 1, NULL,
@@ -583,7 +583,7 @@ void wvm_route_control_close(struct wvm_route_control *control)
 }
 
 int wvm_route_control_apply(struct wvm_route_control *control,
-                            const struct wvm_envelope_v1 *request,
+                            const struct wvm_envelope *request,
                             struct wvm_route_control_result *result_out,
                             char *error, size_t error_len)
 {

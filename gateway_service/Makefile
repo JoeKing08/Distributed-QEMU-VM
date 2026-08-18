@@ -10,7 +10,7 @@ SRCS = aggregator.c main.c \
 	../common_include/wavevm_lifecycle.c \
 	../common_include/wavevm_control.c \
 	../common_include/wavevm_runtime_gate.c \
-	../common_include/wavevm_envelope_v1.c \
+	../common_include/wavevm_envelope.c \
 	../common_include/wavevm_route_runtime.c \
 	../common_include/wavevm_route_control.c \
 	../common_include/wavevm_route_delivery.c

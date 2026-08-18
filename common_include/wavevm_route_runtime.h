@@ -11,7 +11,7 @@
 #include <stddef.h>
 
 #include "wavevm_control.h"
-#include "wavevm_envelope_v1.h"
+#include "wavevm_envelope.h"
 
 #define WVM_ROUTE_RUNTIME_MAX_ENTRIES 65536U
 #define WVM_ROUTE_RUNTIME_MAX_SCOPES 1024U
@@ -67,7 +67,7 @@ int wvm_route_runtime_retire(struct wvm_route_runtime *runtime,
  */
 int wvm_route_runtime_lookup(
     const struct wvm_route_runtime *runtime,
-    const struct wvm_envelope_v1 *envelope,
+    const struct wvm_envelope *envelope,
     struct wvm_route_runtime_next_hop *next_hop_out, char *error,
     size_t error_len);
 

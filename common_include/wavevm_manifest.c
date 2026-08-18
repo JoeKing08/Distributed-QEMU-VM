@@ -2626,7 +2626,7 @@ int wvm_candidate_vm_manifest_validate(
 
     if (!candidate ||
         bytes_are_zero(candidate->manifest_id, sizeof(candidate->manifest_id)) ||
-        candidate->manifest_schema_version != WVM_CANONICAL_SCHEMA_V1 ||
+        candidate->manifest_schema_version != WVM_CANONICAL_SCHEMA ||
         candidate->vm_id == 0 || candidate->vm_incarnation == 0 ||
         candidate->manifest_generation == 0 ||
         bytes_are_zero(candidate->request_id, sizeof(candidate->request_id)) ||
@@ -2664,7 +2664,7 @@ int wvm_candidate_vm_manifest_validate(
         wvm_lifecycle_policy_validate(&candidate->lifecycle_policy, error,
                                       error_len) != 0 ||
         (candidate->namespace_abi != WVM_MANIFEST_NAMESPACE_LEGACY &&
-         candidate->namespace_abi != WVM_MANIFEST_NAMESPACE_V1_U32) ||
+         candidate->namespace_abi != WVM_MANIFEST_NAMESPACE_U32) ||
         (candidate->namespace_abi == WVM_MANIFEST_NAMESPACE_LEGACY &&
          candidate->vm_id > 255) ||
         candidate_assignment_shape_validate(candidate, error, error_len) != 0) {
@@ -3545,7 +3545,7 @@ int wvm_vm_request_validate(const struct wvm_vm_request *request, char *error,
 {
     struct wvm_guest_topology topology;
 
-    if (!request || request->api_version != WVM_CANONICAL_SCHEMA_V1 ||
+    if (!request || request->api_version != WVM_CANONICAL_SCHEMA ||
         bytes_are_zero(request->request_id, sizeof(request->request_id)) ||
         (request->has_display_name != 0 && request->has_display_name != 1) ||
         (request->has_display_name &&

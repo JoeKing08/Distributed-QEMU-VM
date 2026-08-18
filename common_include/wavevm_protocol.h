@@ -19,6 +19,10 @@
 #include "platform_defs.h"
 #include <linux/kvm.h>
 
+#ifndef WVM_CPU_RUN_STATUS_MEMORY_FAILURE
+#define WVM_CPU_RUN_STATUS_MEMORY_FAILURE (-117)
+#endif
+
 /*
  * WaveVM V29.5 "Wavelet" Protocol Definition (FINAL FIXED)
  * Includes V28 MESI Fallback & V29 Prophet Extensions
@@ -177,8 +181,8 @@ typedef struct wvm_ipc_header_t {
 #define WVM_IPC_TYPE_PUSH_BARRIER     9
 #define WVM_IPC_TYPE_PUSH_BARRIER_ACK 10
 #define WVM_IPC_TYPE_REGISTER         11
-#define WVM_IPC_TYPE_MEM_FAULT_V1     12
-#define WVM_IPC_TYPE_MEM_COMMIT_V1    13
+#define WVM_IPC_TYPE_TYPED_MEM_FAULT  12
+#define WVM_IPC_TYPE_TYPED_MEM_COMMIT 13
 
 /* Local IPC connection roles.  Registration removes any dependency on
  * connection arrival order when a QEMU instance opens several sockets. */

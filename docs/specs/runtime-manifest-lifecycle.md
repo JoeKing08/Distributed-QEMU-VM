@@ -247,6 +247,19 @@ NodeRuntimeManifest {
     local_storage_assignments;
     required_route_snapshot_key;
     local_endpoint_names;
+    launch_plan {
+        plan_version;
+        node_runtime_data_port;
+        node_runtime_control_port;
+        local_executor_service_port; // loopback-only
+        local_executor_control_port; // loopback-only
+        executor_worker_count;
+        vcpu_handoff_record_capacity;
+        sync_batch_size;
+        guest_total_memory_bytes;
+        guest_machine;
+        consistency_policy;
+    };
     negotiated_capabilities;
     reservation_lease;
     startup_dependencies;
@@ -275,6 +288,28 @@ projection whose candidate binding and activation fence match the recorded
 `ACTIVATE` decision. A generated in-memory projection, a local process that
 survived a restart, or a reservation commit without its matching durable
 projection is insufficient.
+
+`launch_plan` is a controller-selected, canonical part of the local
+projection. It binds the process-local port leases and executor concurrency
+configuration to the same admitted VM identity as the placement. The embedded
+machine and consistency configuration must exactly match the candidate manifest;
+the embedded total memory must exactly match the candidate's admitted memory
+placement total. The local executor service/control ports are loopback-only
+implementation endpoints, never cluster-membership or gateway endpoints.
+
+The two currently bound UDP listener ports are materialized as the reservation's
+exclusive leases before activation: the node-runtime data listener uses its
+wildcard binding scope, while the local-executor service listener uses its
+loopback binding scope. A launch-plan control port is not an exclusive lease
+unless the corresponding runtime implementation actually binds it. Lease
+generation is owner-epoch evidence and does not change resource identity.
+
+`wavevm_node_runtime` accepts only the runtime manifest path and expected node
+instance ID. It derives any remaining adapter arguments for the current
+master-role and executor-role implementations internally from the accepted
+manifest and its dispatch projection. A launcher must not supply independent
+RAM, worker count, port, VM ID, static topology, or role-specific argument
+groups after admission.
 
 On each physical node, the authenticated local control receiver atomically
 publishes the accepted activated projection to the runtime-manifest path and
@@ -379,6 +414,7 @@ AdmissionEligibilityFence {
     admission_tx_id;
     membership_revision;
     topology_revision;
+    admission_eligibility_revision;
     inventory_revision;
     capability_profile_generation;
     selected_member_records[];    // role, physical ID, node/gateway instance,

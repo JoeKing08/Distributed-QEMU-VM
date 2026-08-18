@@ -10,12 +10,12 @@
 
 #include <stddef.h>
 
-#include "wavevm_envelope_v1.h"
+#include "wavevm_envelope.h"
 #include "wavevm_route_runtime.h"
 
 #define WVM_ROUTE_CONTROL_MAX_OPERATIONS 65536U
 #define WVM_ROUTE_CONTROL_MAX_FRAME_BYTES \
-    (WVM_ENVELOPE_V1_HEADER_BYTES + WVM_ENVELOPE_V1_MAX_LOCAL_PAYLOAD)
+    (WVM_ENVELOPE_HEADER_BYTES + WVM_ENVELOPE_MAX_LOCAL_PAYLOAD)
 
 struct wvm_route_control_operation;
 
@@ -54,7 +54,7 @@ void wvm_route_control_close(struct wvm_route_control *control);
  * payload digest is rejected.
  */
 int wvm_route_control_apply(struct wvm_route_control *control,
-                            const struct wvm_envelope_v1 *request,
+                            const struct wvm_envelope *request,
                             struct wvm_route_control_result *result_out,
                             char *error, size_t error_len);
 

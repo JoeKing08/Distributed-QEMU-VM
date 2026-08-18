@@ -741,6 +741,8 @@ static int placement_options_validate(
 
     if (!options || options->memory_consistency_policy == 0 ||
         options->executor_class == 0 ||
+        (options->kernel_accelerator_required != 0 &&
+         options->kernel_accelerator_required != 1) ||
         wvm_vm_route_scope_key_validate(&options->route_scope_key, error,
                                         error_len) != 0) {
         set_error(error, error_len, "admission placement options are invalid");
@@ -752,6 +754,124 @@ static int placement_options_validate(
     if (wvm_guest_topology_validate(&topology, error, error_len) != 0) {
         set_error(error, error_len, "admission guest topology is invalid");
         return -1;
+    }
+    return 0;
+}
+
+static int listener_plan_matches(
+    const struct wvm_admission_node_listener_plan *plan,
+    uint32_t physical_node_id, uint64_t node_instance_id)
+{
+    return plan && plan->physical_node_id == physical_node_id &&
+           plan->expected_node_instance_id == node_instance_id;
+}
+
+static int listener_plan_validate(
+    const struct wvm_admission_node_listener_plan *plan, char *error,
+    size_t error_len)
+{
+    if (!plan || plan->physical_node_id == 0 ||
+        plan->expected_node_instance_id == 0 ||
+        plan->node_runtime_data_port == 0 ||
+        plan->local_executor_service_port == 0 ||
+        plan->node_runtime_data_port == plan->local_executor_service_port ||
+        (plan->kernel_accelerator_required != 0 &&
+         plan->kernel_accelerator_required != 1) ||
+        plan->lease_generation == 0 || !plan->lease_entries ||
+        plan->lease_capacity <
+            (plan->kernel_accelerator_required ? 3U : 2U)) {
+        set_error(error, error_len, "node listener lease plan is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+static const struct wvm_admission_node_listener_plan *find_listener_plan(
+    const struct wvm_admission_placement_options *options,
+    uint32_t physical_node_id, uint64_t node_instance_id, char *error,
+    size_t error_len)
+{
+    const struct wvm_admission_node_listener_plan *found = NULL;
+    size_t i;
+
+    if (!options || !options->listener_plans ||
+        options->listener_plan_count == 0) {
+        set_error(error, error_len, "placement listener plans are missing");
+        return NULL;
+    }
+    for (i = 0; i < options->listener_plan_count; i++) {
+        const struct wvm_admission_node_listener_plan *plan =
+            &options->listener_plans[i];
+
+        if (listener_plan_validate(plan, error, error_len) != 0) {
+            return NULL;
+        }
+        if (!listener_plan_matches(plan, physical_node_id, node_instance_id)) {
+            continue;
+        }
+        if (found) {
+            set_error(error, error_len,
+                      "placement has duplicate listener plans for node %u",
+                      physical_node_id);
+            return NULL;
+        }
+        found = plan;
+    }
+    if (!found) {
+        set_error(error, error_len,
+                  "placement has no listener plan for node %u instance %llu",
+                  physical_node_id, (unsigned long long)node_instance_id);
+    }
+    return found;
+}
+
+static int derive_listener_leases(
+    const struct wvm_admission_node_listener_plan *plan, char *error,
+    size_t error_len)
+{
+    int written;
+
+    if (listener_plan_validate(plan, error, error_len) != 0) {
+        return -1;
+    }
+    memset(plan->lease_entries, 0,
+           plan->lease_capacity * sizeof(*plan->lease_entries));
+    plan->lease_entries[0].lease_kind =
+        WVM_EXCLUSIVE_LEASE_KIND_NODE_RUNTIME_DATA_UDP;
+    plan->lease_entries[0].lease_generation = plan->lease_generation;
+    written = snprintf(plan->lease_entries[0].lease_name,
+                       sizeof(plan->lease_entries[0].lease_name),
+                       "udp:any:node-runtime-data:%u",
+                       (unsigned)plan->node_runtime_data_port);
+    if (written < 0 || (size_t)written >=
+                           sizeof(plan->lease_entries[0].lease_name)) {
+        set_error(error, error_len, "node runtime listener lease name is too long");
+        return -1;
+    }
+    plan->lease_entries[1].lease_kind =
+        WVM_EXCLUSIVE_LEASE_KIND_LOCAL_EXECUTOR_SERVICE_UDP;
+    plan->lease_entries[1].lease_generation = plan->lease_generation;
+    written = snprintf(plan->lease_entries[1].lease_name,
+                       sizeof(plan->lease_entries[1].lease_name),
+                       "udp:loopback:local-executor-service:%u",
+                       (unsigned)plan->local_executor_service_port);
+    if (written < 0 || (size_t)written >=
+                           sizeof(plan->lease_entries[1].lease_name)) {
+        set_error(error, error_len, "executor listener lease name is too long");
+        return -1;
+    }
+    if (plan->kernel_accelerator_required) {
+        plan->lease_entries[2].lease_kind =
+            WVM_EXCLUSIVE_LEASE_KIND_KERNEL_CONTEXT;
+        plan->lease_entries[2].lease_generation = plan->lease_generation;
+        written = snprintf(plan->lease_entries[2].lease_name,
+                           sizeof(plan->lease_entries[2].lease_name),
+                           "kernel-context");
+        if (written < 0 || (size_t)written >=
+                               sizeof(plan->lease_entries[2].lease_name)) {
+            set_error(error, error_len, "kernel context lease name is too long");
+            return -1;
+        }
     }
     return 0;
 }
@@ -898,6 +1018,7 @@ int wvm_admission_placement_plan_build(
         struct wvm_reservation_requirement *requirement =
             &placement_plan->reservation_requirements
                  .entries[placement_plan->reservation_requirements.count++];
+        const struct wvm_admission_node_listener_plan *listener_plan;
 
         derive_reservation_id(admission_plan->admission_tx_id,
                               reservation->physical_node_id,
@@ -910,6 +1031,23 @@ int wvm_admission_placement_plan_build(
         requirement->overhead_vcpu_slots = reservation->host_overhead_vcpu_slots;
         requirement->overhead_memory_bytes =
             reservation->host_overhead_memory_bytes;
+        listener_plan = find_listener_plan(
+            options, reservation->physical_node_id,
+            reservation->expected_node_instance_id, error, error_len);
+        if (!listener_plan || derive_listener_leases(listener_plan, error,
+                                                     error_len) != 0) {
+            return -1;
+        }
+        if (listener_plan->kernel_accelerator_required !=
+            options->kernel_accelerator_required) {
+            set_error(error, error_len,
+                      "listener accelerator requirement does not match profile");
+            return -1;
+        }
+        requirement->exclusive_leases.entries = listener_plan->lease_entries;
+        requirement->exclusive_leases.count =
+            listener_plan->kernel_accelerator_required ? 3 : 2;
+        requirement->exclusive_leases.capacity = listener_plan->lease_capacity;
     }
     sort_requirements_by_id(placement_plan->reservation_requirements.entries,
                             placement_plan->reservation_requirements.count);

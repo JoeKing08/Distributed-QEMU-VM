@@ -7,6 +7,8 @@
 #include "wavevm_cluster.h"
 
 struct wvm_local_reservation_registry;
+struct wvm_membership_controller;
+struct wvm_membership_controller_capture;
 
 enum wvm_coordinator_id_purpose {
     WVM_COORDINATOR_ID_ADMISSION_TX = 1,
@@ -46,6 +48,32 @@ struct wvm_coordinator_activation_options {
 };
 
 /*
+ * Capability and reservation owners provide a coherent immutable evidence
+ * view alongside each membership capture. Membership itself is always read
+ * from the durable membership controller, never from bootstrap NODE/ROUTE
+ * files or a gateway cache.
+ */
+struct wvm_coordinator_membership_evidence {
+    const struct wvm_capability_record *capability_records;
+    size_t capability_record_count;
+    const struct wvm_resource_reservation *resource_reservations;
+    size_t resource_reservation_count;
+    uint64_t inventory_revision;
+    uint64_t capability_profile_generation;
+};
+
+/*
+ * The host agent reserves these ports before prepare. The controller binds one
+ * immutable launch plan to each selected physical node; launch scripts do not
+ * choose per-VM ports or worker counts after admission.
+ */
+struct wvm_coordinator_node_launch_plan {
+    uint32_t physical_node_id;
+    uint64_t expected_node_instance_id;
+    struct wvm_node_runtime_launch_plan launch_plan;
+};
+
+/*
  * Execution-profile selection is a prior capability-control decision. This
  * coordinator verifies that the selected profile is compatible with the
  * canonical request, then binds it immutably into the candidate manifest.
@@ -63,6 +91,10 @@ struct wvm_coordinator_prepare_options {
     uint64_t host_extra_role_bits;
     uint64_t candidate_created_at;
     uint64_t prepared_reservation_expiry_unix_time_ms;
+    const struct wvm_coordinator_node_launch_plan *node_launch_plans;
+    size_t node_launch_plan_count;
+    const struct wvm_admission_node_listener_plan *node_listener_plans;
+    size_t node_listener_plan_count;
     uint8_t *placement_plan_bytes;
     size_t placement_plan_bytes_capacity;
     uint8_t *candidate_manifest_bytes;
@@ -116,10 +148,37 @@ int wvm_coordinator_begin(
     struct wvm_coordinator_transaction *transaction, char *error,
     size_t error_len);
 
+/*
+ * Build the only cluster record input used by production coordinator calls.
+ * Capture storage and external evidence remain caller-owned and must stay
+ * valid through the immediately following prepare or decision operation.
+ */
+int wvm_coordinator_capture_current_membership_records(
+    const struct wvm_membership_controller *membership_controller,
+    struct wvm_membership_controller_capture *membership_capture,
+    const struct wvm_coordinator_membership_evidence *evidence,
+    struct wvm_cluster_record_set *records_out, char *error, size_t error_len);
+
 int wvm_coordinator_prepare(
     const struct wvm_vm_request *request,
     const struct wvm_coordinator_transaction *transaction,
     const struct wvm_cluster_record_set *records,
+    const struct wvm_coordinator_prepared_route *prepared_route,
+    const struct wvm_coordinator_prepare_options *options,
+    struct wvm_coordinator_prepared_vm *prepared_vm, char *error,
+    size_t error_len);
+
+/*
+ * Capture the current membership authority immediately before planning. This
+ * is the production entry point; wvm_coordinator_prepare remains the pure
+ * record-level primitive used by deterministic tests and recovery tooling.
+ */
+int wvm_coordinator_prepare_current_membership(
+    const struct wvm_membership_controller *membership_controller,
+    struct wvm_membership_controller_capture *membership_capture,
+    const struct wvm_coordinator_membership_evidence *evidence,
+    const struct wvm_vm_request *request,
+    const struct wvm_coordinator_transaction *transaction,
     const struct wvm_coordinator_prepared_route *prepared_route,
     const struct wvm_coordinator_prepare_options *options,
     struct wvm_coordinator_prepared_vm *prepared_vm, char *error,
@@ -135,6 +194,24 @@ int wvm_coordinator_decide_activation(
     const struct wvm_vm_request *request,
     const struct wvm_coordinator_transaction *transaction,
     const struct wvm_cluster_record_set *records,
+    const struct wvm_coordinator_prepared_route *prepared_route,
+    const struct wvm_coordinator_id_provider *id_provider,
+    const struct wvm_coordinator_activation_options *options,
+    struct wvm_coordinator_prepared_vm *prepared_vm,
+    struct wvm_activation_record *activation, char *error, size_t error_len);
+
+/*
+ * Recapture membership before validating a prepared eligibility fence. A
+ * membership or topology change between prepare and ACTIVATE therefore
+ * produces the normal stale-fence rejection instead of consulting a retained
+ * mutable controller view.
+ */
+int wvm_coordinator_decide_activation_current_membership(
+    const struct wvm_membership_controller *membership_controller,
+    struct wvm_membership_controller_capture *membership_capture,
+    const struct wvm_coordinator_membership_evidence *evidence,
+    const struct wvm_vm_request *request,
+    const struct wvm_coordinator_transaction *transaction,
     const struct wvm_coordinator_prepared_route *prepared_route,
     const struct wvm_coordinator_id_provider *id_provider,
     const struct wvm_coordinator_activation_options *options,

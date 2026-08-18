@@ -31,12 +31,13 @@
 #include <stdarg.h>
 #include <sys/time.h>
 #include <sys/sysinfo.h>
+#include <stdatomic.h>
 
 #include "unified_driver.h"
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_executor_abi.h"
-#include "../node_runtime/v1_ingress.h"
+#include "../node_runtime/ingress.h"
 
 extern int wvm_logic_route_snapshot_valid(void);
 
@@ -150,6 +151,7 @@ static int g_rx_thread_count = 4;
 static int g_disable_reuseport = 0;   /* 保留环境变量覆盖能力，但共享 socket 下此项无效 */
 static uint64_t g_id_counter = 0;
 static int g_shared_rx_sockfd = -1;   /* [V30] 共享 RX socket，thread 0 创建，其余线程共享 */
+static _Atomic unsigned int g_typed_ingress_diagnostics[WVM_INGRESS_UNSUPPORTED + 1];
 
 // --- 内存池 (Slab Allocator) ---
 typedef struct {
@@ -168,6 +170,24 @@ static int g_pool_top = -1;
 static int u_send_packet(void *data, int len, uint32_t target_id);
 static void u_log(const char *fmt, ...);
 static pthread_spinlock_t g_pool_lock;
+
+static void report_typed_ingress_result(int status, size_t frame_bytes,
+                                        const char *error)
+{
+    unsigned int occurrence;
+
+    if (status == WVM_INGRESS_ACCEPTED ||
+        status == WVM_INGRESS_INCOMPLETE ||
+        status < 0 || status > WVM_INGRESS_UNSUPPORTED) {
+        return;
+    }
+    occurrence = atomic_fetch_add_explicit(
+        &g_typed_ingress_diagnostics[status], 1, memory_order_relaxed);
+    if (occurrence < 8) {
+        u_log("[Typed Ingress] status=%d bytes=%zu reason=%s",
+              status, frame_bytes, (error && error[0]) ? error : "none");
+    }
+}
 
 static int parse_env_u64(const char *name, uint64_t *value)
 {
@@ -1402,8 +1422,12 @@ static void* rx_thread_loop(void *arg) {
             if (total_len >= 4 && base_ptr[0] == 'W' &&
                 base_ptr[1] == 'V' && base_ptr[2] == 'M' &&
                 base_ptr[3] == '1') {
-                (void)wvm_v1_ingress_handle_datagram(base_ptr,
-                                                      (size_t)total_len);
+                char ingress_error[128] = {0};
+                int ingress_status = wvm_ingress_handle_datagram_ex(
+                    base_ptr, (size_t)total_len, ingress_error,
+                    sizeof(ingress_error));
+                report_typed_ingress_result(ingress_status,
+                                            (size_t)total_len, ingress_error);
                 continue;
             }
 

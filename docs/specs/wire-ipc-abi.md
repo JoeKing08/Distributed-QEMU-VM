@@ -353,7 +353,7 @@ one canonical request record. The response uses `CTRL_RESULT` (`0x01ff`) and
 this fixed 72-byte payload:
 
 ```text
-ControlResultV1 {
+ControlResult {
     u16 status_code;
     u16 recorded_state;
     u32 result_flags;
@@ -367,7 +367,10 @@ ControlResultV1 {
 `status_code=SUCCESS` means the receiver durably recorded the stated result,
 not merely that it queued work. A duplicate request with the same operation ID
 and semantic digest replays the same result. The same ID with a different
-digest is `OPERATION_ID_CONFLICT`.
+digest, control message type, or authenticated member identity is
+`OPERATION_ID_CONFLICT`. `result_flags` is zero in V1. A zero
+`expiry_or_retention_deadline` means that the operation result is retained by
+the member lifecycle/quarantine policy rather than a fixed wall-clock expiry.
 
 | Code | Status |
 | --- | --- |
@@ -394,9 +397,9 @@ tags starting at one; no listed field is optional unless marked optional.
 
 | Type | Message | Mandatory request fields | Preconditions | Success result / retention |
 | --- | --- | --- | --- | --- |
-| `0x0101` | `REGISTER_MEMBER` | `MemberKey`, `hosting_physical_node_id:u32`, `failure_domain_id:u64`, roles, `Endpoint`, capacity record, capability `Digest32`, requested topology record | `vm_id=0`, fresh member instance, authenticated registrar | Registered desired-state record; retained through member removal/quarantine. |
-| `0x0102` | `CORDON` | `MemberKey`, expected `membership_revision:u64`, reason code | Exact member revision and control authorization | New membership/eligibility revision; retained through removal/quarantine. |
-| `0x0103` | `DRAIN` | `MemberKey`, expected revision, dependency report digest, requested drain kind | No unacknowledged conflicting control transaction | Recorded drain plan/rejection; retained through completion. |
+| `0x0101` | `REGISTER_MEMBER` | Exact canonical `NodeRecord` or `GatewayRecord` payload; the receiver derives `MemberKey` from that record | `vm_id=0`, fresh member instance, authenticated registrar | Registered `PENDING`/`RECOVERING` desired-state record; retained through member removal/quarantine. |
+| `0x0102` | `CORDON` | Exact canonical `MemberCordonRequest` (`0x102c`) | Authenticated actor is an `EXECUTOR` principal accepted by the separately configured membership-management authorizer. Target is a registered `NODE_RUNTIME` or `GATEWAY`; all three expected revisions are exact. | Target enters `CORDONED`; membership and admission-eligibility revisions advance by one, topology revision is unchanged; one durable replayable result is retained through removal/quarantine. |
+| `0x0103` | `DRAIN` | Exact canonical `GatewayDrainRequest` (`0x102b`) | Authenticated actor is an `EXECUTOR` principal accepted by the receiver's separately configured management-authorizer callback. A missing callback fails closed. `PREPARE` requires exact current membership/topology/eligibility revisions and one complete successor route at `topology_revision = current + 1`; `COMMIT` and `ABORT` require the post-prepare fence. | One durable replayable result per operation. `PREPARE` advances eligibility only; `COMMIT` atomically activates the successor, marks the target gateway `DRAINING`, and advances all three revisions; `ABORT` leaves revisions unchanged. |
 | `0x0201` | `PREPARE_RESERVATION` | `admission_tx_id:ID16`, candidate `Digest32`, eligibility-fence `Digest32`, plan `Digest32`, expected `MemberKey`, resource reservation record, `prepared_expiry:u64` | Member/capability/fence still eligible and local capacity/name lease free | Prepared reservation ID/digest/expiry; retained until abort or expiry if no activation fence. |
 | `0x0202` | `COMMIT_RESERVATION` | `admission_tx_id`, candidate digest, eligibility-fence digest, `activation_fence:ID16`, reservation ID | Matching unexpired prepared record and durable activation decision | Committed reservation digest; retained through VM retirement. |
 | `0x0203` | `ABORT_RESERVATION` | `admission_tx_id`, candidate digest, reservation ID, reason | No matching activation fence, or explicit compensating-teardown record | Released/teardown-pending result; retained through cleanup horizon. |
@@ -407,7 +410,7 @@ tags starting at one; no listed field is optional unless marked optional.
 | `0x0401` | `ROUTE_PREPARE` | `SnapshotKey`, snapshot canonical record, predecessor key optional, `RequiredAckSet` record/digest, eligibility-fence digest, operation-retention horizon | All ACK-set entries are surviving eligible members; departing/failed gateway absent from required set | Prepared snapshot result; retained until activate/abort. |
 | `0x0402` | `ROUTE_COMMIT` | `SnapshotKey`, route transaction ID, required-ACK-set digest | Matching prepared snapshot and persisted required ACK set | Activated snapshot result; retained through predecessor retirement. |
 | `0x0403` | `ROUTE_RETIRE` | retiring `SnapshotKey`, successor key optional, route transaction ID | No active operation reference and query/retry horizon complete, or typed terminal outcome recorded | Retired snapshot result; retained through VM namespace quarantine. |
-| `0x0501` | `REJOIN` | new `MemberKey`, prior physical role ID optional, capability digest, endpoint, recovery evidence | Fresh registration only; no implicit use of old instance identity | `VALIDATING` membership result. It never rebinds a running V1 VM. |
+| `0x0501` | `REJOIN` | Exact canonical `RejoinMemberRequest` (`0x102a`), containing a `NodeRecord` or `GatewayRecord`, optional prior `MemberKey`, and recovery evidence digest | Fresh registration only; no implicit use of old instance identity | `VALIDATING` membership result. It never rebinds a running V1 VM. |
 | `0x0502` | `RECOVERY_REBIND` | old/new `MemberKey`, manifest/snapshot digests, reservation proof, memory/vCPU/storage recovery proof | Not supported in V1 without a separately accepted recovery specification | `UNSUPPORTED` in V1; retained as audit evidence. |
 
 `RequiredAckSet` is a canonical ordered list of `MemberKey`, expected endpoint,
@@ -415,6 +418,80 @@ role, and snapshot key. It includes only surviving eligible node runtimes and
 gateways that must install a successor before normal traffic can use it, plus a
 new gateway being activated. A departing `DRAINING`, `FAILED`, or `REMOVED`
 gateway may send optional drain status but is never a required successor ACK.
+
+### 4.2.1 Registration and Rejoin Payload Binding
+
+`REGISTER_MEMBER` carries one complete canonical `NodeRecord` (`0x100c`) or
+`GatewayRecord` (`0x100d`) as its complete semantic payload. The desired-state,
+observed-health, membership-revision, and topology-revision fields are
+structural input only; the controller normalizes them to its durable
+`PENDING`/`RECOVERING` record and current revisions.
+
+`REJOIN` carries canonical `RejoinMemberRequest` (`0x102a`). Field one is the
+complete new `NodeRecord` or `GatewayRecord`; the new `MemberKey` is derived
+only from that nested record. Field two, when present, names an earlier
+instance of the same stable role. Field three is a nonzero recovery-evidence
+digest retained for audit. It does not authorize recovery rebind.
+
+For either message, the authenticated control-channel principal must equal the
+derived member key. The V1 envelope origin physical node and runtime instance
+must equal the node record's physical-node/node-instance pair, or the gateway
+record's hosting-physical-node/gateway-instance pair. These checks prevent a
+registered node, gateway, source address, or free-form payload field from
+impersonating another member.
+
+### 4.2.2 Gateway Drain Authorization, Fences, and Replay
+
+`DRAIN` is currently the canonical one-scope `GatewayDrainRequest` only; a
+generic member drain payload is not accepted through this receiver. The
+transport must authenticate an `EXECUTOR` actor before calling the receiver.
+The receiver then calls its separately provisioned management-authorizer with
+the action, authenticated executor, and target gateway. Gateway/self and
+node-runtime principals cannot substitute for that management actor. A missing
+callback, a non-executor actor, or an authorization denial is
+`UNAUTHORIZED_ROLE` and makes no controller or result-journal mutation.
+
+`PREPARE` carries a complete successor `RouteTransaction` and
+`RouteSnapshot`, both bound to the same route operation ID. Its membership,
+topology, and admission-eligibility revisions must exactly equal the current
+controller values. On success the controller durably reserves the successor
+topology generation and advances eligibility only. `COMMIT` and `ABORT` omit
+the successor records and carry the post-prepare fence. Commit atomically
+activates the successor, marks the target gateway `DRAINING`, and advances
+membership, topology, and eligibility revisions. Abort records the successor
+as aborted without advancing any revision.
+
+Every successful action is stored in the result journal under the envelope
+operation ID and semantic digest. A retry after the controller frame became
+durable but before that result record was written is accepted only for the
+same target, route operation, action, and exact terminal/prepare revisions.
+Any changed payload or stale fence is rejected; the receiver must not infer a
+matching drain from a target gateway's current state alone.
+
+### 4.2.3 Member Cordon Authorization, Fences, and Replay
+
+`CORDON` carries the complete canonical `MemberCordonRequest` record. The
+transport must authenticate an `EXECUTOR` actor before calling the receiver.
+The receiver invokes a separately configured membership-management authorizer;
+the gateway-drain authorizer is not reused because cordon is a membership
+eligibility operation rather than a route replacement decision. A missing
+callback, non-executor actor, or denied decision returns `UNAUTHORIZED_ROLE`
+without changing the controller or result journal.
+
+The request's target must be an existing compute or gateway member. At the
+controller linearization point, the membership, topology, and
+admission-eligibility revisions must equal the request fence. The target must
+be `ACTIVE`. Success durably records the target as `CORDONED`, advances
+membership and admission eligibility exactly once, leaves topology unchanged,
+and stamps the resulting revisions on the membership projection. If the
+membership journal already contains that exact transition but the result
+journal write was interrupted, a retry with the old fence is accepted only
+when the target state and all three post-state revisions match exactly; it
+does not advance a revision a second time. Normal result replay still requires
+the same envelope operation ID, authenticated actor, and semantic payload
+digest; a controller-only retry independently rechecks the new request's
+authorization and exact target/fence, while `reason_code` remains audit input
+and never authorizes a second state transition.
 
 ### 4.3 Manifest and Route Records
 
@@ -433,8 +510,9 @@ The canonical local message families are:
 | Current type | Target semantic operation | Required response |
 | --- | --- | --- |
 | `WVM_IPC_TYPE_REGISTER` | Bind QEMU connection role and identity. | Registration ACK with accepted versions/roles. |
-| `WVM_IPC_TYPE_MEM_FAULT` | Request an authoritative page through local node runtime. | Typed page/status response. |
-| `WVM_IPC_TYPE_MEM_WRITE` / `COMMIT_DIFF` | Submit captured dirty data. | Versioned commit result when required by fence policy. |
+| `WVM_IPC_TYPE_TYPED_MEM_FAULT` | Request an authoritative page through the admitted local node runtime. | Typed page/status response. |
+| `WVM_IPC_TYPE_TYPED_MEM_COMMIT` | Submit an operation-identified dirty-page commit through the admitted local node runtime. | Typed commit result with authoritative page version/status. |
+| `WVM_IPC_TYPE_MEM_FAULT` / `MEM_WRITE` / `COMMIT_DIFF` | Legacy local-memory paths. They must not substitute for the typed admitted path. | Legacy/compatibility handling only. |
 | `WVM_IPC_TYPE_COMMIT_DIFF_SYNC` | Complete a handoff-scoped memory fence. | Fence result tied to operation sequence. |
 | `WVM_IPC_TYPE_CPU_RUN` | Request local/remote vCPU handoff. | `wvm_ipc_cpu_run_ack` successor with exact status and context. |
 | `WVM_IPC_TYPE_IRQ` / `INVALIDATE` | Deliver a typed guest event or correction. | Explicit delivery/backpressure result where guest progress depends on it. |
@@ -455,12 +533,12 @@ digest), and the activation fence. It is a single admitted-format ABI; older
 frames are rejected at decode time rather than retained as a compatibility
 path.
 
-The local registration payload is a canonical `LocalRegisterV1` record with
+The local registration payload is a canonical `LocalRegister` record with
 these mandatory fields: `connection_role:u16`, `vm_id:u32`,
 `vm_incarnation:u64`, `manifest_generation:u64`, candidate/admitted manifest
 digest, `local_runtime_instance_id:u64`, caller process instance ID,
 capability-profile digest, and requested local endpoint name. The registration
-result is a `ControlResultV1`-compatible status plus accepted role and local
+result is a `ControlResult`-compatible status plus accepted role and local
 connection ID. No local QEMU/executor connection may send semantic traffic
 until this registration is accepted.
 
@@ -541,7 +619,9 @@ payload layout are not stable until `kernel-accelerator.md` accepts them.
 - Coordinator crash/restart after each `PREPARE_*`, `ACTIVATE_*`,
   `COMMIT_RESERVATION`, `ABORT_*`, `ROUTE_*`, `CORDON`, and `DRAIN` message
   replays one recorded result; it cannot create an orphaned reservation or a
-  partially published route.
+  partially published route. A future-topology route journaled before its
+  gateway-drain reservation is intentionally fail-closed: it cannot ACK or
+  commit after recovery and must be explicitly aborted.
 - A failed/departing gateway is never awaited as a required successor route ACK;
   every survivor ACK is received over the independent control path or the
   operation returns a bounded degraded/failed result.

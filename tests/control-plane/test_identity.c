@@ -63,7 +63,7 @@ int main(void)
         return 1;
     }
 
-    if (expect(wvm_vm_namespace_allocate(&allocator, WVM_NAMESPACE_ABI_V1_U32,
+    if (expect(wvm_vm_namespace_allocate(&allocator, WVM_NAMESPACE_ABI_U32,
                                          &vm_id, &incarnation, error,
                                          sizeof(error)) == 0,
                "allocate V1 namespace") ||

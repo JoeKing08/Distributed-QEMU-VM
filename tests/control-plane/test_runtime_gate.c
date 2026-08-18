@@ -85,6 +85,23 @@ int main(void)
     manifest.negotiated_profile.per_node_capabilities.count = 1;
     manifest.negotiated_profile.per_node_capabilities.capacity = 1;
     memset(manifest.reservation_id, 0x99, sizeof(manifest.reservation_id));
+    manifest.launch_plan.plan_version = WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION;
+    manifest.launch_plan.node_runtime_data_port = 19100;
+    manifest.launch_plan.node_runtime_control_port = 19121;
+    manifest.launch_plan.local_executor_service_port = 19105;
+    manifest.launch_plan.local_executor_control_port = 19121;
+    manifest.launch_plan.executor_worker_count = 1;
+    manifest.launch_plan.vcpu_handoff_record_capacity = 16;
+    manifest.launch_plan.sync_batch_size = 1;
+    manifest.launch_plan.guest_total_memory_bytes = 4 * 1024 * 1024;
+    strcpy(manifest.launch_plan.guest_machine.architecture, "x86_64");
+    strcpy(manifest.launch_plan.guest_machine.machine_type, "pc-i440fx-5.2");
+    manifest.launch_plan.guest_machine.qemu_compat_version = 502;
+    manifest.launch_plan.guest_machine.firmware_policy = 1;
+    manifest.launch_plan.consistency_policy.dirty_batch_size = 1;
+    manifest.launch_plan.consistency_policy.handoff_commit_policy = 1;
+    manifest.launch_plan.consistency_policy.subscriber_delivery_policy = 1;
+    manifest.launch_plan.consistency_policy.max_commit_latency_ms = 1000;
     if (expect(wvm_node_runtime_manifest_validate(&manifest, error,
                                                   sizeof(error)) == 0,
                "validate runtime manifest") ||

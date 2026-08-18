@@ -192,71 +192,71 @@ static int g_nonblock_recv = 0;
 static int g_force_single_fd = 0;
 static int g_multi_queue = 1;
 
-#define WVM_V1_TX_BATCH_SIZE 32U
-#define WVM_V1_TX_QUEUE_CAPACITY 8192U
-#define WVM_V1_TX_HIGH_BURST 8U
+#define WVM_TX_BATCH_SIZE 32U
+#define WVM_TX_QUEUE_CAPACITY 8192U
+#define WVM_TX_HIGH_BURST 8U
 
 /*
  * V1 frames are individually checksummed envelopes and cannot be concatenated
  * into the legacy aggregation buffer.  The gateway still needs queueing,
  * QoS, and batched syscalls, so V1 uses a separate bounded MPSC scheduler.
  */
-struct v1_tx_item {
-    struct v1_tx_item *next;
+struct tx_item {
+    struct tx_item *next;
     struct sockaddr_in destination;
     size_t bytes;
-    uint8_t frame[WVM_ENVELOPE_V1_MAX_NETWORK_FRAME_BYTES];
+    uint8_t frame[WVM_ENVELOPE_MAX_NETWORK_FRAME_BYTES];
 };
 
-struct v1_tx_queue {
-    struct v1_tx_item *head;
-    struct v1_tx_item *tail;
+struct tx_queue {
+    struct tx_item *head;
+    struct tx_item *tail;
     size_t count;
     pthread_mutex_t lock;
     pthread_cond_t ready;
 };
 
-struct v1_tx_scheduler {
-    struct v1_tx_queue high;
-    struct v1_tx_queue normal;
+struct tx_scheduler {
+    struct tx_queue high;
+    struct tx_queue normal;
     pthread_t thread;
     int socket_fd;
     int started;
 };
 
-static struct v1_tx_scheduler g_v1_tx_scheduler = {
+static struct tx_scheduler g_tx_scheduler = {
     .socket_fd = -1,
 };
 
-static int v1_message_is_latency_sensitive(uint16_t message_type)
+static int message_is_latency_sensitive(uint16_t message_type)
 {
     switch (message_type) {
-    case WVM_ENVELOPE_V1_MSG_MEM_READ:
-    case WVM_ENVELOPE_V1_MSG_MEM_ACK:
-    case WVM_ENVELOPE_V1_MSG_VCPU_RUN:
-    case WVM_ENVELOPE_V1_MSG_VCPU_EXIT:
-    case WVM_ENVELOPE_V1_MSG_VFIO_IRQ:
-    case WVM_ENVELOPE_V1_MSG_BLOCK_ACK:
+    case WVM_ENVELOPE_MSG_MEM_READ:
+    case WVM_ENVELOPE_MSG_MEM_ACK:
+    case WVM_ENVELOPE_MSG_VCPU_RUN:
+    case WVM_ENVELOPE_MSG_VCPU_EXIT:
+    case WVM_ENVELOPE_MSG_VFIO_IRQ:
+    case WVM_ENVELOPE_MSG_BLOCK_ACK:
         return 1;
     default:
         return 0;
     }
 }
 
-static void v1_tx_queue_init(struct v1_tx_queue *queue)
+static void tx_queue_init(struct tx_queue *queue)
 {
     memset(queue, 0, sizeof(*queue));
     pthread_mutex_init(&queue->lock, NULL);
     pthread_cond_init(&queue->ready, NULL);
 }
 
-static int v1_tx_enqueue(struct v1_tx_item *item, int high_priority)
+static int tx_enqueue(struct tx_item *item, int high_priority)
 {
-    struct v1_tx_queue *queue =
-        high_priority ? &g_v1_tx_scheduler.high : &g_v1_tx_scheduler.normal;
+    struct tx_queue *queue =
+        high_priority ? &g_tx_scheduler.high : &g_tx_scheduler.normal;
     size_t total_count;
 
-    if (!item || !g_v1_tx_scheduler.started) {
+    if (!item || !g_tx_scheduler.started) {
         return -EPIPE;
     }
 
@@ -264,12 +264,12 @@ static int v1_tx_enqueue(struct v1_tx_item *item, int high_priority)
      * Lock both queues in a fixed order to enforce one scheduler-wide
      * capacity without introducing a data-plane global routing lock.
      */
-    pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
-    pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
-    total_count = g_v1_tx_scheduler.high.count + g_v1_tx_scheduler.normal.count;
-    if (total_count >= WVM_V1_TX_QUEUE_CAPACITY) {
-        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
-        pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+    pthread_mutex_lock(&g_tx_scheduler.high.lock);
+    pthread_mutex_lock(&g_tx_scheduler.normal.lock);
+    total_count = g_tx_scheduler.high.count + g_tx_scheduler.normal.count;
+    if (total_count >= WVM_TX_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&g_tx_scheduler.normal.lock);
+        pthread_mutex_unlock(&g_tx_scheduler.high.lock);
         return -EAGAIN;
     }
     if (queue->tail) {
@@ -280,32 +280,32 @@ static int v1_tx_enqueue(struct v1_tx_item *item, int high_priority)
     queue->tail = item;
     queue->count++;
     /* One scheduler worker waits on the high queue's shared wakeup. */
-    pthread_cond_signal(&g_v1_tx_scheduler.high.ready);
-    pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
-    pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+    pthread_cond_signal(&g_tx_scheduler.high.ready);
+    pthread_mutex_unlock(&g_tx_scheduler.normal.lock);
+    pthread_mutex_unlock(&g_tx_scheduler.high.lock);
     return 0;
 }
 
-static struct v1_tx_item *v1_tx_take_one(unsigned int *high_streak)
+static struct tx_item *tx_take_one(unsigned int *high_streak)
 {
-    struct v1_tx_item *item = NULL;
-    struct v1_tx_queue *selected = NULL;
+    struct tx_item *item = NULL;
+    struct tx_queue *selected = NULL;
 
-    pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
-    pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
-    while (!g_v1_tx_scheduler.high.head && !g_v1_tx_scheduler.normal.head) {
-        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
-        pthread_cond_wait(&g_v1_tx_scheduler.high.ready,
-                          &g_v1_tx_scheduler.high.lock);
-        pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
+    pthread_mutex_lock(&g_tx_scheduler.high.lock);
+    pthread_mutex_lock(&g_tx_scheduler.normal.lock);
+    while (!g_tx_scheduler.high.head && !g_tx_scheduler.normal.head) {
+        pthread_mutex_unlock(&g_tx_scheduler.normal.lock);
+        pthread_cond_wait(&g_tx_scheduler.high.ready,
+                          &g_tx_scheduler.high.lock);
+        pthread_mutex_lock(&g_tx_scheduler.normal.lock);
     }
-    if (g_v1_tx_scheduler.high.head &&
-        (!g_v1_tx_scheduler.normal.head ||
-         *high_streak < WVM_V1_TX_HIGH_BURST)) {
-        selected = &g_v1_tx_scheduler.high;
+    if (g_tx_scheduler.high.head &&
+        (!g_tx_scheduler.normal.head ||
+         *high_streak < WVM_TX_HIGH_BURST)) {
+        selected = &g_tx_scheduler.high;
         (*high_streak)++;
     } else {
-        selected = &g_v1_tx_scheduler.normal;
+        selected = &g_tx_scheduler.normal;
         *high_streak = 0;
     }
     item = selected->head;
@@ -315,43 +315,43 @@ static struct v1_tx_item *v1_tx_take_one(unsigned int *high_streak)
     }
     selected->count--;
     item->next = NULL;
-    pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
-    pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+    pthread_mutex_unlock(&g_tx_scheduler.normal.lock);
+    pthread_mutex_unlock(&g_tx_scheduler.high.lock);
     return item;
 }
 
-static size_t v1_tx_take_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
+static size_t tx_take_batch(struct tx_item *items[WVM_TX_BATCH_SIZE],
                                unsigned int *high_streak)
 {
     size_t count = 0;
 
-    items[count++] = v1_tx_take_one(high_streak);
-    while (count < WVM_V1_TX_BATCH_SIZE) {
-        struct v1_tx_item *item = NULL;
+    items[count++] = tx_take_one(high_streak);
+    while (count < WVM_TX_BATCH_SIZE) {
+        struct tx_item *item = NULL;
 
-        pthread_mutex_lock(&g_v1_tx_scheduler.high.lock);
-        pthread_mutex_lock(&g_v1_tx_scheduler.normal.lock);
-        if (g_v1_tx_scheduler.high.head &&
-            (!g_v1_tx_scheduler.normal.head ||
-             *high_streak < WVM_V1_TX_HIGH_BURST)) {
-            item = g_v1_tx_scheduler.high.head;
-            g_v1_tx_scheduler.high.head = item->next;
-            if (!g_v1_tx_scheduler.high.head) {
-                g_v1_tx_scheduler.high.tail = NULL;
+        pthread_mutex_lock(&g_tx_scheduler.high.lock);
+        pthread_mutex_lock(&g_tx_scheduler.normal.lock);
+        if (g_tx_scheduler.high.head &&
+            (!g_tx_scheduler.normal.head ||
+             *high_streak < WVM_TX_HIGH_BURST)) {
+            item = g_tx_scheduler.high.head;
+            g_tx_scheduler.high.head = item->next;
+            if (!g_tx_scheduler.high.head) {
+                g_tx_scheduler.high.tail = NULL;
             }
-            g_v1_tx_scheduler.high.count--;
+            g_tx_scheduler.high.count--;
             (*high_streak)++;
-        } else if (g_v1_tx_scheduler.normal.head) {
-            item = g_v1_tx_scheduler.normal.head;
-            g_v1_tx_scheduler.normal.head = item->next;
-            if (!g_v1_tx_scheduler.normal.head) {
-                g_v1_tx_scheduler.normal.tail = NULL;
+        } else if (g_tx_scheduler.normal.head) {
+            item = g_tx_scheduler.normal.head;
+            g_tx_scheduler.normal.head = item->next;
+            if (!g_tx_scheduler.normal.head) {
+                g_tx_scheduler.normal.tail = NULL;
             }
-            g_v1_tx_scheduler.normal.count--;
+            g_tx_scheduler.normal.count--;
             *high_streak = 0;
         }
-        pthread_mutex_unlock(&g_v1_tx_scheduler.normal.lock);
-        pthread_mutex_unlock(&g_v1_tx_scheduler.high.lock);
+        pthread_mutex_unlock(&g_tx_scheduler.normal.lock);
+        pthread_mutex_unlock(&g_tx_scheduler.high.lock);
         if (!item) {
             break;
         }
@@ -361,14 +361,14 @@ static size_t v1_tx_take_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
     return count;
 }
 
-static void v1_tx_send_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
+static void tx_send_batch(struct tx_item *items[WVM_TX_BATCH_SIZE],
                              size_t count)
 {
     size_t offset = 0;
 
     while (offset < count) {
-        struct mmsghdr messages[WVM_V1_TX_BATCH_SIZE];
-        struct iovec iovecs[WVM_V1_TX_BATCH_SIZE];
+        struct mmsghdr messages[WVM_TX_BATCH_SIZE];
+        struct iovec iovecs[WVM_TX_BATCH_SIZE];
         size_t remaining = count - offset;
         int sent;
         size_t i;
@@ -382,7 +382,7 @@ static void v1_tx_send_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
             messages[i].msg_hdr.msg_name = &items[offset + i]->destination;
             messages[i].msg_hdr.msg_namelen = sizeof(items[offset + i]->destination);
         }
-        sent = sendmmsg(g_v1_tx_scheduler.socket_fd, messages,
+        sent = sendmmsg(g_tx_scheduler.socket_fd, messages,
                         (unsigned int)remaining, MSG_DONTWAIT);
         if (sent > 0) {
             for (i = 0; i < (size_t)sent; i++) {
@@ -396,7 +396,7 @@ static void v1_tx_send_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
         }
         if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             struct pollfd writable = {
-                .fd = g_v1_tx_scheduler.socket_fd,
+                .fd = g_tx_scheduler.socket_fd,
                 .events = POLLOUT,
             };
 
@@ -420,47 +420,47 @@ static void v1_tx_send_batch(struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE],
     }
 }
 
-static void *v1_tx_worker(void *opaque)
+static void *tx_worker(void *opaque)
 {
     unsigned int high_streak = 0;
 
     (void)opaque;
     for (;;) {
-        struct v1_tx_item *items[WVM_V1_TX_BATCH_SIZE];
-        size_t count = v1_tx_take_batch(items, &high_streak);
+        struct tx_item *items[WVM_TX_BATCH_SIZE];
+        size_t count = tx_take_batch(items, &high_streak);
 
-        v1_tx_send_batch(items, count);
+        tx_send_batch(items, count);
     }
     return NULL;
 }
 
-static int v1_tx_scheduler_start(void)
+static int tx_scheduler_start(void)
 {
     int flags;
 
-    if (g_v1_tx_scheduler.started) {
+    if (g_tx_scheduler.started) {
         return 0;
     }
-    v1_tx_queue_init(&g_v1_tx_scheduler.high);
-    v1_tx_queue_init(&g_v1_tx_scheduler.normal);
-    g_v1_tx_scheduler.socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (g_v1_tx_scheduler.socket_fd < 0) {
+    tx_queue_init(&g_tx_scheduler.high);
+    tx_queue_init(&g_tx_scheduler.normal);
+    g_tx_scheduler.socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_tx_scheduler.socket_fd < 0) {
         return -errno;
     }
-    flags = fcntl(g_v1_tx_scheduler.socket_fd, F_GETFL, 0);
+    flags = fcntl(g_tx_scheduler.socket_fd, F_GETFL, 0);
     if (flags >= 0) {
-        (void)fcntl(g_v1_tx_scheduler.socket_fd, F_SETFL, flags | O_NONBLOCK);
+        (void)fcntl(g_tx_scheduler.socket_fd, F_SETFL, flags | O_NONBLOCK);
     }
-    if (pthread_create(&g_v1_tx_scheduler.thread, NULL, v1_tx_worker, NULL) !=
+    if (pthread_create(&g_tx_scheduler.thread, NULL, tx_worker, NULL) !=
         0) {
         int result = -errno;
 
-        close(g_v1_tx_scheduler.socket_fd);
-        g_v1_tx_scheduler.socket_fd = -1;
+        close(g_tx_scheduler.socket_fd);
+        g_tx_scheduler.socket_fd = -1;
         return result;
     }
-    pthread_detach(g_v1_tx_scheduler.thread);
-    g_v1_tx_scheduler.started = 1;
+    pthread_detach(g_tx_scheduler.thread);
+    g_tx_scheduler.started = 1;
     return 0;
 }
 
@@ -560,29 +560,29 @@ static int endpoint_to_sockaddr_in(const struct wvm_endpoint *endpoint,
     return 0;
 }
 
-static int gateway_forward_v1(int local_fd, const uint8_t *packet,
+static int gateway_forward(int local_fd, const uint8_t *packet,
                               size_t packet_bytes)
 {
-    struct wvm_envelope_v1 envelope;
+    struct wvm_envelope envelope;
     struct wvm_route_runtime_next_hop next_hop;
     struct sockaddr_in destination;
-    struct v1_tx_item *item = NULL;
+    struct tx_item *item = NULL;
     size_t forwarded_bytes = 0;
     char error[256] = {0};
 
     (void)local_fd;
 
     if (!g_route_authority_active ||
-        wvm_envelope_v1_decode(packet, packet_bytes,
-                               WVM_ENVELOPE_V1_TRANSPORT_NETWORK, &envelope,
+        wvm_envelope_decode(packet, packet_bytes,
+                               WVM_ENVELOPE_TRANSPORT_NETWORK, &envelope,
                                error, sizeof(error)) != 0 ||
         wvm_route_runtime_lookup(&g_route_runtime, &envelope, &next_hop,
                                  error, sizeof(error)) != 0 ||
         endpoint_to_sockaddr_in(&next_hop.next_hop_endpoint, &destination) !=
             0 ||
-        wvm_envelope_v1_route_advance(&envelope, error, sizeof(error)) != 0 ||
+        wvm_envelope_route_advance(&envelope, error, sizeof(error)) != 0 ||
         !(item = calloc(1, sizeof(*item))) ||
-        wvm_envelope_v1_encode(&envelope, WVM_ENVELOPE_V1_TRANSPORT_NETWORK,
+        wvm_envelope_encode(&envelope, WVM_ENVELOPE_TRANSPORT_NETWORK,
                                item->frame, sizeof(item->frame),
                                &forwarded_bytes, error, sizeof(error)) != 0) {
         static unsigned int rejected;
@@ -596,7 +596,7 @@ static int gateway_forward_v1(int local_fd, const uint8_t *packet,
     }
     item->destination = destination;
     item->bytes = forwarded_bytes;
-    if (v1_tx_enqueue(item, v1_message_is_latency_sensitive(
+    if (tx_enqueue(item, message_is_latency_sensitive(
                                 envelope.message_type)) != 0) {
         static unsigned int backpressured;
 
@@ -616,7 +616,7 @@ static inline void gateway_process_packet(int local_fd,
     if (pkt_len >= 4 && ptr[0] == 'W' && ptr[1] == 'V' &&
         ptr[2] == 'M' && ptr[3] == '1') {
         (void)src;
-        (void)gateway_forward_v1(local_fd, ptr, (size_t)pkt_len);
+        (void)gateway_forward(local_fd, ptr, (size_t)pkt_len);
         return;
     }
     if (pkt_len < (int)sizeof(struct wvm_header)) return;
@@ -1685,12 +1685,12 @@ static uint16_t control_status_from_error(const char *error)
 }
 
 static void send_route_control_result(
-    int client_fd, const struct wvm_envelope_v1 *request,
+    int client_fd, const struct wvm_envelope *request,
     const struct wvm_route_control_result *result, uint16_t status_code)
 {
     uint8_t payload[72];
-    uint8_t frame[WVM_ENVELOPE_V1_HEADER_BYTES + sizeof(payload)];
-    struct wvm_envelope_v1 response;
+    uint8_t frame[WVM_ENVELOPE_HEADER_BYTES + sizeof(payload)];
+    struct wvm_envelope response;
     size_t frame_bytes = 0;
     char error[128] = {0};
 
@@ -1719,7 +1719,7 @@ static void send_route_control_result(
                sizeof(request->operation_id));
     }
     memset(&response, 0, sizeof(response));
-    response.message_type = WVM_ENVELOPE_V1_MSG_CTRL_RESULT;
+    response.message_type = WVM_ENVELOPE_MSG_CTRL_RESULT;
     response.vm_id = request->vm_id;
     response.vm_incarnation = request->vm_incarnation;
     response.manifest_generation = request->manifest_generation;
@@ -1730,7 +1730,7 @@ static void send_route_control_result(
     response.delivery_attempt_id = 1;
     response.payload = payload;
     response.payload_bytes = sizeof(payload);
-    if (wvm_envelope_v1_encode(&response, WVM_ENVELOPE_V1_TRANSPORT_LOCAL,
+    if (wvm_envelope_encode(&response, WVM_ENVELOPE_TRANSPORT_LOCAL,
                                frame, sizeof(frame), &frame_bytes, error,
                                sizeof(error)) == 0) {
         (void)send(client_fd, frame, frame_bytes, MSG_NOSIGNAL);
@@ -1743,7 +1743,7 @@ static void handle_route_control_client(int client_fd)
     socklen_t credentials_bytes = sizeof(credentials);
     struct msghdr message;
     struct iovec iovec;
-    struct wvm_envelope_v1 request;
+    struct wvm_envelope request;
     struct wvm_route_control_result result;
     uint8_t *frame;
     ssize_t received;
@@ -1767,8 +1767,8 @@ static void handle_route_control_client(int client_fd)
     message.msg_iovlen = 1;
     received = recvmsg(client_fd, &message, 0);
     if (received <= 0 || (message.msg_flags & MSG_TRUNC) != 0 ||
-        wvm_envelope_v1_decode(frame, (size_t)received,
-                               WVM_ENVELOPE_V1_TRANSPORT_LOCAL, &request,
+        wvm_envelope_decode(frame, (size_t)received,
+                               WVM_ENVELOPE_TRANSPORT_LOCAL, &request,
                                error, sizeof(error)) != 0) {
         free(frame);
         return;
@@ -1867,7 +1867,7 @@ int init_aggregator(int local_port, const char *upstream_ip, int upstream_port, 
         if (load_slave_config(config_path) != 0) return -ENOENT;
         if (init_route_runtime_from_environment() != 0) return -EINVAL;
     }
-    if (g_route_authority_active && v1_tx_scheduler_start() != 0) {
+    if (g_route_authority_active && tx_scheduler_start() != 0) {
         fprintf(stderr, "[Gateway] cannot start V1 transmit scheduler\n");
         return -ENOMEM;
     }

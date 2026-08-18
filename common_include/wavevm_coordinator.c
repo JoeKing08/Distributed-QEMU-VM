@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "wavevm_canonical.h"
+#include "wavevm_fault_engine.h"
 #include "wavevm_reservation_runtime.h"
 #include "wavevm_sha256.h"
 
@@ -245,6 +246,58 @@ static int build_admission_request(
     admission_request->host_overhead_memory_bytes =
         options->host_overhead_memory_bytes;
     return 0;
+}
+
+static const struct wvm_coordinator_node_launch_plan *find_node_launch_plan(
+    const struct wvm_coordinator_prepare_options *options,
+    uint32_t physical_node_id, uint64_t node_instance_id)
+{
+    size_t i;
+
+    if (!options || physical_node_id == 0 || node_instance_id == 0 ||
+        !options->node_launch_plans) {
+        return NULL;
+    }
+    for (i = 0; i < options->node_launch_plan_count; i++) {
+        const struct wvm_coordinator_node_launch_plan *entry =
+            &options->node_launch_plans[i];
+
+        if (entry->physical_node_id == physical_node_id &&
+            entry->expected_node_instance_id == node_instance_id) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int launch_plan_matches_request(
+    const struct wvm_node_runtime_launch_plan *launch_plan,
+    const struct wvm_vm_request *request,
+    const struct wvm_machine_config *guest_machine)
+{
+    const struct wvm_consistency_policy *policy;
+
+    if (!launch_plan || !request || !guest_machine) {
+        return 0;
+    }
+    policy = &launch_plan->consistency_policy;
+    return launch_plan->guest_total_memory_bytes ==
+               request->requested_memory_bytes &&
+           strcmp(launch_plan->guest_machine.architecture,
+                  guest_machine->architecture) == 0 &&
+           strcmp(launch_plan->guest_machine.machine_type,
+                  guest_machine->machine_type) == 0 &&
+           launch_plan->guest_machine.qemu_compat_version ==
+               guest_machine->qemu_compat_version &&
+           launch_plan->guest_machine.firmware_policy ==
+               guest_machine->firmware_policy &&
+           policy->dirty_batch_size == request->consistency_policy.dirty_batch_size &&
+           policy->handoff_commit_policy ==
+               request->consistency_policy.handoff_commit_policy &&
+           policy->subscriber_delivery_policy ==
+               request->consistency_policy.subscriber_delivery_policy &&
+           policy->max_commit_latency_ms ==
+               request->consistency_policy.max_commit_latency_ms;
 }
 
 static const struct wvm_capability_record *
@@ -718,7 +771,7 @@ int wvm_coordinator_begin(
         !transaction ||
         wvm_vm_request_validate(request, error, error_len) != 0 ||
         wvm_vm_namespace_allocate(namespace_allocator,
-                                  WVM_NAMESPACE_ABI_V1_U32, &vm_id,
+                                  WVM_NAMESPACE_ABI_U32, &vm_id,
                                   &vm_incarnation, error, error_len) != 0 ||
         id_provider->allocate_id16(id_provider->context,
                                    WVM_COORDINATOR_ID_ADMISSION_TX,
@@ -784,6 +837,8 @@ int wvm_coordinator_prepare(
                                     error_len) != 0 ||
         wvm_execution_fault_profile_validate(&options->execution_profile, error,
                                              error_len) != 0 ||
+        wvm_fault_engine_profile_validate(&options->execution_profile, error,
+                                          error_len) != 0 ||
         !request_allows_backend(request, options->execution_profile.backend) ||
         options->memory_chunk_bytes == 0 ||
         options->memory_chunk_bytes % WVM_MANIFEST_PAGE_BYTES != 0 ||
@@ -794,6 +849,8 @@ int wvm_coordinator_prepare(
         options->executor_class == 0 || options->node_runtime_role_bits == 0 ||
         options->candidate_created_at == 0 ||
         options->prepared_reservation_expiry_unix_time_ms == 0 ||
+        !options->node_launch_plans || options->node_launch_plan_count == 0 ||
+        !options->node_listener_plans || options->node_listener_plan_count == 0 ||
         !options->placement_plan_bytes ||
         options->placement_plan_bytes_capacity == 0 ||
         !options->candidate_manifest_bytes ||
@@ -850,7 +907,11 @@ int wvm_coordinator_prepare(
             ? 1
             : options->guest_numa_nodes;
     placement_options.executor_class = options->executor_class;
+    placement_options.kernel_accelerator_required =
+        options->execution_profile.kernel_accelerator_bits != 0;
     placement_options.route_scope_key = transaction->route_scope_key;
+    placement_options.listener_plans = options->node_listener_plans;
+    placement_options.listener_plan_count = options->node_listener_plan_count;
     if (wvm_admission_placement_plan_build(
             &constrained_snapshot.admission, &admission_request,
             &prepared_vm->admission_plan, prepared_vm->fence.fence_digest,
@@ -877,7 +938,7 @@ int wvm_coordinator_prepare(
             &prepared_vm->fence.selected_members.entries[i].capability;
 
         if (!find_available_capability(records, capability,
-                                       WVM_CAPABILITY_ID_V1_VM_ID_U32) ||
+                                       WVM_CAPABILITY_ID_VM_ID_U32) ||
             append_required_capability(&required_capabilities, capability,
                                        error, error_len) != 0) {
             set_error(error, error_len,
@@ -890,7 +951,7 @@ int wvm_coordinator_prepare(
     candidate.required_capabilities = required_capabilities;
     memcpy(candidate.manifest_id, transaction->manifest_id,
            sizeof(candidate.manifest_id));
-    candidate.manifest_schema_version = WVM_CANONICAL_SCHEMA_V1;
+    candidate.manifest_schema_version = WVM_CANONICAL_SCHEMA;
     candidate.vm_id = transaction->vm_id;
     candidate.vm_incarnation = transaction->vm_incarnation;
     candidate.manifest_generation = transaction->manifest_generation;
@@ -919,7 +980,7 @@ int wvm_coordinator_prepare(
     memcpy(candidate.plan_digest, prepared_vm->placement_plan.plan_digest,
            sizeof(candidate.plan_digest));
     candidate.lifecycle_policy = request->lifecycle_policy;
-    candidate.namespace_abi = WVM_MANIFEST_NAMESPACE_V1_U32;
+    candidate.namespace_abi = WVM_MANIFEST_NAMESPACE_U32;
     memset(&local_name_identity, 0, sizeof(local_name_identity));
     local_name_identity.vm_id = candidate.vm_id;
     local_name_identity.vm_incarnation = candidate.vm_incarnation;
@@ -960,11 +1021,26 @@ int wvm_coordinator_prepare(
         struct wvm_node_runtime_manifest *runtime_manifest =
             &prepared_vm->node_runtime_manifests[
                 prepared_vm->node_runtime_manifest_count];
+        const struct wvm_coordinator_node_launch_plan *launch_plan;
         uint64_t local_role_bits = options->node_runtime_role_bits;
 
         if (candidate.reservation_requirements.entries[i].physical_node_id ==
             candidate.host_node) {
             local_role_bits |= options->host_extra_role_bits;
+        }
+        launch_plan = find_node_launch_plan(
+            options,
+            candidate.reservation_requirements.entries[i].physical_node_id,
+            candidate.reservation_requirements.entries[i].node_instance_id);
+        if (!launch_plan ||
+            wvm_node_runtime_launch_plan_validate(&launch_plan->launch_plan,
+                                                  error, error_len) != 0 ||
+            !launch_plan_matches_request(&launch_plan->launch_plan, request,
+                                         &options->guest_machine)) {
+            set_error(error, error_len,
+                      "coordinator node launch plan is invalid or mismatched");
+            abort_registered_reservations(prepared_vm);
+            return -1;
         }
         if (wvm_resource_reservation_derive(
                 &candidate.reservation_requirements.entries[i], &candidate,
@@ -973,7 +1049,8 @@ int wvm_coordinator_prepare(
                 error_len) != 0 ||
             wvm_node_runtime_manifest_project(
                 &candidate, prepared_vm->candidate_manifest_digest, reservation,
-                NULL, local_role_bits, runtime_manifest, error, error_len) !=
+                NULL, &launch_plan->launch_plan, local_role_bits,
+                runtime_manifest, error, error_len) !=
                 0 ||
             fill_startup_dependencies(&candidate, runtime_manifest, error,
                                       error_len) != 0 ||
@@ -1057,6 +1134,7 @@ int wvm_coordinator_decide_activation(
         options->decided_at, error, error_len);
 }
 
+
 int wvm_coordinator_commit_local(
     const struct wvm_coordinator_transaction *transaction,
     struct wvm_coordinator_prepared_vm *prepared_vm,
@@ -1130,7 +1208,8 @@ int wvm_coordinator_commit_local(
             wvm_node_runtime_manifest_project(
                 &prepared_vm->candidate,
                 prepared_vm->candidate_manifest_digest, reservation, activation,
-                local_role_bits, runtime_manifest, error, error_len) != 0 ||
+                NULL, local_role_bits, runtime_manifest, error, error_len) !=
+                0 ||
             fill_startup_dependencies(&prepared_vm->candidate, runtime_manifest,
                                       error, error_len) != 0 ||
             wvm_node_runtime_manifest_validate(runtime_manifest, error,

@@ -14,6 +14,7 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_sha256.c" \
     "$repo_root/common_include/wavevm_canonical.c" \
     "$repo_root/common_include/wavevm_identity.c" \
+    "$repo_root/common_include/wavevm_runtime_names.c" \
     "$repo_root/common_include/wavevm_manifest.c" \
     "$repo_root/common_include/wavevm_control.c" \
     "$repo_root/common_include/wavevm_capability.c" \
@@ -21,6 +22,9 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_admission.c" \
     "$repo_root/common_include/wavevm_cluster.c" \
     "$repo_root/common_include/wavevm_reservation_runtime.c" \
+    "$repo_root/common_include/wavevm_fault_engine.c" \
+    "$repo_root/common_include/wavevm_admission_orchestrator.c" \
+    "$repo_root/common_include/wavevm_admission_recovery.c" \
     "$repo_root/common_include/wavevm_coordinator.c" \
     "$repo_root/common_include/wavevm_control_plane.c" \
     "$repo_root/tests/control-plane/test_coordinator.c" \

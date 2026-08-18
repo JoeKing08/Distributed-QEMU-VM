@@ -229,6 +229,11 @@ accept an old reservation merely because its instance still matches. A gateway
 in `DRAINING` is eligible only for predecessor-generation drain traffic and
 cannot satisfy a new candidate's normal route ACK set.
 
+`AdmissionEligibilityFence` carries `admission_eligibility_revision` as a
+separate canonical field in addition to membership and topology revisions.
+Health, capability, and pending-drain changes must therefore invalidate an
+unfinished candidate even when the registered topology did not change.
+
 ## 5. Controlled Operations
 
 ### 5.1 Join a Compute Node
@@ -274,9 +279,12 @@ Readiness includes route-snapshot validation and the required peer acknowledgeme
 
 ### 5.3 Cordon and Drain a Compute Node
 
-`CORDONED` immediately advances admission eligibility and prevents unfinished
-candidate admission from using the compute role while allowing existing
-allocations to finish or be examined. A request to enter `DRAINING` must
+For a compute member, `CORDONED` immediately advances admission eligibility
+and prevents unfinished candidate admission from using the compute role while
+allowing existing allocations to finish or be examined. For a gateway member,
+it prevents new admission or successor-route selection from naming that
+gateway while retaining already committed route snapshots for existing
+traffic; it does not rewrite those snapshots. A request to enter `DRAINING` must
 enumerate every dependent VM allocation, including vCPU execution, memory
 owner/directory duties, storage work, required local control duties, and every
 hosted gateway role if the physical host itself is being removed.
@@ -294,6 +302,27 @@ gateway is excluded from the successor's `RequiredAckSet`; it may report an
 optional predecessor-drain status, but its silence cannot block successor
 commit. New normal traffic changes only after every surviving required source
 has prepared the same snapshot key/digest.
+
+The implemented V1 controller primitive is deliberately fail-closed and
+bounded to one affected VM route scope. It accepts a drain only when the
+departing healthy `ACTIVE` gateway has exactly one registered dependency for
+that VM incarnation, the successor has `topology_revision = current + 1`, the
+predecessor is a currently activated snapshot for the same scope, the
+departing gateway appears exactly once in the optional predecessor-drain set,
+and no successor next hop or required ACK names that gateway. Larger
+multi-scope drains must be represented as an explicit aggregate transaction;
+they must not publish a subset of replacement paths.
+
+The controller first durably records the successor `RouteTransaction`, then
+durably reserves its next topology revision in the gateway-drain plan and
+advances `admission_eligibility_revision`. Registration, removal, and any
+other topology-changing drain are rejected while that reservation is live.
+Only ACKs for that one reserved successor may proceed. Its composite commit is
+one durable frame that activates the successor and its required ACK states,
+marks the gateway `DRAINING`, advances membership/topology/eligibility
+revisions, and stamps all records. A crash after the ordinary route prepare
+but before the drain plan leaves an orphan future-topology route that cannot
+ACK or commit; recovery permits only an explicit abort of that route.
 
 The predecessor is retained until every operation reference completes or its
 documented query/retry horizon expires with a typed result. A fixed arbitrary
@@ -475,6 +504,7 @@ completion from a member process still being alive.
 | Current code | Current behavior | Required migration direction |
 | --- | --- | --- |
 | `common_include/wavevm_resources.c` | Parses static `NODE` records and allocates sequential vnode ranges at startup. | Import as bootstrap input into the control-plane registry; do not make it the long-term authority. |
+| `common_include/wavevm_membership_controller.c` and `wavevm_membership_control.c` | The authority persists authenticated node/gateway registration, desired and observed member state, dependency counts, route prepare/ACK/commit/retire decisions, one-scope fail-closed gateway-drain prepare/commit/abort frames, and fenced compute/gateway cordon transitions. The V1 receiver exposes canonical `GatewayDrainRequest` and `MemberCordonRequest` only to transport-authenticated `EXECUTOR` actors accepted by separately configured route-management and membership-management callbacks, and durably replays successful registration, rejoin, drain, and cordon results. | Extend the bounded one-scope drain into an explicit aggregate transaction before permitting multi-scope gateway or host drains. Bind both management authorization callbacks to the real executor/control-plane trust domain rather than test adapters. The coordinator/topology owner captures deep-copied controller records, then combines that immutable membership revision with separately owned capability and reservation evidence. It must not construct runtime membership from `NODE`/`ROUTE` files. |
 | `gateway_service/aggregator.c` | Parses `ROUTE` groups, learns addresses, and offers an in-place route add/update control path. | Consume prepared immutable snapshots; do not infer membership from packet source or modify live maps as membership operations. |
 | `master_core/user_backend.c` | Uses a fixed `WVM_MAX_GATEWAYS` table and sends through a local sidecar. | Keep only local sidecar/derived next-hop state in the node runtime; remove global flat-target assumptions after the route-scope contract exists. |
 | `master_core/kernel_backend.c` | Holds module-global route state keyed by current fixed limits. | Convert to versioned per-VM accelerator cache after `kernel-accelerator.md`; it cannot be membership truth. |

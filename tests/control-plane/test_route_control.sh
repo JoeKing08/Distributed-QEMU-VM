@@ -12,7 +12,7 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_identity.c" \
     "$repo_root/common_include/wavevm_manifest.c" \
     "$repo_root/common_include/wavevm_control.c" \
-    "$repo_root/common_include/wavevm_envelope_v1.c" \
+    "$repo_root/common_include/wavevm_envelope.c" \
     "$repo_root/common_include/wavevm_route_runtime.c" \
     "$repo_root/common_include/wavevm_route_control.c" \
     "$repo_root/tests/control-plane/test_route_control.c" \

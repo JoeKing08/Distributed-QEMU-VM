@@ -16,7 +16,7 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_lifecycle.c" \
     "$repo_root/common_include/wavevm_control.c" \
     "$repo_root/common_include/wavevm_runtime_gate.c" \
-    "$repo_root/common_include/wavevm_envelope_v1.c" \
+    "$repo_root/common_include/wavevm_envelope.c" \
     "$repo_root/common_include/wavevm_route_delivery.c" \
     "$repo_root/tests/control-plane/test_gateway_route_control_integration.c" \
     -pthread -o "$tmpdir/test_gateway_route_control_integration"

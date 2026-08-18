@@ -33,8 +33,8 @@
 #include "exec/ram_addr.h"
 
 #include "../../../common_include/wavevm_protocol.h"
-#include "../../../common_include/wavevm_local_memory_v1.h"
-#include "../../../common_include/wavevm_memory_v1.h"
+#include "../../../common_include/wavevm_local_memory.h"
+#include "../../../common_include/wavevm_memory.h"
 #include "wavevm-runtime-registration.h"
 
 /*
@@ -57,7 +57,7 @@ static int g_client_sync_batch = 1024; // 当前生效的 Batch
 static int g_min_batch = 1;            // 下限
 static int g_max_batch = 8192;         // 上限
 static int g_enable_auto_tuning = 1;   // 开关：1=自动, 0=固定(强一致用)
-static _Atomic uint64_t g_v1_operation_sequence = 1;
+static _Atomic uint64_t g_operation_sequence = 1;
 
 static uint64_t get_us_time(void);
 static uint64_t get_local_page_version(uint64_t gpa);
@@ -617,10 +617,10 @@ static void write_be64(uint8_t output[8], uint64_t value)
  * gets a process-scoped, never-reused ID.  After sequence exhaustion QEMU
  * fails the request instead of wrapping into an older operation identity.
  */
-static int make_v1_operation_id(
+static int make_operation_id(
     uint8_t operation_id[WVM_IDENTITY_ID_BYTES])
 {
-    uint64_t current = atomic_load_explicit(&g_v1_operation_sequence,
+    uint64_t current = atomic_load_explicit(&g_operation_sequence,
                                             memory_order_relaxed);
 
     for (;;) {
@@ -631,7 +631,7 @@ static int make_v1_operation_id(
         }
         next = current == UINT64_MAX ? 0 : current + 1U;
         if (atomic_compare_exchange_weak_explicit(
-                &g_v1_operation_sequence, &current, next,
+                &g_operation_sequence, &current, next,
                 memory_order_relaxed, memory_order_relaxed)) {
             write_be64(operation_id, (uint64_t)(uint32_t)getpid());
             write_be64(operation_id + 8, current);
@@ -640,7 +640,7 @@ static int make_v1_operation_id(
     }
 }
 
-static int parse_v1_u64_env(const char *name, uint64_t *value)
+static int parse_u64_env(const char *name, uint64_t *value)
 {
     const char *text = getenv(name);
     char *end = NULL;
@@ -658,19 +658,19 @@ static int parse_v1_u64_env(const char *name, uint64_t *value)
     return 0;
 }
 
-static int fill_v1_commit_reply_destination(
-    struct wvm_v1_mem_commit *commit)
+static int fill_commit_reply_destination(
+    struct wvm_mem_commit *commit)
 {
     uint64_t kind;
     uint64_t scope;
     uint64_t vnode;
 
     if (!commit ||
-        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_KIND",
+        parse_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_KIND",
                          &kind) != 0 ||
-        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_SCOPE",
+        parse_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_SCOPE",
                          &scope) != 0 ||
-        parse_v1_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_VNODE",
+        parse_u64_env("WVM_RUNTIME_LOCAL_PRIMARY_DESTINATION_VNODE",
                          &vnode) != 0 ||
         kind > UINT16_MAX || vnode > UINT32_MAX) {
         return -EINVAL;
@@ -681,36 +681,36 @@ static int fill_v1_commit_reply_destination(
     return 0;
 }
 
-static int v1_ack_status_to_errno(uint16_t status)
+static int ack_status_to_errno(uint16_t status)
 {
     switch (status) {
-    case WVM_V1_MEM_ACK_SUCCESS:
+    case WVM_MEM_ACK_SUCCESS:
         return 0;
-    case WVM_V1_MEM_ACK_STALE:
+    case WVM_MEM_ACK_STALE:
         return -ESTALE;
-    case WVM_V1_MEM_ACK_NOT_FOUND:
+    case WVM_MEM_ACK_NOT_FOUND:
         return -ENOENT;
-    case WVM_V1_MEM_ACK_BACKPRESSURE:
+    case WVM_MEM_ACK_BACKPRESSURE:
         return -EAGAIN;
-    case WVM_V1_MEM_ACK_INTERNAL_FAILURE:
+    case WVM_MEM_ACK_INTERNAL_FAILURE:
         return -EIO;
     default:
         return -EPROTO;
     }
 }
 
-static int v1_commit_status_to_errno(uint16_t status)
+static int commit_status_to_errno(uint16_t status)
 {
     switch (status) {
-    case WVM_V1_MEM_COMMIT_ACK_SUCCESS:
+    case WVM_MEM_COMMIT_ACK_SUCCESS:
         return 0;
-    case WVM_V1_MEM_COMMIT_ACK_STALE_BASE_VERSION:
+    case WVM_MEM_COMMIT_ACK_STALE_BASE_VERSION:
         return -ESTALE;
-    case WVM_V1_MEM_COMMIT_ACK_NOT_FOUND:
+    case WVM_MEM_COMMIT_ACK_NOT_FOUND:
         return -ENOENT;
-    case WVM_V1_MEM_COMMIT_ACK_BACKPRESSURE:
+    case WVM_MEM_COMMIT_ACK_BACKPRESSURE:
         return -EAGAIN;
-    case WVM_V1_MEM_COMMIT_ACK_INTERNAL_FAILURE:
+    case WVM_MEM_COMMIT_ACK_INTERNAL_FAILURE:
         return -EIO;
     default:
         return -EPROTO;
@@ -722,30 +722,30 @@ static int v1_commit_status_to_errno(uint16_t status)
  * local IPC connection. The caller owns the connection lifecycle; this
  * helper only validates and exchanges one request/result pair.
  */
-static int request_v1_commit_on_fd(
+static int request_commit_on_fd(
     int fd, uint64_t gpa, uint64_t base_version, uint16_t offset,
     const uint8_t *data, size_t data_bytes,
-    struct wvm_v1_mem_commit_ack *ack_out)
+    struct wvm_mem_commit_ack *ack_out)
 {
-    struct wvm_local_memory_v1_commit_request request;
-    struct wvm_local_memory_v1_commit_result result;
+    struct wvm_local_memory_commit_request request;
+    struct wvm_local_memory_commit_result result;
     wvm_ipc_header_t header;
-    uint8_t request_bytes[WVM_LOCAL_MEMORY_V1_COMMIT_REQUEST_HEADER_BYTES +
-                          WVM_V1_MEMORY_PAGE_BYTES];
-    uint8_t result_bytes[WVM_LOCAL_MEMORY_V1_COMMIT_RESULT_BYTES];
+    uint8_t request_bytes[WVM_LOCAL_MEMORY_COMMIT_REQUEST_HEADER_BYTES +
+                          WVM_MEMORY_PAGE_BYTES];
+    uint8_t result_bytes[WVM_LOCAL_MEMORY_COMMIT_RESULT_BYTES];
     size_t request_bytes_count = 0;
     char error[160] = {0};
     int status;
 
     if (fd < 0 || !data || !ack_out || base_version == 0 ||
-        gpa % WVM_V1_MEMORY_PAGE_BYTES != 0 || data_bytes == 0 ||
-        data_bytes > WVM_V1_MEMORY_PAGE_BYTES ||
-        offset > WVM_V1_MEMORY_PAGE_BYTES - data_bytes) {
+        gpa % WVM_MEMORY_PAGE_BYTES != 0 || data_bytes == 0 ||
+        data_bytes > WVM_MEMORY_PAGE_BYTES ||
+        offset > WVM_MEMORY_PAGE_BYTES - data_bytes) {
         return -EINVAL;
     }
     memset(&request, 0, sizeof(request));
     memset(&result, 0, sizeof(result));
-    if (make_v1_operation_id(request.operation_id) != 0) {
+    if (make_operation_id(request.operation_id) != 0) {
         return -EOVERFLOW;
     }
     request.delivery_attempt_id = 1;
@@ -755,18 +755,18 @@ static int request_v1_commit_on_fd(
     request.commit.size = (uint16_t)data_bytes;
     request.commit.data = data;
     request.commit.data_bytes = data_bytes;
-    if (fill_v1_commit_reply_destination(&request.commit) != 0 ||
-        wvm_local_memory_v1_commit_request_encode(
+    if (fill_commit_reply_destination(&request.commit) != 0 ||
+        wvm_local_memory_commit_request_encode(
             &request, request_bytes, sizeof(request_bytes),
             &request_bytes_count, error, sizeof(error)) != 0) {
         return -EPROTO;
     }
-    header.type = WVM_IPC_TYPE_MEM_COMMIT_V1;
+    header.type = WVM_IPC_TYPE_TYPED_MEM_COMMIT;
     header.len = (uint32_t)request_bytes_count;
     if (write_all_fd(fd, &header, sizeof(header)) < 0 ||
         write_all_fd(fd, request_bytes, request_bytes_count) < 0 ||
         read_exact(fd, result_bytes, sizeof(result_bytes)) < 0 ||
-        wvm_local_memory_v1_commit_result_decode(
+        wvm_local_memory_commit_result_decode(
             result_bytes, &result, error, sizeof(error)) != 0 ||
         memcmp(result.operation_id, request.operation_id,
                sizeof(request.operation_id)) != 0 ||
@@ -774,7 +774,7 @@ static int request_v1_commit_on_fd(
         return -EIO;
     }
     *ack_out = result.ack;
-    status = v1_commit_status_to_errno(result.ack.status);
+    status = commit_status_to_errno(result.ack.status);
     return status;
 }
 
@@ -783,22 +783,22 @@ static int request_v1_commit_on_fd(
  * are both typed V1 records; a zero result length means node runtime failed
  * before it received a directory ACK.
  */
-static int request_v1_page_over_ipc(
-    uint64_t gpa, struct wvm_v1_mem_ack *ack_out,
-    uint8_t page[WVM_V1_MEMORY_PAGE_BYTES])
+static int request_page_over_ipc(
+    uint64_t gpa, struct wvm_mem_ack *ack_out,
+    uint8_t page[WVM_MEMORY_PAGE_BYTES])
 {
-    struct wvm_local_memory_v1_fault_request request;
+    struct wvm_local_memory_fault_request request;
     wvm_ipc_header_t header;
-    uint8_t request_bytes[WVM_LOCAL_MEMORY_V1_FAULT_REQUEST_BYTES];
-    uint8_t result_length[WVM_LOCAL_MEMORY_V1_RESULT_LENGTH_BYTES];
-    uint8_t ack_bytes[WVM_V1_MEM_ACK_HEADER_BYTES +
-                      WVM_V1_MEMORY_PAGE_BYTES];
+    uint8_t request_bytes[WVM_LOCAL_MEMORY_FAULT_REQUEST_BYTES];
+    uint8_t result_length[WVM_LOCAL_MEMORY_RESULT_LENGTH_BYTES];
+    uint8_t ack_bytes[WVM_MEM_ACK_HEADER_BYTES +
+                      WVM_MEMORY_PAGE_BYTES];
     size_t ack_bytes_count = 0;
-    struct wvm_v1_mem_ack decoded_ack;
+    struct wvm_mem_ack decoded_ack;
     char error[160] = {0};
     int result;
 
-    if (!ack_out || !page || gpa % WVM_V1_MEMORY_PAGE_BYTES != 0) {
+    if (!ack_out || !page || gpa % WVM_MEMORY_PAGE_BYTES != 0) {
         return -EINVAL;
     }
     if (t_com_sock == -1) {
@@ -808,22 +808,22 @@ static int request_v1_page_over_ipc(
         }
     }
     memset(&request, 0, sizeof(request));
-    result = make_v1_operation_id(request.operation_id);
+    result = make_operation_id(request.operation_id);
     if (result != 0) {
         return result;
     }
     request.delivery_attempt_id = 1;
     request.gpa = gpa;
-    if (wvm_local_memory_v1_fault_request_encode(
+    if (wvm_local_memory_fault_request_encode(
             &request, request_bytes, error, sizeof(error)) != 0) {
         return -EPROTO;
     }
-    header.type = WVM_IPC_TYPE_MEM_FAULT_V1;
+    header.type = WVM_IPC_TYPE_TYPED_MEM_FAULT;
     header.len = sizeof(request_bytes);
     if (write_all_fd(t_com_sock, &header, sizeof(header)) < 0 ||
         write_all_fd(t_com_sock, request_bytes, sizeof(request_bytes)) < 0 ||
         read_exact(t_com_sock, result_length, sizeof(result_length)) < 0 ||
-        wvm_local_memory_v1_result_length_decode(
+        wvm_local_memory_result_length_decode(
             result_length, &ack_bytes_count, error, sizeof(error)) != 0) {
         close(t_com_sock);
         t_com_sock = -1;
@@ -833,16 +833,16 @@ static int request_v1_page_over_ipc(
         return -EIO;
     }
     if (read_exact(t_com_sock, ack_bytes, ack_bytes_count) < 0 ||
-        wvm_v1_mem_ack_decode(ack_bytes, ack_bytes_count, &decoded_ack,
+        wvm_mem_ack_decode(ack_bytes, ack_bytes_count, &decoded_ack,
                               error, sizeof(error)) != 0 ||
         decoded_ack.gpa != gpa) {
         close(t_com_sock);
         t_com_sock = -1;
         return -EPROTO;
     }
-    if (decoded_ack.status == WVM_V1_MEM_ACK_SUCCESS) {
+    if (decoded_ack.status == WVM_MEM_ACK_SUCCESS) {
         memcpy(page, decoded_ack.data, sizeof(page[0]) *
-                                      WVM_V1_MEMORY_PAGE_BYTES);
+                                      WVM_MEMORY_PAGE_BYTES);
         decoded_ack.data = page;
     }
     *ack_out = decoded_ack;
@@ -854,12 +854,12 @@ static int internal_connect_master_role(uint32_t role) {
     if (sock < 0) return -1;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
 
-    const char *env_path = getenv("WVM_ENV_SOCK_PATH");
+    const char *env_path = wavevm_qemu_runtime_socket_path();
     if (!env_path) {
-        char *inst_id = getenv("WVM_INSTANCE_ID");
-        static char fallback_path[128];
-        snprintf(fallback_path, sizeof(fallback_path), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
-        env_path = fallback_path;
+        fprintf(stderr,
+                "[WaveVM-User] manifest-derived QEMU socket path is missing\n");
+        close(sock);
+        return -1;
     }
     strncpy(addr.sun_path, env_path, sizeof(addr.sun_path) - 1);
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -909,7 +909,7 @@ static int ensure_local_shm_shadow(void)
 
     const char *shm_path = getenv("WVM_SHM_FILE");
     if (!shm_path) {
-        shm_path = "/wavevm_ram";
+        return -1;
     }
 
     int shm_fd = shm_open(shm_path, O_RDWR, 0666);
@@ -1016,9 +1016,9 @@ int wavevm_user_mem_sync_page(uint64_t gpa)
 
     /* 使用线程局部 IPC socket (与 request_page_sync Master 路径相同) */
     if (!g_is_slave) {
-        struct wvm_v1_mem_ack ack;
-        uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
-        int result = request_v1_page_over_ipc(gpa, &ack, page);
+        struct wvm_mem_ack ack;
+        uint8_t page[WVM_MEMORY_PAGE_BYTES];
+        int result = request_page_over_ipc(gpa, &ack, page);
 
         if (result != 0) {
             fprintf(stderr,
@@ -1026,14 +1026,14 @@ int wavevm_user_mem_sync_page(uint64_t gpa)
                     PRIx64 "\n", gpa);
             return result;
         }
-        result = v1_ack_status_to_errno(ack.status);
+        result = ack_status_to_errno(ack.status);
         if (result == 0) {
             void *fetch_hva = gpa_to_hva_safe(gpa);
             if (!fetch_hva) {
                 return -EFAULT;
             }
             mprotect(fetch_hva, 4096, PROT_READ | PROT_WRITE);
-            memcpy(fetch_hva, ack.data, WVM_V1_MEMORY_PAGE_BYTES);
+            memcpy(fetch_hva, ack.data, WVM_MEMORY_PAGE_BYTES);
             /* KVM 模式下不降权：脏页由 dirty log 跟踪，
              * mprotect(PROT_READ) 会导致 EPT 违例 → exit=17 */
             set_local_page_version(gpa, ack.version);
@@ -1064,10 +1064,6 @@ static void kvm_proactive_page_fetch(uint64_t gpa)
 // =============================================================
 
 static int request_page_sync(uintptr_t fault_addr, bool is_write) {
-    /* KVM guard: under KVM, pages are never PROT_NONE so this path should
-     * never be reached.  Return success as defense-in-depth. */
-    if (kvm_enabled()) return 0;
-
     uint64_t gpa = hva_to_gpa_safe(fault_addr);
     if (gpa == (uint64_t)-1) return -1;
     gpa &= ~4095ULL;
@@ -1097,19 +1093,19 @@ static int request_page_sync(uintptr_t fault_addr, bool is_write) {
         }
 
         {
-            struct wvm_v1_mem_ack ack;
-            uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
-            int result = request_v1_page_over_ipc(gpa, &ack, page);
+            struct wvm_mem_ack ack;
+            uint8_t page[WVM_MEMORY_PAGE_BYTES];
+            int result = request_page_over_ipc(gpa, &ack, page);
 
             if (result != 0) {
                 return result;
             }
-            result = v1_ack_status_to_errno(ack.status);
+            result = ack_status_to_errno(ack.status);
             if (result != 0) {
                 return result;
             }
             mprotect((void *)aligned_addr, 4096, PROT_READ | PROT_WRITE);
-            memcpy((void *)aligned_addr, ack.data, WVM_V1_MEMORY_PAGE_BYTES);
+            memcpy((void *)aligned_addr, ack.data, WVM_MEMORY_PAGE_BYTES);
             set_local_page_version(gpa, ack.version); // 同步版本
             return 0;
         }
@@ -1657,10 +1653,10 @@ int wavevm_user_mem_flush_dirty_to_ipc(int ipc_fd,
                 return -ENOMEM;
             }
             if (wavevm_qemu_runtime_gate_enabled()) {
-                struct wvm_v1_mem_commit_ack ack;
-                int commit_ret = request_v1_commit_on_fd(
+                struct wvm_mem_commit_ack ack;
+                int commit_ret = request_commit_on_fd(
                     ipc_fd, gpa, cur_ver, 0, hva,
-                    WVM_V1_MEMORY_PAGE_BYTES, &ack);
+                    WVM_MEMORY_PAGE_BYTES, &ack);
 
                 if (commit_ret == 0) {
                     ver = ack.result_version;
@@ -1959,7 +1955,7 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
     uint64_t *seen = NULL;
     size_t seen_count = 0;
     size_t seen_capacity = 0;
-    const bool use_v1_commit = wavevm_qemu_runtime_gate_enabled();
+    const bool use_commit = wavevm_qemu_runtime_gate_enabled();
 
     for (WritablePage *curr = batch_head; curr; curr = curr->next) {
         bool duplicate = false;
@@ -2012,8 +2008,8 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
          * pages such as kernel stacks do not depend on a lossless chain of
          * intermediate partial diffs.
          */
-        if (use_v1_commit) {
-            struct wvm_v1_mem_commit_ack ack;
+        if (use_commit) {
+            struct wvm_mem_commit_ack ack;
             uint64_t base_version = get_local_page_version(curr->gpa);
             int commit_ret;
 
@@ -2023,9 +2019,9 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
                 if (t_com_sock < 0) {
                     t_com_sock = internal_connect_master();
                 }
-                commit_ret = request_v1_commit_on_fd(
+                commit_ret = request_commit_on_fd(
                     t_com_sock, curr->gpa, base_version, 0,
-                    current_snapshot, WVM_V1_MEMORY_PAGE_BYTES, &ack);
+                    current_snapshot, WVM_MEMORY_PAGE_BYTES, &ack);
             }
             if (commit_ret != 0) {
                 ram_addr_t ra = qemu_ram_addr_from_host(page_addr);
@@ -2047,7 +2043,7 @@ static int process_writable_batch_full_snapshot(WritablePage *batch_head,
     }
 
     free(seen);
-    if (!use_v1_commit) {
+    if (!use_commit) {
         flush_aggregator();
     }
     return first_error != 0 ? first_error : committed;

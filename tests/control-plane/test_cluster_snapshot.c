@@ -44,7 +44,7 @@ static void fill_capability(struct wvm_capability_record *record,
 {
     memset(record, 0, sizeof(*record));
     record->capability_id = capability_id;
-    record->capability_schema_version = WVM_CANONICAL_SCHEMA_V1;
+    record->capability_schema_version = WVM_CANONICAL_SCHEMA;
     record->physical_node_id = node_id;
     record->node_instance_id = node_instance;
     record->provider_instance_id = provider;
@@ -178,6 +178,7 @@ int main(void)
     records.inventory_revision = 10;
     records.membership_revision = 5;
     records.topology_revision = 6;
+    records.admission_eligibility_revision = 7;
     records.capability_profile_generation = 9;
     if (expect(wvm_cluster_snapshot_build(&records, &snapshot, error,
                                           sizeof(error)) == 0,

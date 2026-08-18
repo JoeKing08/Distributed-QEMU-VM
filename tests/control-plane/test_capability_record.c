@@ -39,7 +39,7 @@ int main(void)
 
     memset(&record, 0, sizeof(record));
     record.capability_id = 1;
-    record.capability_schema_version = WVM_CANONICAL_SCHEMA_V1;
+    record.capability_schema_version = WVM_CANONICAL_SCHEMA;
     record.physical_node_id = 17;
     record.node_instance_id = 101;
     record.provider_instance_id = 2001;

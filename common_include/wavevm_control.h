@@ -16,6 +16,8 @@
 #define WVM_RECORD_GATEWAY_RECORD 0x100dU
 #define WVM_RECORD_ADMISSION_ELIGIBILITY_FENCE 0x100eU
 #define WVM_RECORD_ROUTE_TRANSACTION 0x1020U
+#define WVM_RECORD_GATEWAY_DRAIN_REQUEST 0x102bU
+#define WVM_RECORD_MEMBER_CORDON_REQUEST 0x102cU
 
 #define WVM_ENDPOINT_ADDRESS_MAX_BYTES 16U
 #define WVM_ENDPOINT_SERVER_NAME_MAX_BYTES 253U
@@ -39,6 +41,12 @@ enum wvm_route_destination_kind {
 enum wvm_route_next_hop_kind {
     WVM_ROUTE_NEXT_HOP_ENDPOINT = 1,
     WVM_ROUTE_NEXT_HOP_GATEWAY = 2,
+};
+
+enum wvm_gateway_drain_action {
+    WVM_GATEWAY_DRAIN_ACTION_PREPARE = 1,
+    WVM_GATEWAY_DRAIN_ACTION_COMMIT = 2,
+    WVM_GATEWAY_DRAIN_ACTION_ABORT = 3,
 };
 
 struct wvm_endpoint {
@@ -164,6 +172,7 @@ struct wvm_admission_eligibility_fence {
     uint8_t admission_tx_id[WVM_IDENTITY_ID_BYTES];
     uint64_t membership_revision;
     uint64_t topology_revision;
+    uint64_t admission_eligibility_revision;
     uint64_t inventory_revision;
     uint64_t capability_profile_generation;
     struct wvm_required_member_list selected_members;
@@ -181,6 +190,33 @@ struct wvm_route_transaction_record {
     struct wvm_required_ack_entry_list optional_departure_drain_set;
     uint64_t operation_retention_horizon_ms;
     uint16_t state;
+};
+
+/*
+ * PREPARE embeds the complete immutable successor material. COMMIT and ABORT
+ * carry the same target, revision fence, and route operation ID, but omit
+ * successor_transaction and successor_snapshot.
+ *
+ * Decode callers provide storage for the nested list fields in the two
+ * successor records before calling wvm_gateway_drain_request_decode().
+ */
+struct wvm_gateway_drain_request {
+    enum wvm_gateway_drain_action action;
+    struct wvm_member_key target_gateway_member_key;
+    uint64_t expected_membership_revision;
+    uint64_t expected_topology_revision;
+    uint64_t expected_admission_eligibility_revision;
+    uint8_t route_operation_id[WVM_IDENTITY_ID_BYTES];
+    struct wvm_route_transaction_record successor_transaction;
+    struct wvm_route_snapshot_record successor_snapshot;
+};
+
+struct wvm_member_cordon_request {
+    struct wvm_member_key target_member_key;
+    uint64_t expected_membership_revision;
+    uint64_t expected_topology_revision;
+    uint64_t expected_admission_eligibility_revision;
+    uint16_t reason_code;
 };
 
 int wvm_endpoint_validate(const struct wvm_endpoint *endpoint, char *error,
@@ -266,5 +302,25 @@ int wvm_route_transaction_record_decode(
     const uint8_t *bytes, size_t encoded_bytes,
     struct wvm_route_transaction_record *transaction, char *error,
     size_t error_len);
+
+int wvm_gateway_drain_request_validate(
+    const struct wvm_gateway_drain_request *request, char *error,
+    size_t error_len);
+int wvm_gateway_drain_request_encode(
+    const struct wvm_gateway_drain_request *request, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len);
+int wvm_gateway_drain_request_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_gateway_drain_request *request, char *error, size_t error_len);
+
+int wvm_member_cordon_request_validate(
+    const struct wvm_member_cordon_request *request, char *error,
+    size_t error_len);
+int wvm_member_cordon_request_encode(
+    const struct wvm_member_cordon_request *request, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len);
+int wvm_member_cordon_request_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_member_cordon_request *request, char *error, size_t error_len);
 
 #endif /* WAVEVM_CONTROL_H */

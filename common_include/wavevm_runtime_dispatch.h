@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #include "wavevm_cluster.h"
-#include "wavevm_envelope_v1.h"
+#include "wavevm_envelope.h"
 #include "wavevm_route_delivery.h"
 
 #define WVM_RECORD_RUNTIME_DISPATCH_PROJECTION 0x1028U

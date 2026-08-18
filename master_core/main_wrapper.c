@@ -37,9 +37,11 @@
 #include "../common_include/wavevm_route_delivery.h"
 #include "../common_include/wavevm_runtime_dispatch.h"
 #include "../common_include/wavevm_runtime_gate.h"
-#include "../common_include/wavevm_local_memory_v1.h"
-#include "../common_include/wavevm_memory_v1.h"
-#include "../node_runtime/memory_service_v1.h"
+#include "../common_include/wavevm_runtime_names.h"
+#include "../common_include/wavevm_local_memory.h"
+#include "../common_include/wavevm_memory.h"
+#include "../node_runtime/memory_service.h"
+#include "../node_runtime/vcpu_service.h"
 
 // --- 全局状态 ---
 extern struct dsm_driver_ops u_ops;
@@ -187,7 +189,7 @@ static int runtime_dispatch_populate_legacy_memory_cache(
         if (entry->gpa_start % legacy_chunk_bytes != 0 ||
             entry->bytes % legacy_chunk_bytes != 0 ||
             entry->directory.destination_kind !=
-                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+                WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE ||
             entry->directory.destination_scope != 0) {
             return 0;
         }
@@ -223,7 +225,7 @@ static int runtime_dispatch_legacy_vnode_count(
     if (!dispatch || !count_out ||
         dispatch->route_topology_kind != WVM_ROUTE_TOPOLOGY_FLAT ||
         dispatch->local_primary.destination_kind !=
-            WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+            WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE ||
         dispatch->local_primary.destination_scope != 0) {
         return -1;
     }
@@ -233,7 +235,7 @@ static int runtime_dispatch_legacy_vnode_count(
             &dispatch->cpu_dispatch.entries[i].executor;
 
         if (destination->destination_kind !=
-                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+                WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE ||
             destination->destination_scope != 0) {
             return -1;
         }
@@ -246,10 +248,10 @@ static int runtime_dispatch_legacy_vnode_count(
             &dispatch->memory_dispatch.entries[i];
 
         if (entry->directory.destination_kind !=
-                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+                WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE ||
             entry->directory.destination_scope != 0 ||
             entry->executor.destination_kind !=
-                WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE ||
+                WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE ||
             entry->executor.destination_scope != 0) {
             return -1;
         }
@@ -796,28 +798,28 @@ void load_swarm_config(const char *filename) {
  * typed MEM_ACK payload in return.  The old legacy fault IPC is deliberately
  * not translated here: it cannot carry operation identity or authority.
  */
-static void handle_ipc_fault_v1(int qemu_fd, const uint8_t *payload,
+static void handle_ipc_fault(int qemu_fd, const uint8_t *payload,
                                 uint32_t payload_bytes)
 {
-    struct wvm_local_memory_v1_fault_request request;
-    struct wvm_v1_mem_ack ack;
-    uint8_t page[WVM_V1_MEMORY_PAGE_BYTES];
-    uint8_t ack_payload[WVM_V1_MEM_ACK_HEADER_BYTES +
-                        WVM_V1_MEMORY_PAGE_BYTES];
-    uint8_t result_length[WVM_LOCAL_MEMORY_V1_RESULT_LENGTH_BYTES];
+    struct wvm_local_memory_fault_request request;
+    struct wvm_mem_ack ack;
+    uint8_t page[WVM_MEMORY_PAGE_BYTES];
+    uint8_t ack_payload[WVM_MEM_ACK_HEADER_BYTES +
+                        WVM_MEMORY_PAGE_BYTES];
+    uint8_t result_length[WVM_LOCAL_MEMORY_RESULT_LENGTH_BYTES];
     size_t ack_payload_bytes = 0;
     char error[192] = {0};
     int result;
 
     memset(&request, 0, sizeof(request));
     memset(&ack, 0, sizeof(ack));
-    if (wvm_local_memory_v1_fault_request_decode(
+    if (wvm_local_memory_fault_request_decode(
             payload, payload_bytes, &request, error, sizeof(error)) == 0) {
-        result = wvm_v1_memory_service_global_request_fault(
+        result = wvm_memory_service_global_request_fault(
             request.gpa, request.operation_id, request.delivery_attempt_id,
             &ack, page, error, sizeof(error));
         if (result == 0 &&
-            wvm_v1_mem_ack_encode(&ack, ack_payload, sizeof(ack_payload),
+            wvm_mem_ack_encode(&ack, ack_payload, sizeof(ack_payload),
                                   &ack_payload_bytes, error,
                                   sizeof(error)) == 0) {
             result = 0;
@@ -834,7 +836,7 @@ static void handle_ipc_fault_v1(int qemu_fd, const uint8_t *payload,
                 "[IPC V1 Fault] rejected fd=%d status=%d reason=%s\n",
                 qemu_fd, result, error[0] ? error : "invalid local request");
     }
-    if (wvm_local_memory_v1_result_length_encode(
+    if (wvm_local_memory_result_length_encode(
             ack_payload_bytes, result_length, error, sizeof(error)) != 0 ||
         write_exact(qemu_fd, result_length, sizeof(result_length)) < 0 ||
         (ack_payload_bytes != 0 &&
@@ -844,22 +846,22 @@ static void handle_ipc_fault_v1(int qemu_fd, const uint8_t *payload,
     }
 }
 
-static void handle_ipc_commit_v1(int qemu_fd, const uint8_t *payload,
+static void handle_ipc_commit(int qemu_fd, const uint8_t *payload,
                                  uint32_t payload_bytes)
 {
-    struct wvm_local_memory_v1_commit_request request;
-    struct wvm_local_memory_v1_commit_result result;
-    uint8_t encoded[WVM_LOCAL_MEMORY_V1_COMMIT_RESULT_BYTES];
+    struct wvm_local_memory_commit_request request;
+    struct wvm_local_memory_commit_result result;
+    uint8_t encoded[WVM_LOCAL_MEMORY_COMMIT_RESULT_BYTES];
     char error[192] = {0};
     int status;
 
     memset(&request, 0, sizeof(request));
     memset(&result, 0, sizeof(result));
-    if (wvm_local_memory_v1_commit_request_decode(
+    if (wvm_local_memory_commit_request_decode(
             payload, payload_bytes, &request, error, sizeof(error)) != 0) {
         status = -EPROTO;
     } else {
-        status = wvm_v1_memory_service_global_request_commit(
+        status = wvm_memory_service_global_request_commit(
             request.commit.gpa, request.commit.base_version,
             request.commit.offset, request.commit.data,
             request.commit.data_bytes, request.operation_id,
@@ -872,12 +874,12 @@ static void handle_ipc_commit_v1(int qemu_fd, const uint8_t *payload,
         memcpy(result.operation_id, request.operation_id,
                sizeof(result.operation_id));
         result.ack.gpa = request.commit.gpa;
-        result.ack.status = WVM_V1_MEM_COMMIT_ACK_INTERNAL_FAILURE;
+        result.ack.status = WVM_MEM_COMMIT_ACK_INTERNAL_FAILURE;
         fprintf(stderr,
                 "[IPC V1 Commit] rejected fd=%d status=%d reason=%s\n",
                 qemu_fd, status, error[0] ? error : "invalid local request");
     }
-    if (wvm_local_memory_v1_commit_result_encode(
+    if (wvm_local_memory_commit_result_encode(
             &result, encoded, error, sizeof(error)) != 0 ||
         write_exact(qemu_fd, encoded, sizeof(encoded)) < 0) {
         fprintf(stderr, "[IPC V1 Commit] response write failed fd=%d\n",
@@ -885,69 +887,31 @@ static void handle_ipc_commit_v1(int qemu_fd, const uint8_t *payload,
     }
 }
 
-static void handle_ipc_cpu_run(int qemu_fd, struct wvm_ipc_cpu_run_req* req) {
-    struct wvm_ipc_cpu_run_ack ack = {0};
-    int rpc_ret = 0;
-    { static int __ipc_run=0;
-      if (__ipc_run < 10) {
-          fprintf(stderr, "[IPC VCPU_RUN] vcpu=%u mode=%u slave_id=%u\n",
-                  req->vcpu_index, req->mode_tcg, (unsigned)req->slave_id);
-          __ipc_run++;
-      }
+static void handle_ipc_cpu_run(int qemu_fd,
+                               const struct wvm_ipc_cpu_run_req *req)
+{
+    struct wvm_ipc_cpu_run_ack ack;
+    char error[192] = {0};
+    int result;
+
+    /*
+     * This point is reached only after drain_pending_commits() succeeds on
+     * the same QEMU IPC connection. The node-runtime service therefore owns
+     * the following typed memory fence and the exact asynchronous reply path.
+     */
+    result = wvm_vcpu_service_global_submit(qemu_fd, req, error,
+                                             sizeof(error));
+    if (result == 0) {
+        return;
     }
-    if (!WVM_IS_VALID_TARGET(req->slave_id)) {
-        req->slave_id = wvm_get_compute_slave_id(req->vcpu_index);
-    }
-    if (!WVM_IS_VALID_TARGET(req->slave_id)) {
-        ack.status = -ENODEV;
-    } else if (req->mode_tcg) {
-        /*
-         * TCG remote execution needs the request metadata too.  Sending only
-         * ctx.tcg drops vcpu_index, so the slave TCG process cannot align its
-         * guest-visible CPU/APIC identity with the vCPU being executed.
-         */
-        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, req,
-            sizeof(*req),
-            req->slave_id, &ack, sizeof(ack));
-        if (rpc_ret < 0) ack.status = rpc_ret;
-        ack.mode_tcg = req->mode_tcg;
-    } else {
-        static int __ipc_kvm_ctx = 0;
-        if (__ipc_kvm_ctx < 20) {
-            fprintf(stderr,
-                    "[IPC KVM CTX] vcpu=%u rip=0x%llx rax=0x%llx rdx=0x%llx mp_valid=%u mp=%u lapic=%u vcpu_events=%u tsc=%u\n",
-                    req->vcpu_index,
-                    (unsigned long long)req->ctx.kvm.rip,
-                    (unsigned long long)req->ctx.kvm.rax,
-                    (unsigned long long)req->ctx.kvm.rdx,
-                    req->ctx.kvm.mp_state_valid,
-                    req->ctx.kvm.mp_state,
-                    req->ctx.kvm.lapic_valid,
-                    req->ctx.kvm.vcpu_events_valid,
-                    req->ctx.kvm.tsc_valid);
-            __ipc_kvm_ctx++;
-        }
-        /*
-         * KVM needs the same envelope as TCG.  The slave selects its KVM
-         * vCPU from vcpu_index; forwarding only ctx.kvm silently aliases
-         * every compact-path request to the receiver worker.
-         */
-        rpc_ret = wvm_rpc_call(MSG_VCPU_RUN, req,
-            sizeof(*req),
-            req->slave_id, &ack, sizeof(ack));
-        if (rpc_ret < 0) ack.status = rpc_ret;
-    }
-    {
-        static int __ipc_run_ret = 0;
-        if (__ipc_run_ret < 20) {
-            fprintf(stderr,
-                    "[IPC VCPU_RUN RET] vcpu=%u mode=%u target=%u rpc_ret=%d ack_status=%d ack_mode=%u\n",
-                    req->vcpu_index, req->mode_tcg, (unsigned)req->slave_id,
-                    rpc_ret, ack.status, ack.mode_tcg);
-            __ipc_run_ret++;
-        }
-    }
-    write_exact(qemu_fd, &ack, sizeof(ack));
+    memset(&ack, 0, sizeof(ack));
+    ack.status = result;
+    ack.mode_tcg = req->mode_tcg;
+    fprintf(stderr,
+            "[IPC VCPU_RUN] rejected fd=%d vcpu=%u mode=%u status=%d reason=%s\n",
+            qemu_fd, req->vcpu_index, req->mode_tcg, result,
+            error[0] ? error : "typed vCPU service unavailable");
+    (void)write_exact(qemu_fd, &ack, sizeof(ack));
 }
 
 #define WVM_COMMIT_SYNC_WINDOW     128
@@ -1483,11 +1447,11 @@ void* client_handler(void *socket_desc) {
                 }
                 break;
             }
-            case WVM_IPC_TYPE_MEM_FAULT_V1:
-                handle_ipc_fault_v1(qemu_fd, payload_buf, ipc_hdr.len);
+            case WVM_IPC_TYPE_TYPED_MEM_FAULT:
+                handle_ipc_fault(qemu_fd, payload_buf, ipc_hdr.len);
                 break;
-            case WVM_IPC_TYPE_MEM_COMMIT_V1:
-                handle_ipc_commit_v1(qemu_fd, payload_buf, ipc_hdr.len);
+            case WVM_IPC_TYPE_TYPED_MEM_COMMIT:
+                handle_ipc_commit(qemu_fd, payload_buf, ipc_hdr.len);
                 break;
             case WVM_IPC_TYPE_CPU_RUN: {
                 struct wvm_ipc_cpu_run_req *req =
@@ -1751,7 +1715,7 @@ int main(int argc, char **argv) {
         parse_legacy_vm_id(argv[8], &g_my_vm_id) != 0) {
         fprintf(stderr,
                 "[VM-ID] legacy data-plane header supports VM IDs only in "
-                "[0, %u]; V1_U32 dispatch is not implemented here\n",
+                "[0, %u]; U32 dispatch is not implemented here\n",
                 UINT8_MAX);
         return 1;
     }
@@ -1913,9 +1877,13 @@ int main(int argc, char **argv) {
     }
 
     // 8. 初始化共享内存 (RAM Backing Store)
-    // 优先读取环境变量，支持单机多实例测试
+    // The admitted runtime must provide the manifest-derived SHM name.
     const char *shm_path = getenv("WVM_SHM_FILE");
-    if (!shm_path) shm_path = WVM_DEFAULT_SHM_PATH; // "/wavevm_ram"
+    if (!shm_path || shm_path[0] == '\0') {
+        fprintf(stderr,
+                "[System] manifest-derived SHM name is missing\n");
+        return 1;
+    }
 
     printf("[System] Initializing SHM: %s (Size: %lu MB)\n", shm_path, ram_mb);
 
@@ -1958,17 +1926,25 @@ int main(int argc, char **argv) {
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
     
-    // 动态生成 Socket 路径，支持多实例
-    char *inst_id = getenv("WVM_INSTANCE_ID");
-    char sock_path[128];
-    snprintf(sock_path, sizeof(sock_path), "/tmp/wvm_user_%s.sock", inst_id ? inst_id : "0");
+    // The runtime and QEMU consume one manifest-derived endpoint.
+    const char *sock_path = getenv("WVM_RUNTIME_SOCKET");
+    if (!sock_path || sock_path[0] == '\0') {
+        sock_path = getenv("WVM_ENV_SOCK_PATH");
+    }
+    if (!sock_path || sock_path[0] == '\0' ||
+        strlen(sock_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr,
+                "[System] manifest-derived runtime socket path is missing\n");
+        close(listen_fd);
+        return 1;
+    }
 
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
     unlink(sock_path); // 绑定前确保文件不存在
 
     printf("[System] Control Socket: %s\n", sock_path);
 
-    // 关键：设置环境变量供子进程 (QEMU) 使用
+    // Keep the same value visible to any locally launched QEMU child.
     setenv("WVM_ENV_SOCK_PATH", sock_path, 1);
 
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { 
@@ -1979,6 +1955,21 @@ int main(int argc, char **argv) {
     if (listen(listen_fd, 100) < 0) {
         perror("listen failed");
         return 1;
+    }
+
+    /* Publish identity-bound readiness only after the endpoint is listening. */
+    {
+        char ready_error[256] = {0};
+
+        if (wvm_runtime_ready_publish(
+                &g_runtime_storage.manifest,
+                g_runtime_storage.manifest.expected_node_instance_id,
+                ready_error, sizeof(ready_error)) != 0) {
+            fprintf(stderr, "[System] cannot publish runtime readiness: %s\n",
+                    ready_error[0] ? ready_error : "invalid readiness state");
+            close(listen_fd);
+            return 1;
+        }
     }
 
     printf("[+] WaveVM V29 Node Ready. Waiting for QEMU...\n");

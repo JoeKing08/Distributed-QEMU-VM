@@ -504,7 +504,7 @@ int wvm_capability_record_validate(
     int requires_reason;
 
     if (!record || record->capability_id == 0 ||
-        record->capability_schema_version != WVM_CANONICAL_SCHEMA_V1 ||
+        record->capability_schema_version != WVM_CANONICAL_SCHEMA ||
         record->physical_node_id == 0 || record->node_instance_id == 0 ||
         record->provider_instance_id == 0 ||
         !valid_capability_state(record->state) || record->abi_version == 0 ||

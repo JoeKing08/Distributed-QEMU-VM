@@ -42,6 +42,8 @@
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_runtime_gate.h"
+#include "../node_runtime/kvm_page_cache.h"
+#include "../node_runtime/memory_service.h"
 
 // --- 全局配置变量 ---
 static int g_service_port = 9000;
@@ -294,6 +296,8 @@ static void kvm_alarm_handler(int sig) {
 // 任务单元：封装一个需要同步的脏页
 typedef struct {
     uint64_t gpa;
+    struct wvm_kvm_memory_slice *slice;
+    struct wvm_kvm_dirty_page dirty;
     uint8_t  data[4096];
 } dirty_page_task_t;
 
@@ -576,6 +580,13 @@ static int g_vcpu_init_debug_once = 0;
 #define WVM_KVM_IDMAP_ADDR       0xfffbc000ULL
 #define WVM_KVM_TSS_ADDR         0xfffbd000ULL
 #define WVM_KVM_RESERVED_SIZE    0x2000ULL /* IDMAP + TSS pages */
+
+static int ensure_kvm_page_snapshot(
+    const struct wvm_header *hdr, uint64_t gpa, uint8_t *hva,
+    uint64_t *version_out);
+static int prepare_kvm_execution_snapshot(
+    const struct wvm_header *hdr, const wvm_kvm_context_t *context,
+    uint64_t *error_gpa_out);
 
 static uint8_t *wvm_gpa_to_hva(uint64_t gpa)
 {
@@ -1072,6 +1083,38 @@ static void emergency_send_dirty_page(uint64_t gpa, const uint8_t *hva) {
     robust_sendto(t_emergency_sock, tx_buf, total_len, &master_snap);
 }
 
+static void submit_typed_dirty_page(dirty_page_task_t *task)
+{
+    struct wvm_mem_commit_ack ack;
+    char error[256] = {0};
+    uint16_t status = WVM_MEM_COMMIT_ACK_INTERNAL_FAILURE;
+    uint64_t result_version = 0;
+    int request_result;
+
+    if (!task || !task->slice) {
+        return;
+    }
+    memset(&ack, 0, sizeof(ack));
+    request_result = wvm_memory_service_global_request_commit(
+        task->dirty.gpa, task->dirty.base_version, 0, task->data,
+        WVM_MEMORY_PAGE_BYTES, task->dirty.operation_id,
+        task->dirty.delivery_attempt_id, &ack, error, sizeof(error));
+    if (request_result == 0) {
+        status = ack.status;
+        result_version = ack.result_version;
+    }
+    if (request_result != 0 ||
+        wvm_kvm_memory_slice_complete_dirty(
+            task->slice, &task->dirty, status, result_version, error,
+            sizeof(error)) != 0) {
+        fprintf(stderr,
+                "[KVM commit] GPA=%#" PRIx64 " base=%#" PRIx64
+                " failed status=%u result=%d reason=%s\n",
+                task->dirty.gpa, task->dirty.base_version, (unsigned)status,
+                request_result, error[0] ? error : "commit rejected");
+    }
+}
+
 /* 
  * [物理意图] 充当远程执行节点的“脏页回写引擎”，实现计算与同步的解耦。
  * [关键逻辑] 作为 MPSC 队列的唯一消费者，将各个 vCPU 产生的脏页任务（Dirty Pages）进行有序的异步网络发送。
@@ -1102,7 +1145,13 @@ void* dirty_sync_sender_thread(void* arg) {
         
         pthread_mutex_unlock(&g_mpsc_lock);
         
-        // 网络发送
+        if (task && task->slice) {
+            submit_typed_dirty_page(task);
+            free(task);
+            continue;
+        }
+
+        // Legacy fallback for a non-admitted standalone executor.
         uint8_t tx_buf[sizeof(struct wvm_header) + 8 + 4096];
         memset(tx_buf, 0, sizeof(struct wvm_header)); // [FIX] 清零 header 区域，防止 epoch/flags 等字段含垃圾值
         struct wvm_header *wh = (struct wvm_header *)tx_buf;
@@ -1386,6 +1435,44 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         ioctl(t_vcpu_fd, KVM_SET_MSRS, &msr_data);
     }
 
+    /*
+     * Establish the input side of the KVM handoff before KVM_RUN. KVM does
+     * not surface guest read faults to this userspace executor, so a missing
+     * instruction-fetch page must be resolved before the vCPU can execute.
+     * Keep this slice open through dirty-page capture and write-back below.
+     */
+    struct wvm_kvm_memory_slice *memory_slice = NULL;
+    int memory_fence_status = 0;
+    uint64_t memory_error_gpa = 0;
+    int execution_window_active = 0;
+    if (!req->mode_tcg && wvm_kvm_page_cache_global_active()) {
+        char cache_error[256] = {0};
+
+        if (g_wvm_device_ram_mapping ||
+            wvm_kvm_memory_slice_global_begin(
+                &memory_slice, cache_error, sizeof(cache_error)) != 0) {
+            memory_fence_status = WVM_CPU_RUN_STATUS_MEMORY_FAILURE;
+            if (cache_error[0] != '\0') {
+                fprintf(stderr,
+                        "[KVM cache] cannot begin execution slice: %s\n",
+                        cache_error);
+            }
+        } else if (prepare_kvm_execution_snapshot(
+                       hdr, &req->ctx.kvm, &memory_error_gpa) != 0) {
+            memory_fence_status = WVM_CPU_RUN_STATUS_MEMORY_FAILURE;
+            fprintf(stderr,
+                    "[KVM cache] execution input snapshot failed GPA=%#llx\n",
+                    (unsigned long long)memory_error_gpa);
+        } else if (wvm_kvm_execution_global_begin(
+                       cache_error, sizeof(cache_error)) != 0) {
+            memory_fence_status = WVM_CPU_RUN_STATUS_MEMORY_FAILURE;
+            fprintf(stderr, "[KVM cache] cannot begin execution window: %s\n",
+                    cache_error[0] ? cache_error : "busy");
+        } else {
+            execution_window_active = 1;
+        }
+    }
+
     /* [DBG] Print RAW incoming ctx BEFORE assignment */
     {
         static int dbg_raw = 0;
@@ -1467,7 +1554,16 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
      * WVM_EXIT_PREEMPT below.
      */
 
-    int ret;
+    int ret = -EIO;
+
+    if (memory_fence_status != 0) {
+        /*
+         * Never enter KVM with an unresolved input snapshot. The transport
+         * status tells the requester to retry after resynchronization.
+         */
+        t_kvm_run->exit_reason = WVM_EXIT_PREEMPT;
+        goto kvm_run_done;
+    }
 
     /* --- Thread-directed alarm: 50ms timeout for KVM_RUN --- */
     t_kvm_alarm_fired = 0;
@@ -1590,6 +1686,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         __atomic_store_n(&t_kvm_run->immediate_exit, 0, __ATOMIC_RELEASE);
     }
 
+kvm_run_done:
     /* Host slice expiry is preemption, not a guest HLT. */
     if (t_kvm_alarm_fired) {
         fprintf(stderr, "[Slave] KVM_RUN slice expired -- returning preempt exit\n");
@@ -1661,7 +1758,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
      * device open for control/ioctl handling, but harvest KVM dirty pages
      * whenever RAM is not actually backed by /dev/wavevm.
      */
-    if (!g_wvm_device_ram_mapping) {
+    if (!g_wvm_device_ram_mapping && memory_fence_status == 0) {
         // [V28.5 FIXED] KVM Dirty Log Sync (Full Implementation)
         // 完整实现：获取位图 -> 遍历 -> 封包 -> 发送
         struct kvm_dirty_log log = { .slot = 0 };
@@ -1713,14 +1810,39 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                         uint8_t *hva = wvm_gpa_to_hva(gpa);
                         if (!hva) continue;
 
-                        dirty_page_task_t* task = malloc(sizeof(dirty_page_task_t));
+                        struct wvm_kvm_dirty_page dirty;
+                        dirty_page_task_t *task;
+
+                        memset(&dirty, 0, sizeof(dirty));
+                        if (memory_slice &&
+                            wvm_kvm_memory_slice_capture_dirty(
+                                memory_slice, gpa, &dirty, NULL, 0) != 0) {
+                            wvm_kvm_memory_slice_fail(
+                                memory_slice, gpa, NULL, 0);
+                            memory_fence_status =
+                                WVM_CPU_RUN_STATUS_MEMORY_FAILURE;
+                            continue;
+                        }
+                        task = malloc(sizeof(dirty_page_task_t));
                         if (!task) {
-                            // [FIX-F2] malloc 失败同理：不能丢弃已清除 dirty bit 的页面
-                            emergency_send_dirty_page(gpa, hva);
+                            if (memory_slice) {
+                                dirty_page_task_t emergency;
+
+                                memset(&emergency, 0, sizeof(emergency));
+                                emergency.slice = memory_slice;
+                                emergency.dirty = dirty;
+                                emergency.gpa = gpa;
+                                memcpy(emergency.data, hva, 4096);
+                                submit_typed_dirty_page(&emergency);
+                            } else {
+                                emergency_send_dirty_page(gpa, hva);
+                            }
                             continue;
                         }
 
                         task->gpa = gpa;
+                        task->slice = memory_slice;
+                        task->dirty = dirty;
                         memcpy(task->data, hva, 4096);
 
                         /* [FIX] next_tail 计算和满队检查必须在锁内。
@@ -1732,9 +1854,13 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                         uint32_t next_tail = (g_mpsc_tail + 1) % MPSC_QUEUE_SIZE;
                         if (next_tail == g_mpsc_head) {
                             pthread_mutex_unlock(&g_mpsc_lock);
-                            // [FIX-F2] 队列已满：紧急内联发送
+                            // Queue pressure uses the same typed commit path.
+                            if (task->slice) {
+                                submit_typed_dirty_page(task);
+                            } else {
+                                emergency_send_dirty_page(gpa, hva);
+                            }
                             free(task);
-                            emergency_send_dirty_page(gpa, hva);
                             continue;
                         }
                         g_mpsc_queue[g_mpsc_tail] = task;
@@ -1746,6 +1872,30 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                 }
             }
         }
+    }
+    if (memory_slice) {
+        int slice_success = 0;
+        uint64_t error_gpa = 0;
+        char cache_error[256] = {0};
+
+        if (wvm_kvm_memory_slice_seal(
+                memory_slice, cache_error, sizeof(cache_error)) != 0 ||
+            wvm_kvm_memory_slice_wait(
+                memory_slice, &slice_success, &error_gpa, cache_error,
+                sizeof(cache_error)) != 0 ||
+            !slice_success) {
+            memory_fence_status = WVM_CPU_RUN_STATUS_MEMORY_FAILURE;
+            fprintf(stderr,
+                    "[KVM cache] slice commit failed GPA=%#" PRIx64
+                    " reason=%s\n",
+                    error_gpa, cache_error[0] ? cache_error : "resync required");
+        }
+        wvm_kvm_memory_slice_destroy(memory_slice);
+        memory_slice = NULL;
+    }
+    if (execution_window_active) {
+        wvm_kvm_execution_global_end();
+        execution_window_active = 0;
     }
     // 导出寄存器状态并回包
     ioctl(t_vcpu_fd, KVM_GET_REGS, &kregs); ioctl(t_vcpu_fd, KVM_GET_SREGS, &ksregs);
@@ -1776,7 +1926,7 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     ack_hdr.req_id = WVM_HTONLL(hdr->req_id);
     
     struct wvm_ipc_cpu_run_ack *ack = (struct wvm_ipc_cpu_run_ack *)payload;
-    ack->status = 0;
+    ack->status = memory_fence_status;
     ack->mode_tcg = req->mode_tcg;
     if (req->mode_tcg) {
         wvm_translate_kvm_to_tcg(&kregs, &ksregs, &ack->ctx.tcg);
@@ -1852,14 +2002,299 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
  * [关键逻辑] 处理 INVALIDATE（失效本地页）、DOWNGRADE（权限降级）及 READ（数据提取），操作本地物理页。
  * [后果] 保证了 Slave 侧物理内存与全网真理的一致。若响应失败，Slave 会持有一份陈旧的数据副本，导致计算错误。
  */
+static void build_kvm_snapshot_operation_id(
+    const struct wvm_header *hdr, uint64_t gpa,
+    uint8_t operation_id[WVM_IDENTITY_ID_BYTES])
+{
+    uint64_t request_id = hdr ? WVM_NTOHLL(hdr->req_id) : 0;
+    uint64_t source_id = hdr ? (uint64_t)ntohl(hdr->slave_id) : 0;
+
+    if (request_id == 0) {
+        request_id = gpa ^ (source_id << 32) ^ (uint64_t)g_slave_vm_id;
+        if (request_id == 0) {
+            request_id = 1;
+        }
+    }
+    memcpy(operation_id, &request_id, sizeof(request_id));
+    memcpy(operation_id + sizeof(request_id), &gpa, sizeof(gpa));
+}
+
+static int ensure_kvm_page_snapshot(
+    const struct wvm_header *hdr, uint64_t gpa, uint8_t *hva,
+    uint64_t *version_out)
+{
+    uint8_t state = WVM_KVM_PAGE_ABSENT;
+    uint64_t version = 0;
+    uint8_t operation_id[WVM_IDENTITY_ID_BYTES];
+    uint8_t page[WVM_MEMORY_PAGE_BYTES];
+    struct wvm_mem_ack ack;
+    char error[256] = {0};
+    int result;
+
+    if (!hva || !version_out ||
+        wvm_kvm_page_cache_global_lookup(
+            gpa, &state, &version, error, sizeof(error)) != 0) {
+        return -EINVAL;
+    }
+    if (state == WVM_KVM_PAGE_CLEAN && version != 0) {
+        *version_out = version;
+        return 0;
+    }
+    if (state == WVM_KVM_PAGE_DIRTY ||
+        state == WVM_KVM_PAGE_SUBMITTING) {
+        return -EBUSY;
+    }
+
+    build_kvm_snapshot_operation_id(hdr, gpa, operation_id);
+    memset(&ack, 0, sizeof(ack));
+    result = wvm_memory_service_global_request_fault(
+        gpa, operation_id, 1, &ack, page, error, sizeof(error));
+    if (result != 0 || ack.status != WVM_MEM_ACK_SUCCESS ||
+        ack.version == 0 || ack.data_bytes != WVM_MEMORY_PAGE_BYTES) {
+        return result != 0 ? result : -EIO;
+    }
+    result = wvm_kvm_page_cache_global_install_full(
+        gpa, ack.version, error, sizeof(error));
+    if (result != 0) {
+        return result;
+    }
+    memcpy(hva, page, WVM_MEMORY_PAGE_BYTES);
+    *version_out = ack.version;
+    return 0;
+}
+
+static int ensure_kvm_execution_page(
+    const struct wvm_header *hdr, uint64_t gpa, uint64_t *error_gpa_out)
+{
+    uint64_t version = 0;
+    uint8_t *hva;
+
+    gpa &= ~(WVM_PAGE_SIZE - 1U);
+    if (error_gpa_out) {
+        *error_gpa_out = gpa;
+    }
+    if (!wvm_gpa_page_valid(gpa) || !(hva = wvm_gpa_to_hva(gpa))) {
+        return -EFAULT;
+    }
+    return ensure_kvm_page_snapshot(hdr, gpa, hva, &version);
+}
+
+static int read_kvm_snapshot_u64(
+    const struct wvm_header *hdr, uint64_t gpa, uint64_t *value_out,
+    uint64_t *error_gpa_out)
+{
+    uint8_t *hva;
+    int result;
+
+    if (!value_out || (gpa & (sizeof(uint64_t) - 1U)) != 0 ||
+        (gpa & (WVM_PAGE_SIZE - 1U)) >
+            WVM_PAGE_SIZE - sizeof(uint64_t)) {
+        return -EINVAL;
+    }
+    result = ensure_kvm_execution_page(
+        hdr, gpa, error_gpa_out);
+    if (result != 0) {
+        return result;
+    }
+    hva = wvm_gpa_to_hva(gpa);
+    if (!hva) {
+        return -EFAULT;
+    }
+    memcpy(value_out, hva, sizeof(*value_out));
+    return 0;
+}
+
+static int read_kvm_snapshot_u32(
+    const struct wvm_header *hdr, uint64_t gpa, uint32_t *value_out,
+    uint64_t *error_gpa_out)
+{
+    uint8_t *hva;
+    int result;
+
+    if (!value_out || (gpa & (sizeof(uint32_t) - 1U)) != 0 ||
+        (gpa & (WVM_PAGE_SIZE - 1U)) >
+            WVM_PAGE_SIZE - sizeof(uint32_t)) {
+        return -EINVAL;
+    }
+    result = ensure_kvm_execution_page(
+        hdr, gpa, error_gpa_out);
+    if (result != 0) {
+        return result;
+    }
+    hva = wvm_gpa_to_hva(gpa);
+    if (!hva) {
+        return -EFAULT;
+    }
+    memcpy(value_out, hva, sizeof(*value_out));
+    return 0;
+}
+
+static int translate_kvm_linear_to_gpa(
+    const struct wvm_header *hdr, const struct kvm_sregs *sregs,
+    uint64_t linear, uint64_t *gpa_out, uint64_t *error_gpa_out)
+{
+    const uint64_t page_mask = UINT64_C(0x000ffffffffff000);
+    const uint64_t present = UINT64_C(1);
+    const uint64_t large_page = UINT64_C(1) << 7;
+    uint64_t entry;
+    uint64_t table;
+    int result;
+
+    if (!sregs || !gpa_out) {
+        return -EINVAL;
+    }
+    if ((sregs->cr0 & (UINT64_C(1) << 31)) == 0) {
+        *gpa_out = linear;
+        return 0;
+    }
+
+    if ((sregs->efer & (UINT64_C(1) << 10)) != 0) {
+        int levels = (sregs->cr4 & (UINT64_C(1) << 12)) != 0 ? 5 : 4;
+
+        table = sregs->cr3 & page_mask;
+        for (int level = levels; level > 0; level--) {
+            uint64_t index = (linear >> (12 + 9 * (level - 1))) & 0x1ffU;
+
+            result = read_kvm_snapshot_u64(
+                hdr, table + index * sizeof(uint64_t), &entry,
+                error_gpa_out);
+            if (result != 0 || (entry & present) == 0) {
+                return result != 0 ? result : -ENOENT;
+            }
+            if ((level == 3 || level == 2) && (entry & large_page) != 0) {
+                unsigned int page_shift = 12U + 9U * (unsigned int)(level - 1);
+                uint64_t base_mask =
+                    ~(UINT64_MAX >> (64U - page_shift));
+
+                *gpa_out = (entry & page_mask & base_mask) |
+                           (linear & ~base_mask);
+                return 0;
+            }
+            table = entry & page_mask;
+        }
+        *gpa_out = table | (linear & (WVM_PAGE_SIZE - 1U));
+        return 0;
+    }
+
+    if ((sregs->cr4 & (UINT64_C(1) << 5)) != 0) {
+        uint64_t pdpt_index = (linear >> 30) & 0x3U;
+        uint64_t pd_index = (linear >> 21) & 0x1ffU;
+        uint64_t pt_index = (linear >> 12) & 0x1ffU;
+
+        table = sregs->cr3 & ~UINT64_C(0x1f);
+        result = read_kvm_snapshot_u64(
+            hdr, table + pdpt_index * sizeof(uint64_t), &entry,
+            error_gpa_out);
+        if (result != 0 || (entry & present) == 0) {
+            return result != 0 ? result : -ENOENT;
+        }
+        table = entry & page_mask;
+        result = read_kvm_snapshot_u64(
+            hdr, table + pd_index * sizeof(uint64_t), &entry,
+            error_gpa_out);
+        if (result != 0 || (entry & present) == 0) {
+            return result != 0 ? result : -ENOENT;
+        }
+        if ((entry & large_page) != 0) {
+            *gpa_out = (entry & UINT64_C(0x000fffffffe00000)) |
+                       (linear & UINT64_C(0x1fffff));
+            return 0;
+        }
+        table = entry & page_mask;
+        result = read_kvm_snapshot_u64(
+            hdr, table + pt_index * sizeof(uint64_t), &entry,
+            error_gpa_out);
+        if (result != 0 || (entry & present) == 0) {
+            return result != 0 ? result : -ENOENT;
+        }
+        *gpa_out = (entry & page_mask) |
+                   (linear & (WVM_PAGE_SIZE - 1U));
+        return 0;
+    }
+
+    {
+        uint32_t pde;
+        uint32_t pte;
+        uint64_t pd_index = (linear >> 22) & 0x3ffU;
+        uint64_t pt_index = (linear >> 12) & 0x3ffU;
+
+        table = sregs->cr3 & UINT64_C(0xfffff000);
+        result = read_kvm_snapshot_u32(
+            hdr, table + pd_index * sizeof(uint32_t), &pde,
+            error_gpa_out);
+        if (result != 0 || (pde & present) == 0) {
+            return result != 0 ? result : -ENOENT;
+        }
+        if ((pde & large_page) != 0) {
+            *gpa_out = ((uint64_t)pde & UINT64_C(0xffc00000)) |
+                       (linear & UINT64_C(0x3fffff));
+            return 0;
+        }
+        table = (uint64_t)pde & UINT64_C(0xfffff000);
+        result = read_kvm_snapshot_u32(
+            hdr, table + pt_index * sizeof(uint32_t), &pte,
+            error_gpa_out);
+        if (result != 0 || (pte & present) == 0) {
+            return result != 0 ? result : -ENOENT;
+        }
+        *gpa_out = ((uint64_t)pte & UINT64_C(0xfffff000)) |
+                   (linear & (WVM_PAGE_SIZE - 1U));
+    }
+    return 0;
+}
+
+static int prepare_kvm_execution_snapshot(
+    const struct wvm_header *hdr, const wvm_kvm_context_t *context,
+    uint64_t *error_gpa_out)
+{
+    const struct kvm_sregs *sregs;
+    uint64_t linear;
+    uint64_t gpa;
+    int result;
+
+    if (error_gpa_out) {
+        *error_gpa_out = 0;
+    }
+    if (!context ||
+        sizeof(*sregs) > sizeof(context->sregs_data)) {
+        return -EINVAL;
+    }
+    sregs = (const struct kvm_sregs *)context->sregs_data;
+    if (context->rip > UINT64_MAX - sregs->cs.base) {
+        return -EOVERFLOW;
+    }
+    linear = sregs->cs.base + context->rip;
+
+    /*
+     * x86 instructions are at most 15 bytes. Resolve both possible fetch
+     * pages and all page-table levels used to derive them before KVM_RUN.
+     */
+    for (uint64_t offset = 0; offset <= 15; offset += 15) {
+        if (linear > UINT64_MAX - offset) {
+            return -EOVERFLOW;
+        }
+        result = translate_kvm_linear_to_gpa(
+            hdr, sregs, linear + offset, &gpa, error_gpa_out);
+        if (result != 0) {
+            return result;
+        }
+        result = ensure_kvm_execution_page(hdr, gpa, error_gpa_out);
+        if (result != 0) {
+            return result;
+        }
+    }
+    return 0;
+}
+
 void handle_kvm_mem(int sockfd, struct sockaddr_in *client, struct wvm_header *hdr, void *payload) {
-    uint16_t type = hdr->msg_type; 
+    uint16_t type = ntohs(hdr->msg_type);
+    uint16_t payload_len = ntohs(hdr->payload_len);
     uint64_t gpa;
 
     if (type == MSG_INVALIDATE || type == MSG_DOWNGRADE) {
         gpa = hdr->target_gpa; // ntoh_header 已将 union req_id/target_gpa 转为 host order
     } else {
-        if (hdr->payload_len < 8) return; 
+        if (payload_len < 8) return;
         // [FIX] 安全读取 Payload 中的 GPA
         gpa = wvm_get_u64_unaligned(payload);
     }
@@ -1869,30 +2304,123 @@ void handle_kvm_mem(int sockfd, struct sockaddr_in *client, struct wvm_header *h
     uint8_t *hva = wvm_gpa_to_hva(gpa);
     if (!hva) return;
 
+    if (type == MSG_MEM_ACK || type == MSG_PAGE_PUSH_FULL) {
+        struct wvm_mem_ack_payload *snapshot =
+            (struct wvm_mem_ack_payload *)payload;
+        int install_result;
+
+        if (!wvm_kvm_page_cache_global_active() ||
+            payload_len < sizeof(*snapshot) ||
+            WVM_NTOHLL(snapshot->gpa) != gpa) {
+            return;
+        }
+        install_result = wvm_kvm_page_cache_global_install_full(
+            gpa, WVM_NTOHLL(snapshot->version), NULL, 0);
+        if (install_result == 0) {
+            memcpy(hva, snapshot->data, WVM_MEMORY_PAGE_BYTES);
+        }
+        return;
+    }
+
+    if (type == MSG_PAGE_PUSH_DIFF) {
+        struct wvm_diff_log *diff = (struct wvm_diff_log *)payload;
+        uint16_t offset;
+        uint16_t data_bytes;
+        int zero_page;
+        int apply_result;
+
+        if (!wvm_kvm_page_cache_global_active() ||
+            payload_len < sizeof(*diff)) {
+            return;
+        }
+        offset = ntohs(diff->offset);
+        data_bytes = ntohs(diff->size);
+        if (WVM_NTOHLL(diff->gpa) != gpa ||
+            sizeof(*diff) + data_bytes > payload_len ||
+            offset + data_bytes > WVM_MEMORY_PAGE_BYTES) {
+            return;
+        }
+        zero_page = (hdr->flags & WVM_FLAG_ZERO) != 0;
+        apply_result = wvm_kvm_page_cache_global_apply_diff(
+            gpa, WVM_NTOHLL(diff->version), offset, data_bytes, zero_page,
+            NULL, 0);
+        if (apply_result == 0) {
+            if (zero_page) {
+                memset(hva, 0, WVM_MEMORY_PAGE_BYTES);
+            } else if (data_bytes != 0) {
+                memcpy(hva + offset, diff->data, data_bytes);
+            }
+        }
+        return;
+    }
+
     if (type == MSG_MEM_READ) {
+        uint8_t page_state = WVM_KVM_PAGE_ABSENT;
+        uint64_t page_version = 0;
+
+        if (wvm_kvm_page_cache_global_active()) {
+            if (ensure_kvm_page_snapshot(
+                    hdr, gpa, hva, &page_version) != 0 ||
+                wvm_kvm_page_cache_global_lookup(
+                    gpa, &page_state, &page_version, NULL, 0) != 0 ||
+                page_state != WVM_KVM_PAGE_CLEAN || page_version == 0) {
+                return;
+            }
+        }
         struct wvm_header ack_hdr;
         memset(&ack_hdr, 0, sizeof(ack_hdr));
         ack_hdr.magic = htonl(WVM_MAGIC);
         ack_hdr.msg_type = htons(MSG_MEM_ACK);
-        ack_hdr.payload_len = htons(4096);
+        ack_hdr.payload_len = htons(
+            wvm_kvm_page_cache_global_active()
+                ? sizeof(struct wvm_mem_ack_payload)
+                : WVM_MEMORY_PAGE_BYTES);
         ack_hdr.slave_id = htonl(WVM_ENCODE_ID(g_slave_vm_id, (uint32_t)g_base_id));
         ack_hdr.target_id = hdr->slave_id;  /* already in network byte order */
         ack_hdr.req_id = WVM_HTONLL(hdr->req_id);
 
-        uint8_t tx[sizeof(ack_hdr) + 4096];
+        uint8_t tx[sizeof(ack_hdr) + sizeof(struct wvm_mem_ack_payload)];
         memcpy(tx, &ack_hdr, sizeof(ack_hdr));
-        memcpy(tx+sizeof(ack_hdr), hva, 4096);
+        if (wvm_kvm_page_cache_global_active()) {
+            struct wvm_mem_ack_payload *ack =
+                (struct wvm_mem_ack_payload *)(tx + sizeof(ack_hdr));
+
+            ack->gpa = WVM_HTONLL(gpa);
+            ack->version = WVM_HTONLL(page_version);
+            memcpy(ack->data, hva, WVM_MEMORY_PAGE_BYTES);
+        } else {
+            memcpy(tx + sizeof(ack_hdr), hva, WVM_MEMORY_PAGE_BYTES);
+        }
         struct wvm_header *tx_hdr = (struct wvm_header *)tx;
         tx_hdr->crc32 = 0;
-        tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
-        robust_sendto(sockfd, tx, sizeof(tx), client);
-    } 
+        size_t tx_bytes = sizeof(ack_hdr) +
+                          (wvm_kvm_page_cache_global_active()
+                               ? sizeof(struct wvm_mem_ack_payload)
+                               : WVM_MEMORY_PAGE_BYTES);
+        tx_hdr->payload_len = htons((uint16_t)(tx_bytes - sizeof(ack_hdr)));
+        tx_hdr->crc32 = htonl(calculate_crc32(tx, tx_bytes));
+        robust_sendto(sockfd, tx, tx_bytes, client);
+    }
     else if (type == MSG_MEM_WRITE) {
-        if (hdr->payload_len >= 8+4096) {
+        if (payload_len >= 8+4096) {
+            if (wvm_kvm_page_cache_global_active()) {
+                int invalidate_result =
+                    wvm_kvm_page_cache_global_invalidate(gpa, NULL, 0);
+                if (invalidate_result == -EBUSY) {
+                    return;
+                }
+            }
             memcpy(hva, (uint8_t*)payload+8, 4096);
         }
     }
     else if (type == MSG_INVALIDATE) {
+        if (wvm_kvm_page_cache_global_active()) {
+            int invalidate_result =
+                wvm_kvm_page_cache_global_invalidate(gpa, NULL, 0);
+            if (invalidate_result == -EBUSY) {
+                return;
+            }
+        }
         if (g_kvm_available) {
             memset(hva, 0, 4096); /* KVM: 不能 MADV_DONTNEED，会破坏 memslot 物理页 */
         } else {
@@ -1900,7 +2428,7 @@ void handle_kvm_mem(int sockfd, struct sockaddr_in *client, struct wvm_header *h
         }
     }
     else if (type == MSG_DOWNGRADE) {
-        if (hdr->payload_len < 16) return;
+        if (payload_len < 16) return;
         
         // [FIX] 安全读取 Payload 中的复杂数据
         uint64_t requester_u64 = wvm_get_u64_unaligned(payload);
@@ -2523,6 +3051,8 @@ void* tcg_proxy_thread(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    char error[256] = {0};
+
     g_nonblock_recv = (getenv("WVM_NONBLOCK_RECV") != NULL);
 
     // 启动时自动创建存储目录
@@ -2548,7 +3078,7 @@ int main(int argc, char **argv) {
         executor_parse_legacy_vm_id(argv[6], &g_slave_vm_id) != 0) {
         fprintf(stderr,
                 "[VM-ID] legacy executor header supports VM IDs only in "
-                "[0, %u]; V1_U32 dispatch is not implemented here\n",
+                "[0, %u]; U32 dispatch is not implemented here\n",
                 UINT8_MAX);
         return 1;
     }
@@ -2575,6 +3105,30 @@ int main(int argc, char **argv) {
     }
 
     if (g_kvm_available) {
+        if (g_executor_local_only) {
+            struct wvm_kvm_page_cache_config cache_config;
+            uint64_t guest_bytes =
+                g_executor_manifest_storage.manifest.launch_plan
+                    .guest_total_memory_bytes;
+
+            memset(&cache_config, 0, sizeof(cache_config));
+            cache_config.vm_id = g_slave_vm_id;
+            cache_config.vm_incarnation =
+                g_executor_manifest_storage.manifest.vm_incarnation;
+            cache_config.max_page_records =
+                (guest_bytes + WVM_MEMORY_PAGE_BYTES - 1U) /
+                WVM_MEMORY_PAGE_BYTES;
+            cache_config.completion_timeout_ms =
+                g_executor_manifest_storage.manifest.launch_plan
+                    .consistency_policy.max_commit_latency_ms;
+            if (cache_config.max_page_records == 0 ||
+                wvm_kvm_page_cache_global_install(
+                    &cache_config, error, sizeof(error)) != 0) {
+                fprintf(stderr, "[RuntimeGate] cannot install KVM page cache: %s\n",
+                        error[0] ? error : "invalid cache configuration");
+                return 1;
+            }
+        }
         printf("[Hybrid] Mode: KVM FAST PATH. Listening on %s:%d\n",
                g_executor_local_only ? "127.0.0.1" : "0.0.0.0",
                g_service_port);
@@ -2605,7 +3159,7 @@ int main(int argc, char **argv) {
         if (proxy_threads < 1) proxy_threads = 1;
         pthread_t *threads = malloc(sizeof(pthread_t) * proxy_threads);
         for(long i=0; i<proxy_threads; i++) pthread_create(&threads[i], NULL, tcg_proxy_thread, NULL);
-        while(wait(NULL) > 0);
+        while (wait(NULL) > 0);
     }
     return 0;
 }

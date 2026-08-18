@@ -209,7 +209,7 @@ int main(void)
     candidate.lifecycle_policy.failure_policy = 1;
     candidate.lifecycle_policy.completion_query_horizon_ms = 5000;
     candidate.lifecycle_policy.route_retention_horizon_ms = 6000;
-    candidate.namespace_abi = WVM_MANIFEST_NAMESPACE_V1_U32;
+    candidate.namespace_abi = WVM_MANIFEST_NAMESPACE_U32;
 
     if (expect(wvm_candidate_vm_manifest_encode(
                    &candidate, candidate_bytes, sizeof(candidate_bytes),

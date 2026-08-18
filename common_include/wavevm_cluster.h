@@ -26,6 +26,7 @@ struct wvm_cluster_record_set {
     uint64_t inventory_revision;
     uint64_t membership_revision;
     uint64_t topology_revision;
+    uint64_t admission_eligibility_revision;
     uint64_t capability_profile_generation;
 };
 

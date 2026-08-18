@@ -127,6 +127,22 @@ struct wvm_admission_plan {
 };
 
 /*
+ * Controller-provided listener identity for one selected node. The lease
+ * entries are caller-owned output storage; placement only fills them from
+ * these admitted ports and never chooses a port range itself.
+ */
+struct wvm_admission_node_listener_plan {
+    uint32_t physical_node_id;
+    uint64_t expected_node_instance_id;
+    uint16_t node_runtime_data_port;
+    uint16_t local_executor_service_port;
+    int kernel_accelerator_required;
+    uint64_t lease_generation;
+    struct wvm_exclusive_lease *lease_entries;
+    size_t lease_capacity;
+};
+
+/*
  * The planner receives its route/fence identity from the control-plane
  * transaction.  It does not infer either from a gateway map or a launcher.
  */
@@ -135,7 +151,10 @@ struct wvm_admission_placement_options {
     enum wvm_manifest_guest_topology_policy guest_topology_policy;
     uint32_t guest_numa_nodes;
     uint16_t executor_class;
+    int kernel_accelerator_required;
     struct wvm_vm_route_scope_key route_scope_key;
+    const struct wvm_admission_node_listener_plan *listener_plans;
+    size_t listener_plan_count;
 };
 
 int wvm_admission_snapshot_validate(const struct wvm_admission_snapshot *snapshot,

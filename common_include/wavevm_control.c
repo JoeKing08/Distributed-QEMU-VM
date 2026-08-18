@@ -2336,6 +2336,7 @@ static int admission_fence_shape_validate(
     if (!fence ||
         bytes_are_zero(fence->admission_tx_id, sizeof(fence->admission_tx_id)) ||
         fence->membership_revision == 0 || fence->topology_revision == 0 ||
+        fence->admission_eligibility_revision == 0 ||
         fence->inventory_revision == 0 ||
         fence->capability_profile_generation == 0 ||
         required_member_list_validate(&fence->selected_members, error,
@@ -2370,6 +2371,7 @@ int wvm_admission_eligibility_fence_encode(
     size_t scope_key_bytes;
     uint8_t *member_list_value;
     uint8_t *scope_key_value;
+    uint8_t *fence_digest_value;
     uint8_t calculated_digest[WVM_SHA256_DIGEST_BYTES];
     uint8_t zero_digest[WVM_SHA256_DIGEST_BYTES] = {0};
 
@@ -2406,8 +2408,10 @@ int wvm_admission_eligibility_fence_encode(
                                       &scope_key_bytes, error, error_len) != 0 ||
         wvm_canonical_field_append(&builder, 8, fence->required_ack_set_digest,
                                    sizeof(fence->required_ack_set_digest)) != 0 ||
-        wvm_canonical_field_append(&builder, 9, zero_digest,
-                                   sizeof(zero_digest)) != 0 ||
+        wvm_canonical_field_reserve(&builder, 9, sizeof(zero_digest),
+                                    &fence_digest_value) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 10, fence->admission_eligibility_revision) != 0 ||
         wvm_canonical_record_finish(&builder, encoded_bytes) != 0 ||
         wvm_canonical_record_digest(bytes, *encoded_bytes, 9, calculated_digest) !=
             0) {
@@ -2420,8 +2424,7 @@ int wvm_admission_eligibility_fence_encode(
         set_error(error, error_len, "admission eligibility fence digest mismatches");
         return -1;
     }
-    memcpy(bytes + *encoded_bytes - WVM_SHA256_DIGEST_BYTES, calculated_digest,
-           sizeof(calculated_digest));
+    memcpy(fence_digest_value, calculated_digest, sizeof(calculated_digest));
     if (fence_digest) {
         memcpy(fence_digest, calculated_digest, sizeof(calculated_digest));
     }
@@ -2433,22 +2436,24 @@ int wvm_admission_eligibility_fence_decode(
     struct wvm_admission_eligibility_fence *fence, char *error,
     size_t error_len)
 {
-    struct wvm_canonical_field fields[10];
-    unsigned char present[10];
+    struct wvm_canonical_field fields[11];
+    unsigned char present[11];
     struct wvm_required_member_list members;
     uint8_t calculated_digest[WVM_SHA256_DIGEST_BYTES];
 
     if (!fence ||
         parse_record_fields(bytes, encoded_bytes,
                             WVM_RECORD_ADMISSION_ELIGIBILITY_FENCE, fields,
-                            present, 9, error, error_len) != 0 ||
+                            present, 10, error, error_len) != 0 ||
         !present[1] || !present[2] || !present[3] || !present[4] ||
         !present[5] || !present[6] || !present[7] || !present[8] ||
-        !present[9] || fields[1].value_bytes != WVM_IDENTITY_ID_BYTES ||
+        !present[9] || !present[10] ||
+        fields[1].value_bytes != WVM_IDENTITY_ID_BYTES ||
         fields[2].value_bytes != 8 || fields[3].value_bytes != 8 ||
         fields[4].value_bytes != 8 || fields[5].value_bytes != 8 ||
         fields[8].value_bytes != WVM_SHA256_DIGEST_BYTES ||
-        fields[9].value_bytes != WVM_SHA256_DIGEST_BYTES) {
+        fields[9].value_bytes != WVM_SHA256_DIGEST_BYTES ||
+        fields[10].value_bytes != 8) {
         set_error(error, error_len, "admission eligibility fence has invalid fields");
         return -1;
     }
@@ -2460,6 +2465,7 @@ int wvm_admission_eligibility_fence_decode(
     fence->topology_revision = read_be64(fields[3].value);
     fence->inventory_revision = read_be64(fields[4].value);
     fence->capability_profile_generation = read_be64(fields[5].value);
+    fence->admission_eligibility_revision = read_be64(fields[10].value);
     memcpy(fence->required_ack_set_digest, fields[8].value,
            sizeof(fence->required_ack_set_digest));
     memcpy(fence->fence_digest, fields[9].value, sizeof(fence->fence_digest));
@@ -2674,4 +2680,319 @@ int wvm_route_transaction_record_decode(
         return -1;
     }
     return wvm_route_transaction_record_validate(transaction, error, error_len);
+}
+
+static int route_snapshot_record_size(
+    const struct wvm_route_snapshot_record *snapshot, size_t *encoded_size)
+{
+    size_t fields[8];
+    size_t field_count = 0;
+
+    if (wvm_route_snapshot_record_validate(snapshot, NULL, 0) != 0 ||
+        route_snapshot_key_size(&fields[field_count++]) != 0) {
+        return -1;
+    }
+    fields[field_count++] = 8;
+    fields[field_count++] = 2;
+    if (route_rule_list_size(&snapshot->next_hop_rules,
+                             &fields[field_count++]) != 0 ||
+        required_ack_set_size(&snapshot->required_ack_set,
+                              &snapshot->route_snapshot_key,
+                              &fields[field_count++]) != 0) {
+        return -1;
+    }
+    if (snapshot->has_predecessor_snapshot_key &&
+        route_snapshot_key_size(&fields[field_count++]) != 0) {
+        return -1;
+    }
+    fields[field_count++] = 8;
+    fields[field_count++] = 2;
+    return canonical_record_size(fields, field_count, encoded_size);
+}
+
+static int route_transaction_record_size(
+    const struct wvm_route_transaction_record *transaction,
+    size_t *encoded_size)
+{
+    size_t fields[7];
+    size_t field_count = 0;
+
+    if (wvm_route_transaction_record_validate(transaction, NULL, 0) != 0) {
+        return -1;
+    }
+    fields[field_count++] = WVM_IDENTITY_ID_BYTES;
+    if (route_snapshot_key_size(&fields[field_count++]) != 0) {
+        return -1;
+    }
+    if (transaction->has_predecessor_snapshot_key &&
+        route_snapshot_key_size(&fields[field_count++]) != 0) {
+        return -1;
+    }
+    if (required_ack_set_size(&transaction->required_ack_set, NULL,
+                              &fields[field_count++]) != 0 ||
+        record_list_size(
+            transaction->optional_departure_drain_set.entries,
+            transaction->optional_departure_drain_set.count,
+            sizeof(*transaction->optional_departure_drain_set.entries),
+            required_ack_entry_size_adapter,
+            &fields[field_count++]) != 0) {
+        return -1;
+    }
+    fields[field_count++] = 8;
+    fields[field_count++] = 2;
+    return canonical_record_size(fields, field_count, encoded_size);
+}
+
+static int route_snapshot_record_encode_adapter(
+    const void *value, uint8_t *bytes, size_t capacity, size_t *encoded_bytes,
+    char *error, size_t error_len)
+{
+    uint8_t digest[WVM_SHA256_DIGEST_BYTES];
+
+    return wvm_route_snapshot_record_encode(value, bytes, capacity,
+                                            encoded_bytes, digest, error,
+                                            error_len);
+}
+
+static int route_transaction_record_encode_adapter(
+    const void *value, uint8_t *bytes, size_t capacity, size_t *encoded_bytes,
+    char *error, size_t error_len)
+{
+    return wvm_route_transaction_record_encode(value, bytes, capacity,
+                                               encoded_bytes, error, error_len);
+}
+
+static int valid_gateway_drain_action(enum wvm_gateway_drain_action action)
+{
+    return action == WVM_GATEWAY_DRAIN_ACTION_PREPARE ||
+           action == WVM_GATEWAY_DRAIN_ACTION_COMMIT ||
+           action == WVM_GATEWAY_DRAIN_ACTION_ABORT;
+}
+
+int wvm_gateway_drain_request_validate(
+    const struct wvm_gateway_drain_request *request, char *error,
+    size_t error_len)
+{
+    if (!request || !valid_gateway_drain_action(request->action) ||
+        request->target_gateway_member_key.role_type !=
+            WVM_MANIFEST_ROLE_GATEWAY ||
+        wvm_member_key_validate(&request->target_gateway_member_key, error,
+                                error_len) != 0 ||
+        request->expected_membership_revision == 0 ||
+        request->expected_topology_revision == 0 ||
+        request->expected_admission_eligibility_revision == 0 ||
+        bytes_are_zero(request->route_operation_id,
+                       sizeof(request->route_operation_id))) {
+        set_error(error, error_len, "gateway drain request is invalid");
+        return -1;
+    }
+    if (request->action != WVM_GATEWAY_DRAIN_ACTION_PREPARE) {
+        return 0;
+    }
+    if (wvm_route_transaction_record_validate(&request->successor_transaction,
+                                              error, error_len) != 0 ||
+        wvm_route_snapshot_record_validate(&request->successor_snapshot, error,
+                                           error_len) != 0 ||
+        memcmp(request->route_operation_id,
+               request->successor_transaction.operation_id,
+               sizeof(request->route_operation_id)) != 0 ||
+        !route_snapshot_key_full_equal(
+            &request->successor_transaction.route_snapshot_key,
+            &request->successor_snapshot.route_snapshot_key) ||
+        request->successor_snapshot.membership_revision !=
+            request->expected_membership_revision) {
+        set_error(error, error_len,
+                  "gateway drain prepare successor does not match its fence");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_gateway_drain_request_encode(
+    const struct wvm_gateway_drain_request *request, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len)
+{
+    struct wvm_canonical_builder builder;
+    size_t member_key_bytes;
+    size_t transaction_bytes = 0;
+    size_t snapshot_bytes = 0;
+
+    if (!bytes || !encoded_bytes ||
+        wvm_gateway_drain_request_validate(request, error, error_len) != 0 ||
+        member_key_size(&member_key_bytes) != 0 ||
+        (request->action == WVM_GATEWAY_DRAIN_ACTION_PREPARE &&
+         (route_transaction_record_size(&request->successor_transaction,
+                                        &transaction_bytes) != 0 ||
+          route_snapshot_record_size(&request->successor_snapshot,
+                                     &snapshot_bytes) != 0)) ||
+        wvm_canonical_record_begin(&builder, bytes, capacity,
+                                   WVM_RECORD_GATEWAY_DRAIN_REQUEST) != 0 ||
+        wvm_canonical_field_append_u16(&builder, 1, request->action) != 0 ||
+        append_nested_record(&builder, 2, member_key_bytes,
+                             member_key_encode_adapter,
+                             &request->target_gateway_member_key, error,
+                             error_len) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 3, request->expected_membership_revision) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 4, request->expected_topology_revision) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 5, request->expected_admission_eligibility_revision) !=
+            0 ||
+        (request->action == WVM_GATEWAY_DRAIN_ACTION_PREPARE &&
+         (append_nested_record(&builder, 6, transaction_bytes,
+                               route_transaction_record_encode_adapter,
+                               &request->successor_transaction, error,
+                               error_len) != 0 ||
+          append_nested_record(&builder, 7, snapshot_bytes,
+                               route_snapshot_record_encode_adapter,
+                               &request->successor_snapshot, error,
+                               error_len) != 0)) ||
+        wvm_canonical_field_append(&builder, 8, request->route_operation_id,
+                                   sizeof(request->route_operation_id)) != 0 ||
+        wvm_canonical_record_finish(&builder, encoded_bytes) != 0) {
+        set_error(error, error_len, "cannot encode gateway drain request");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_gateway_drain_request_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_gateway_drain_request *request, char *error, size_t error_len)
+{
+    struct wvm_canonical_field fields[9];
+    unsigned char present[9];
+    struct wvm_route_transaction_record transaction;
+    struct wvm_route_snapshot_record snapshot;
+
+    if (!request ||
+        parse_record_fields(bytes, encoded_bytes,
+                            WVM_RECORD_GATEWAY_DRAIN_REQUEST, fields, present,
+                            8, error, error_len) != 0 ||
+        !present[1] || !present[2] || !present[3] || !present[4] ||
+        !present[5] || !present[8] || fields[1].value_bytes != 2 ||
+        fields[3].value_bytes != 8 || fields[4].value_bytes != 8 ||
+        fields[5].value_bytes != 8 ||
+        fields[8].value_bytes != WVM_IDENTITY_ID_BYTES) {
+        set_error(error, error_len, "gateway drain request has invalid fields");
+        return -1;
+    }
+    transaction = request->successor_transaction;
+    snapshot = request->successor_snapshot;
+    memset(request, 0, sizeof(*request));
+    request->successor_transaction = transaction;
+    request->successor_snapshot = snapshot;
+    request->action = (enum wvm_gateway_drain_action)read_be16(fields[1].value);
+    request->expected_membership_revision = read_be64(fields[3].value);
+    request->expected_topology_revision = read_be64(fields[4].value);
+    request->expected_admission_eligibility_revision = read_be64(fields[5].value);
+    memcpy(request->route_operation_id, fields[8].value,
+           sizeof(request->route_operation_id));
+    if (wvm_member_key_decode(fields[2].value, fields[2].value_bytes,
+                              &request->target_gateway_member_key, error,
+                              error_len) != 0 ||
+        ((request->action == WVM_GATEWAY_DRAIN_ACTION_PREPARE &&
+          (!present[6] || !present[7] ||
+           wvm_route_transaction_record_decode(
+               fields[6].value, fields[6].value_bytes,
+               &request->successor_transaction, error, error_len) != 0 ||
+           wvm_route_snapshot_record_decode(
+               fields[7].value, fields[7].value_bytes,
+               &request->successor_snapshot, error, error_len) != 0)) ||
+         (request->action != WVM_GATEWAY_DRAIN_ACTION_PREPARE &&
+          (present[6] || present[7]))) ||
+        wvm_gateway_drain_request_validate(request, error, error_len) != 0) {
+        set_error(error, error_len, "gateway drain request is malformed");
+        return -1;
+    }
+    return 0;
+}
+
+static int valid_member_cordon_role(enum wvm_manifest_role_type role_type)
+{
+    return role_type == WVM_MANIFEST_ROLE_NODE_RUNTIME ||
+           role_type == WVM_MANIFEST_ROLE_GATEWAY;
+}
+
+int wvm_member_cordon_request_validate(
+    const struct wvm_member_cordon_request *request, char *error,
+    size_t error_len)
+{
+    if (!request || !valid_member_cordon_role(request->target_member_key.role_type) ||
+        wvm_member_key_validate(&request->target_member_key, error,
+                                error_len) != 0 ||
+        request->expected_membership_revision == 0 ||
+        request->expected_topology_revision == 0 ||
+        request->expected_admission_eligibility_revision == 0 ||
+        request->reason_code == 0) {
+        set_error(error, error_len, "member cordon request is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_member_cordon_request_encode(
+    const struct wvm_member_cordon_request *request, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len)
+{
+    struct wvm_canonical_builder builder;
+    size_t member_key_bytes;
+
+    if (!bytes || !encoded_bytes ||
+        wvm_member_cordon_request_validate(request, error, error_len) != 0 ||
+        member_key_size(&member_key_bytes) != 0 ||
+        wvm_canonical_record_begin(&builder, bytes, capacity,
+                                   WVM_RECORD_MEMBER_CORDON_REQUEST) != 0 ||
+        append_nested_record(&builder, 1, member_key_bytes,
+                             member_key_encode_adapter,
+                             &request->target_member_key, error,
+                             error_len) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 2, request->expected_membership_revision) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 3, request->expected_topology_revision) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 4, request->expected_admission_eligibility_revision) !=
+            0 ||
+        wvm_canonical_field_append_u16(&builder, 5, request->reason_code) !=
+            0 ||
+        wvm_canonical_record_finish(&builder, encoded_bytes) != 0) {
+        set_error(error, error_len, "cannot encode member cordon request");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_member_cordon_request_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_member_cordon_request *request, char *error, size_t error_len)
+{
+    struct wvm_canonical_field fields[6];
+    unsigned char present[6];
+
+    if (!request ||
+        parse_record_fields(bytes, encoded_bytes,
+                            WVM_RECORD_MEMBER_CORDON_REQUEST, fields, present,
+                            5, error, error_len) != 0 ||
+        !present[1] || !present[2] || !present[3] || !present[4] ||
+        !present[5] || fields[2].value_bytes != 8 ||
+        fields[3].value_bytes != 8 || fields[4].value_bytes != 8 ||
+        fields[5].value_bytes != 2 ||
+        wvm_member_key_decode(fields[1].value, fields[1].value_bytes,
+                              &request->target_member_key, error,
+                              error_len) != 0) {
+        set_error(error, error_len, "member cordon request has invalid fields");
+        return -1;
+    }
+    request->expected_membership_revision = read_be64(fields[2].value);
+    request->expected_topology_revision = read_be64(fields[3].value);
+    request->expected_admission_eligibility_revision =
+        read_be64(fields[4].value);
+    request->reason_code = read_be16(fields[5].value);
+    if (wvm_member_cordon_request_validate(request, error, error_len) != 0) {
+        set_error(error, error_len, "member cordon request is malformed");
+        return -1;
+    }
+    return 0;
 }

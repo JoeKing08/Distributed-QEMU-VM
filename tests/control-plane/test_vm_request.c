@@ -34,7 +34,7 @@ int main(void)
     strcpy(constraints[0].value, "trusted-a");
 
     memset(&request, 0, sizeof(request));
-    request.api_version = WVM_CANONICAL_SCHEMA_V1;
+    request.api_version = WVM_CANONICAL_SCHEMA;
     request.request_id[WVM_IDENTITY_ID_BYTES - 1] = 0x42;
     request.has_display_name = 1;
     strcpy(request.display_name, "tcg-control-plane-contract");

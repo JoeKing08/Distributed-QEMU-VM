@@ -69,7 +69,7 @@ static void fill_request(struct wvm_vm_request *request, uint8_t request_id,
                          uint32_t requested_vcpus)
 {
     memset(request, 0, sizeof(*request));
-    request->api_version = WVM_CANONICAL_SCHEMA_V1;
+    request->api_version = WVM_CANONICAL_SCHEMA;
     request->request_id[WVM_IDENTITY_ID_BYTES - 1] = request_id;
     request->requested_vcpus = requested_vcpus;
     request->requested_memory_bytes = 4 * 1024 * 1024;

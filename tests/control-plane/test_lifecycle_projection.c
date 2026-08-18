@@ -204,7 +204,7 @@ static int build_candidate(struct wvm_candidate_vm_manifest *candidate,
     candidate->lifecycle_policy.failure_policy = 1;
     candidate->lifecycle_policy.completion_query_horizon_ms = 5000;
     candidate->lifecycle_policy.route_retention_horizon_ms = 6000;
-    candidate->namespace_abi = WVM_MANIFEST_NAMESPACE_V1_U32;
+    candidate->namespace_abi = WVM_MANIFEST_NAMESPACE_U32;
     if (wvm_candidate_vm_manifest_encode(candidate, candidate_bytes,
                                          sizeof(candidate_bytes), &encoded_bytes,
                                          candidate_digest, error, error_len) !=
@@ -347,6 +347,7 @@ static int test_runtime_dispatch_projection(
     records.inventory_revision = 1;
     records.membership_revision = 1;
     records.topology_revision = 1;
+    records.admission_eligibility_revision = 1;
     records.capability_profile_generation = 1;
 
     fill_dispatch_route_rule(&rules[0], 0, 0, &nodes[0]);
@@ -378,7 +379,7 @@ static int test_runtime_dispatch_projection(
                    &projection, error, error_len) == 0 &&
                    projection.route_topology_kind == WVM_ROUTE_TOPOLOGY_FLAT &&
                    projection.local_primary.destination_kind ==
-                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+                       WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE &&
                    projection.local_primary.destination_scope == 0 &&
                    projection.local_primary.destination_vnode == 0 &&
                    projection.cpu_dispatch.count == 2 &&
@@ -405,7 +406,7 @@ static int test_runtime_dispatch_projection(
                        bytes, encoded_bytes, &decoded, error, error_len) == 0 &&
                    decoded.memory_dispatch.count == 2 &&
                    decoded.cpu_dispatch.entries[1].executor.destination_kind ==
-                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE &&
+                       WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE &&
                    decoded.cpu_dispatch.entries[1].executor.destination_scope ==
                        0 &&
                    decoded.cpu_dispatch.entries[1].executor.destination_vnode ==
@@ -432,12 +433,12 @@ static int test_runtime_dispatch_projection(
                    projection.route_topology_kind ==
                        WVM_ROUTE_TOPOLOGY_FRACTAL &&
                    projection.local_primary.destination_kind ==
-                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+                       WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE &&
                    projection.local_primary.destination_scope == 41 &&
                    projection.local_primary.destination_vnode == 0 &&
                    projection.cpu_dispatch.entries[1].executor
                            .destination_kind ==
-                       WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+                       WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE &&
                    projection.cpu_dispatch.entries[1].executor
                            .destination_scope == 99 &&
                    projection.cpu_dispatch.entries[1].executor
@@ -803,9 +804,24 @@ int main(void)
     runtime_manifest.local_memory_assignments.capacity = 2;
     runtime_manifest.startup_dependencies.entries = dependencies;
     runtime_manifest.startup_dependencies.capacity = 1;
+    runtime_manifest.launch_plan.plan_version =
+        WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION;
+    runtime_manifest.launch_plan.node_runtime_data_port = 19100;
+    runtime_manifest.launch_plan.node_runtime_control_port = 19121;
+    runtime_manifest.launch_plan.local_executor_service_port = 19105;
+    runtime_manifest.launch_plan.local_executor_control_port = 19121;
+    runtime_manifest.launch_plan.executor_worker_count = 1;
+    runtime_manifest.launch_plan.vcpu_handoff_record_capacity = 16;
+    runtime_manifest.launch_plan.sync_batch_size = 1;
+    runtime_manifest.launch_plan.guest_total_memory_bytes =
+        4 * 1024 * 1024;
+    runtime_manifest.launch_plan.guest_machine = candidate.guest_machine;
+    runtime_manifest.launch_plan.consistency_policy =
+        candidate.consistency_policy;
     if (expect(wvm_node_runtime_manifest_project(
-                   &candidate, candidate_digest, &reservation, &activation, 1,
-                   &runtime_manifest, error, sizeof(error)) == 0,
+                   &candidate, candidate_digest, &reservation, &activation,
+                   &runtime_manifest.launch_plan, 1, &runtime_manifest, error,
+                   sizeof(error)) == 0,
                "project node runtime manifest") ||
         expect(runtime_manifest.has_activation_fence,
                "project committed activation fence") ||
@@ -860,6 +876,10 @@ int main(void)
         expect(decoded_runtime_manifest.local_vcpu_assignments.count == 1 &&
                    decoded_runtime_manifest.local_memory_assignments.count == 1 &&
                    decoded_runtime_manifest.startup_dependencies.count == 1 &&
+                   decoded_runtime_manifest.launch_plan
+                           .local_executor_service_port == 19105 &&
+                   decoded_runtime_manifest.launch_plan
+                           .guest_total_memory_bytes == 4 * 1024 * 1024 &&
                    memcmp(decoded_runtime_manifest.candidate_manifest_digest,
                           candidate_digest, sizeof(candidate_digest)) == 0,
                "round trip node runtime manifest")) {

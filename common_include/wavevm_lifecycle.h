@@ -10,6 +10,9 @@
 #define WVM_RECORD_NODE_RUNTIME_MANIFEST 0x101eU
 #define WVM_RECORD_ACTIVATION_RECORD 0x101fU
 #define WVM_RECORD_ADMISSION_TRANSACTION 0x1027U
+#define WVM_RECORD_NODE_RUNTIME_LAUNCH_PLAN 0x1029U
+
+#define WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION 1U
 
 enum wvm_reservation_state {
     WVM_RESERVATION_PREPARED = 1,
@@ -107,6 +110,26 @@ struct wvm_activation_record {
     uint64_t decided_at;
 };
 
+/*
+ * Controller-selected local startup inputs for one admitted node runtime.
+ * The local executor service is always loopback-only; it is not a remote
+ * cluster endpoint. Sidecar/gateway reachability remains in the matching
+ * route snapshot and runtime dispatch projection.
+ */
+struct wvm_node_runtime_launch_plan {
+    uint16_t plan_version;
+    uint16_t node_runtime_data_port;
+    uint16_t node_runtime_control_port;
+    uint16_t local_executor_service_port;
+    uint16_t local_executor_control_port;
+    uint32_t executor_worker_count;
+    uint32_t vcpu_handoff_record_capacity;
+    uint32_t sync_batch_size;
+    uint64_t guest_total_memory_bytes;
+    struct wvm_machine_config guest_machine;
+    struct wvm_consistency_policy consistency_policy;
+};
+
 struct wvm_node_runtime_manifest {
     uint8_t candidate_manifest_digest[WVM_SHA256_DIGEST_BYTES];
     uint32_t vm_id;
@@ -127,6 +150,7 @@ struct wvm_node_runtime_manifest {
     struct wvm_execution_fault_profile negotiated_profile;
     uint8_t reservation_id[WVM_IDENTITY_ID_BYTES];
     struct wvm_startup_dependency_list startup_dependencies;
+    struct wvm_node_runtime_launch_plan launch_plan;
 };
 
 struct wvm_lifecycle_transaction {
@@ -223,11 +247,24 @@ int wvm_startup_dependency_decode(
     const uint8_t *bytes, size_t encoded_bytes,
     struct wvm_startup_dependency *dependency, char *error, size_t error_len);
 
+int wvm_node_runtime_launch_plan_validate(
+    const struct wvm_node_runtime_launch_plan *launch_plan, char *error,
+    size_t error_len);
+int wvm_node_runtime_launch_plan_encode(
+    const struct wvm_node_runtime_launch_plan *launch_plan, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len);
+int wvm_node_runtime_launch_plan_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_node_runtime_launch_plan *launch_plan, char *error,
+    size_t error_len);
+
 int wvm_node_runtime_manifest_project(
     const struct wvm_candidate_vm_manifest *candidate,
     const uint8_t candidate_manifest_digest[WVM_SHA256_DIGEST_BYTES],
     const struct wvm_resource_reservation *reservation,
-    const struct wvm_activation_record *activation, uint64_t local_role_bits,
+    const struct wvm_activation_record *activation,
+    const struct wvm_node_runtime_launch_plan *launch_plan,
+    uint64_t local_role_bits,
     struct wvm_node_runtime_manifest *runtime_manifest, char *error,
     size_t error_len);
 

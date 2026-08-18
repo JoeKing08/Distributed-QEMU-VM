@@ -21,7 +21,7 @@ static void set_error(char *error, size_t error_len, const char *fmt, ...)
 static int valid_namespace_abi(enum wvm_namespace_abi namespace_abi)
 {
     return namespace_abi == WVM_NAMESPACE_ABI_LEGACY ||
-           namespace_abi == WVM_NAMESPACE_ABI_V1_U32;
+           namespace_abi == WVM_NAMESPACE_ABI_U32;
 }
 
 static int valid_namespace_state(enum wvm_vm_namespace_state state)
@@ -119,7 +119,7 @@ void wvm_vm_namespace_allocator_init(struct wvm_vm_namespace_allocator *allocato
     memset(allocator, 0, sizeof(*allocator));
     allocator->records = records;
     allocator->record_capacity = record_capacity;
-    allocator->next_v1_vm_id = 256;
+    allocator->next_vm_id = 256;
     allocator->next_legacy_vm_id = 1;
     allocator->legacy_cluster_epoch = legacy_cluster_epoch;
     if (records && record_capacity != 0) {
@@ -177,8 +177,8 @@ static int allocate_fresh_id(struct wvm_vm_namespace_allocator *allocator,
     }
 
     for (attempts = 0; attempts < UINT32_MAX; attempts++) {
-        candidate = allocator->next_v1_vm_id;
-        allocator->next_v1_vm_id =
+        candidate = allocator->next_vm_id;
+        allocator->next_vm_id =
             candidate == UINT32_MAX ? 256 : candidate + 1;
         if (candidate < 256) {
             continue;
@@ -350,7 +350,7 @@ int wvm_vm_namespace_restore(
         vm_incarnation == 0 || vm_incarnation == UINT64_MAX ||
         !valid_namespace_state(state) || state == WVM_VM_NAMESPACE_FREE ||
         (namespace_abi == WVM_NAMESPACE_ABI_LEGACY && vm_id > 255) ||
-        (namespace_abi == WVM_NAMESPACE_ABI_V1_U32 && vm_id < 256)) {
+        (namespace_abi == WVM_NAMESPACE_ABI_U32 && vm_id < 256)) {
         set_error(error, error_len, "invalid durable VM namespace record");
         return -1;
     }
@@ -388,8 +388,8 @@ int wvm_vm_namespace_restore(
         if (vm_id >= allocator->next_legacy_vm_id) {
             allocator->next_legacy_vm_id = vm_id == 255 ? 1 : vm_id + 1U;
         }
-    } else if (vm_id >= allocator->next_v1_vm_id) {
-        allocator->next_v1_vm_id = vm_id == UINT32_MAX ? 256 : vm_id + 1U;
+    } else if (vm_id >= allocator->next_vm_id) {
+        allocator->next_vm_id = vm_id == UINT32_MAX ? 256 : vm_id + 1U;
     }
     return 0;
 }
@@ -470,7 +470,7 @@ int wvm_local_name_namespace_derive(
 
     written = snprintf(namespace_out->namespace_name,
                        sizeof(namespace_out->namespace_name),
-                       "wvm-v1-v%" PRIu32 "-i%" PRIu64 "-g%" PRIu64
+                       "wvm-v%" PRIu32 "-i%" PRIu64 "-g%" PRIu64
                        "-n%" PRIu32 "-%s",
                        identity->vm_id, identity->vm_incarnation,
                        identity->manifest_generation,

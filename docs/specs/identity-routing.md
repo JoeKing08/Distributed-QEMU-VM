@@ -128,7 +128,7 @@ unsafe immediate reuse is valid.
 The V1 envelope's `vm_id` is a full `u32` namespace. The allocator may assign
 any value in `1..UINT32_MAX` only after every required participant for that VM
 (QEMU frontend, node runtimes, executors, sidecars, gateways, and selected
-accelerator contexts) has negotiated `WVM_CAP_V1_VM_ID_U32`. A participant
+accelerator contexts) has negotiated `WVM_CAP_VM_ID_U32`. A participant
 outside the VM's manifest need not negotiate this feature merely because it is
 registered in the cluster.
 

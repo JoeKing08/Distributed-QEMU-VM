@@ -95,6 +95,8 @@ int main(void)
     struct wvm_vcpu_assignment vcpu_assignments[3];
     struct wvm_memory_chunk_assignment memory_assignments[4];
     struct wvm_reservation_requirement reservation_requirements[2];
+    struct wvm_admission_node_listener_plan listener_plans[2];
+    struct wvm_exclusive_lease listener_leases[2][3];
     struct wvm_placement_plan placement_plan;
     uint8_t admission_tx_id[WVM_ADMISSION_ID_BYTES] = {0};
     uint8_t eligibility_fence_digest[WVM_SHA256_DIGEST_BYTES];
@@ -151,9 +153,28 @@ int main(void)
     options.guest_topology_policy = WVM_MANIFEST_GUEST_TOPOLOGY_FLAT;
     options.guest_numa_nodes = 1;
     options.executor_class = 1;
+    options.kernel_accelerator_required = 0;
     options.route_scope_key.vm_id = request.vm_id;
     options.route_scope_key.vm_incarnation = request.vm_incarnation;
     options.route_scope_key.route_scope_id = 1;
+    memset(listener_plans, 0, sizeof(listener_plans));
+    memset(listener_leases, 0, sizeof(listener_leases));
+    listener_plans[0].physical_node_id = 17;
+    listener_plans[0].expected_node_instance_id = 101;
+    listener_plans[0].node_runtime_data_port = 19100;
+    listener_plans[0].local_executor_service_port = 19105;
+    listener_plans[0].lease_generation = 101;
+    listener_plans[0].lease_entries = listener_leases[0];
+    listener_plans[0].lease_capacity = 3;
+    listener_plans[1].physical_node_id = 99;
+    listener_plans[1].expected_node_instance_id = 202;
+    listener_plans[1].node_runtime_data_port = 19200;
+    listener_plans[1].local_executor_service_port = 19205;
+    listener_plans[1].lease_generation = 202;
+    listener_plans[1].lease_entries = listener_leases[1];
+    listener_plans[1].lease_capacity = 3;
+    options.listener_plans = listener_plans;
+    options.listener_plan_count = 2;
     memset(eligibility_fence_digest, 0x5a, sizeof(eligibility_fence_digest));
     memset(&placement_plan, 0, sizeof(placement_plan));
     placement_plan.vcpu_assignments.entries = vcpu_assignments;
@@ -174,6 +195,9 @@ int main(void)
                "cover every requested CPU and memory chunk") ||
         expect(placement_plan.host_node == proposed_plan.host_physical_node_id,
                "preserve selected host") ||
+        expect(placement_plan.reservation_requirements.entries[0]
+                       .exclusive_leases.count == 2,
+               "reserve the two actual node listeners") ||
         expect(wvm_placement_plan_encode(
                    &placement_plan, placement_bytes, sizeof(placement_bytes),
                    &placement_bytes_used, placement_digest, error,
@@ -181,6 +205,27 @@ int main(void)
                "encode the generated placement plan")) {
         return 1;
     }
+
+    options.kernel_accelerator_required = 1;
+    listener_plans[0].kernel_accelerator_required = 1;
+    listener_plans[1].kernel_accelerator_required = 1;
+    if (expect(wvm_admission_placement_plan_build(
+                   &snapshot, &request, &proposed_plan, eligibility_fence_digest,
+                   &options, &placement_plan, error, sizeof(error)) == 0 &&
+                   placement_plan.reservation_requirements.entries[0]
+                           .exclusive_leases.count == 3 &&
+                   placement_plan.reservation_requirements.entries[0]
+                           .exclusive_leases.entries[2].lease_kind ==
+                       WVM_EXCLUSIVE_LEASE_KIND_KERNEL_CONTEXT &&
+                   strcmp(placement_plan.reservation_requirements.entries[0]
+                              .exclusive_leases.entries[2].lease_name,
+                          "kernel-context") == 0,
+               "kernel profile reserves one local context per node")) {
+        return 1;
+    }
+    options.kernel_accelerator_required = 0;
+    listener_plans[0].kernel_accelerator_required = 0;
+    listener_plans[1].kernel_accelerator_required = 0;
 
     snapshot.nodes[1].committed_vcpu_slots = 2;
     if (expect(wvm_admission_plan_propose(&snapshot, &request, admission_tx_id,

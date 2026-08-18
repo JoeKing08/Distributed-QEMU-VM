@@ -20,7 +20,7 @@ static void fill_id(uint8_t id[WVM_IDENTITY_ID_BYTES], uint8_t value)
 
 int main(void)
 {
-    struct wvm_exclusive_lease host_leases[1];
+    struct wvm_exclusive_lease host_leases[2];
     struct wvm_reservation_requirement requirements[2];
     struct wvm_vcpu_assignment vcpus[2];
     struct wvm_memory_chunk_assignment memory[2];
@@ -153,6 +153,17 @@ int main(void)
     if (expect(wvm_placement_plan_decode(bytes, encoded_bytes, &decoded_plan,
                                          error, sizeof(error)) != 0,
                "reject a mismatched plan digest")) {
+        return 1;
+    }
+
+    host_leases[1] = host_leases[0];
+    host_leases[1].lease_generation = 2;
+    requirements[0].exclusive_leases.count = 2;
+    requirements[0].exclusive_leases.capacity = 2;
+    if (expect(wvm_placement_plan_encode(&plan, bytes, sizeof(bytes),
+                                         &encoded_bytes, digest, error,
+                                         sizeof(error)) != 0,
+               "reject duplicate lease resource with a different generation")) {
         return 1;
     }
 

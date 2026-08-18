@@ -404,6 +404,7 @@ int wvm_cluster_snapshot_build(
         (records->gateway_count != 0 && !records->gateways) ||
         records->inventory_revision == 0 || records->membership_revision == 0 ||
         records->topology_revision == 0 ||
+        records->admission_eligibility_revision == 0 ||
         records->capability_profile_generation == 0 ||
         capability_set_validate(records, error, error_len) != 0) {
         set_error(error, error_len, "cluster record set is invalid");
@@ -833,6 +834,8 @@ int wvm_cluster_admission_fence_build(
            sizeof(fence->admission_tx_id));
     fence->membership_revision = snapshot->admission.membership_revision;
     fence->topology_revision = snapshot->admission.topology_revision;
+    fence->admission_eligibility_revision =
+        records->admission_eligibility_revision;
     fence->inventory_revision = snapshot->admission.inventory_revision;
     fence->capability_profile_generation =
         snapshot->admission.capability_profile_generation;

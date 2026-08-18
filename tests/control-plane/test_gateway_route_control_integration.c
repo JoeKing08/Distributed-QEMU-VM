@@ -18,7 +18,7 @@
 #include <unistd.h>
 
 #include "wavevm_control.h"
-#include "wavevm_envelope_v1.h"
+#include "wavevm_envelope.h"
 #include "wavevm_route_delivery.h"
 #include "wavevm_runtime_gate.h"
 
@@ -188,6 +188,23 @@ static int create_runtime_manifest(
     manifest.negotiated_profile.per_node_capabilities.entries = &capability;
     manifest.negotiated_profile.per_node_capabilities.count = 1;
     manifest.negotiated_profile.per_node_capabilities.capacity = 1;
+    manifest.launch_plan.plan_version = WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION;
+    manifest.launch_plan.node_runtime_data_port = 19100;
+    manifest.launch_plan.node_runtime_control_port = 19121;
+    manifest.launch_plan.local_executor_service_port = 19105;
+    manifest.launch_plan.local_executor_control_port = 19121;
+    manifest.launch_plan.executor_worker_count = 1;
+    manifest.launch_plan.vcpu_handoff_record_capacity = 16;
+    manifest.launch_plan.sync_batch_size = 1;
+    manifest.launch_plan.guest_total_memory_bytes = 4 * 1024 * 1024;
+    strcpy(manifest.launch_plan.guest_machine.architecture, "x86_64");
+    strcpy(manifest.launch_plan.guest_machine.machine_type, "pc-i440fx-5.2");
+    manifest.launch_plan.guest_machine.qemu_compat_version = 502;
+    manifest.launch_plan.guest_machine.firmware_policy = 1;
+    manifest.launch_plan.consistency_policy.dirty_batch_size = 1;
+    manifest.launch_plan.consistency_policy.handoff_commit_policy = 1;
+    manifest.launch_plan.consistency_policy.subscriber_delivery_policy = 1;
+    manifest.launch_plan.consistency_policy.max_commit_latency_ms = 1000;
 
     return wvm_runtime_manifest_file_publish(manifest_path, &manifest, error,
                                              error_len);
@@ -311,7 +328,7 @@ static void stop_gateway(pid_t child)
     (void)waitpid(child, &status, 0);
 }
 
-static void make_control_request(struct wvm_envelope_v1 *request,
+static void make_control_request(struct wvm_envelope *request,
                                  uint16_t message_type,
                                  uint8_t operation_tail,
                                  const uint8_t *payload, size_t payload_bytes)
@@ -330,21 +347,21 @@ static void make_control_request(struct wvm_envelope_v1 *request,
 }
 
 static int send_control_request(const char *socket_path,
-                                const struct wvm_envelope_v1 *request,
+                                const struct wvm_envelope *request,
                                 uint16_t expected_state)
 {
     struct sockaddr_un address;
     struct pollfd pollfd;
-    struct wvm_envelope_v1 response;
-    uint8_t request_bytes[WVM_ENVELOPE_V1_HEADER_BYTES +
-                          WVM_ENVELOPE_V1_MAX_LOCAL_PAYLOAD];
-    uint8_t response_bytes[WVM_ENVELOPE_V1_HEADER_BYTES + 128];
+    struct wvm_envelope response;
+    uint8_t request_bytes[WVM_ENVELOPE_HEADER_BYTES +
+                          WVM_ENVELOPE_MAX_LOCAL_PAYLOAD];
+    uint8_t response_bytes[WVM_ENVELOPE_HEADER_BYTES + 128];
     size_t request_byte_count = 0;
     ssize_t received;
     char error[256] = {0};
     int fd;
 
-    if (wvm_envelope_v1_encode(request, WVM_ENVELOPE_V1_TRANSPORT_LOCAL,
+    if (wvm_envelope_encode(request, WVM_ENVELOPE_TRANSPORT_LOCAL,
                                request_bytes, sizeof(request_bytes),
                                &request_byte_count, error,
                                sizeof(error)) != 0) {
@@ -378,10 +395,10 @@ static int send_control_request(const char *socket_path,
     received = recv(fd, response_bytes, sizeof(response_bytes), 0);
     close(fd);
     if (received <= 0 ||
-        wvm_envelope_v1_decode(response_bytes, (size_t)received,
-                               WVM_ENVELOPE_V1_TRANSPORT_LOCAL, &response,
+        wvm_envelope_decode(response_bytes, (size_t)received,
+                               WVM_ENVELOPE_TRANSPORT_LOCAL, &response,
                                error, sizeof(error)) != 0 ||
-        response.message_type != WVM_ENVELOPE_V1_MSG_CTRL_RESULT ||
+        response.message_type != WVM_ENVELOPE_MSG_CTRL_RESULT ||
         response.payload_bytes != 72 ||
         read_be16(response.payload) != 0 ||
         read_be16(response.payload + 2) != expected_state ||
@@ -400,10 +417,10 @@ static int expect_forwarded_frame(int receiver_fd, uint16_t gateway_port,
 {
     struct sockaddr_in gateway_address;
     struct pollfd pollfd;
-    struct wvm_envelope_v1 request;
-    struct wvm_envelope_v1 forwarded;
-    uint8_t frame[WVM_ENVELOPE_V1_MAX_NETWORK_FRAME_BYTES];
-    uint8_t received[WVM_ENVELOPE_V1_MAX_NETWORK_FRAME_BYTES];
+    struct wvm_envelope request;
+    struct wvm_envelope forwarded;
+    uint8_t frame[WVM_ENVELOPE_MAX_NETWORK_FRAME_BYTES];
+    uint8_t received[WVM_ENVELOPE_MAX_NETWORK_FRAME_BYTES];
     static const uint8_t payload[] = {0xa1, 0xb2, 0xc3, 0xd4};
     size_t frame_bytes = 0;
     ssize_t received_bytes;
@@ -411,7 +428,7 @@ static int expect_forwarded_frame(int receiver_fd, uint16_t gateway_port,
     int sender;
 
     memset(&request, 0, sizeof(request));
-    request.message_type = WVM_ENVELOPE_V1_MSG_MEM_READ;
+    request.message_type = WVM_ENVELOPE_MSG_MEM_READ;
     request.vm_id = key->scope_key.vm_id;
     request.vm_incarnation = key->scope_key.vm_incarnation;
     request.manifest_generation = 9;
@@ -425,12 +442,12 @@ static int expect_forwarded_frame(int receiver_fd, uint16_t gateway_port,
     memcpy(request.route_snapshot_digest, key->snapshot_digest,
            sizeof(request.route_snapshot_digest));
     request.route.destination_kind =
-        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE;
+        WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE;
     request.route.destination_vnode_or_endpoint = 0;
     request.route.hop_limit = 4;
     request.payload = payload;
     request.payload_bytes = sizeof(payload);
-    if (wvm_envelope_v1_encode(&request, WVM_ENVELOPE_V1_TRANSPORT_NETWORK,
+    if (wvm_envelope_encode(&request, WVM_ENVELOPE_TRANSPORT_NETWORK,
                                frame, sizeof(frame), &frame_bytes, error,
                                sizeof(error)) != 0) {
         fprintf(stderr, "cannot encode routed V1 frame: %s\n", error);
@@ -459,8 +476,8 @@ static int expect_forwarded_frame(int receiver_fd, uint16_t gateway_port,
     }
     received_bytes = recv(receiver_fd, received, sizeof(received), 0);
     if (received_bytes <= 0 ||
-        wvm_envelope_v1_decode(received, (size_t)received_bytes,
-                               WVM_ENVELOPE_V1_TRANSPORT_NETWORK, &forwarded,
+        wvm_envelope_decode(received, (size_t)received_bytes,
+                               WVM_ENVELOPE_TRANSPORT_NETWORK, &forwarded,
                                error, sizeof(error)) != 0 ||
         forwarded.message_type != request.message_type ||
         forwarded.route.hop_count != 1 ||
@@ -495,7 +512,7 @@ int main(int argc, char **argv)
     struct wvm_required_ack_entry initial_ack;
     struct wvm_required_ack_entry successor_ack;
     struct wvm_required_ack_entry poison_ack;
-    struct wvm_envelope_v1 request;
+    struct wvm_envelope request;
     uint8_t snapshot_bytes[8192];
     uint8_t key_bytes[512];
     size_t snapshot_byte_count = 0;
@@ -597,7 +614,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "encode successor snapshot: %s\n", error);
         goto out;
     }
-    make_control_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_PREPARE, 2,
+    make_control_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 2,
                          snapshot_bytes, snapshot_byte_count);
     if (expect(send_control_request(control_socket_path, &request, 1) == 0,
                "prepare successor through gateway control socket") ||
@@ -607,7 +624,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "prepare successor failed: %s\n", error);
         goto out;
     }
-    make_control_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_COMMIT, 3,
+    make_control_request(&request, WVM_ENVELOPE_MSG_ROUTE_COMMIT, 3,
                          key_bytes, key_byte_count);
     if (expect(send_control_request(control_socket_path, &request, 2) == 0,
                "commit successor through gateway control socket")) {

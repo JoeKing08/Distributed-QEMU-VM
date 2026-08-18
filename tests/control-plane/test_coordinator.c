@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,8 +7,10 @@
 #include "wavevm_canonical.h"
 #include "wavevm_control_plane.h"
 #include "wavevm_coordinator.h"
+#include "wavevm_admission_orchestrator.h"
 #include "wavevm_membership.h"
 #include "wavevm_reservation_runtime.h"
+#include "wavevm_runtime_names.h"
 
 #define MIB (1024ULL * 1024ULL)
 
@@ -27,6 +30,7 @@ struct prepared_buffers {
     struct wvm_vcpu_assignment local_vcpus[4][4];
     struct wvm_memory_chunk_assignment local_memory[4][4];
     struct wvm_startup_dependency dependencies[4][4];
+    struct wvm_exclusive_lease listener_leases[4][3];
 };
 
 static int expect(int condition, const char *message)
@@ -69,7 +73,7 @@ static void fill_capability(struct wvm_capability_record *record,
 {
     memset(record, 0, sizeof(*record));
     record->capability_id = capability_id;
-    record->capability_schema_version = WVM_CANONICAL_SCHEMA_V1;
+    record->capability_schema_version = WVM_CANONICAL_SCHEMA;
     record->physical_node_id = node_id;
     record->node_instance_id = node_instance;
     record->provider_instance_id = provider;
@@ -161,7 +165,7 @@ static void admission_node_from_record(struct wvm_admission_node *admission,
 static void fill_request(struct wvm_vm_request *request)
 {
     memset(request, 0, sizeof(*request));
-    request->api_version = WVM_CANONICAL_SCHEMA_V1;
+    request->api_version = WVM_CANONICAL_SCHEMA;
     request->request_id[WVM_IDENTITY_ID_BYTES - 1] = 0x42;
     request->requested_vcpus = 2;
     request->requested_memory_bytes = 4 * MIB;
@@ -218,6 +222,58 @@ static void fill_options(
     options->placement_plan_bytes_capacity = placement_bytes_capacity;
     options->candidate_manifest_bytes = candidate_bytes;
     options->candidate_manifest_bytes_capacity = candidate_bytes_capacity;
+}
+
+static void fill_node_launch_plans(
+    struct wvm_coordinator_prepare_options *options,
+    struct wvm_coordinator_node_launch_plan launch_plans[2],
+    const struct wvm_node_record nodes[2],
+    struct wvm_admission_node_listener_plan listener_plans[2],
+    struct wvm_exclusive_lease listener_leases[2][3])
+{
+    size_t i;
+
+    memset(launch_plans, 0, 2 * sizeof(*launch_plans));
+    memset(listener_plans, 0, 2 * sizeof(*listener_plans));
+    memset(listener_leases, 0, 2 * sizeof(*listener_leases));
+    for (i = 0; i < 2; i++) {
+        struct wvm_node_runtime_launch_plan *launch_plan =
+            &launch_plans[i].launch_plan;
+
+        launch_plans[i].physical_node_id = nodes[i].physical_node_id;
+        launch_plans[i].expected_node_instance_id = nodes[i].node_instance_id;
+        launch_plan->plan_version = WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION;
+        launch_plan->node_runtime_data_port = (uint16_t)(19100 + i * 100);
+        launch_plan->node_runtime_control_port = (uint16_t)(19121 + i * 100);
+        launch_plan->local_executor_service_port =
+            (uint16_t)(19105 + i * 100);
+        launch_plan->local_executor_control_port =
+            launch_plan->node_runtime_control_port;
+        launch_plan->executor_worker_count = 1;
+        launch_plan->vcpu_handoff_record_capacity = 16;
+        launch_plan->sync_batch_size = 1;
+        launch_plan->guest_total_memory_bytes = 4 * MIB;
+        launch_plan->guest_machine = options->guest_machine;
+        launch_plan->consistency_policy.dirty_batch_size = 1;
+        launch_plan->consistency_policy.handoff_commit_policy = 1;
+        launch_plan->consistency_policy.subscriber_delivery_policy = 1;
+        launch_plan->consistency_policy.max_commit_latency_ms = 1000;
+        listener_plans[i].physical_node_id = nodes[i].physical_node_id;
+        listener_plans[i].expected_node_instance_id = nodes[i].node_instance_id;
+        listener_plans[i].node_runtime_data_port =
+            launch_plan->node_runtime_data_port;
+        listener_plans[i].local_executor_service_port =
+            launch_plan->local_executor_service_port;
+        listener_plans[i].kernel_accelerator_required =
+            options->execution_profile.kernel_accelerator_bits != 0;
+        listener_plans[i].lease_generation = nodes[i].node_instance_id;
+        listener_plans[i].lease_entries = listener_leases[i];
+        listener_plans[i].lease_capacity = 3;
+    }
+    options->node_launch_plans = launch_plans;
+    options->node_launch_plan_count = 2;
+    options->node_listener_plans = listener_plans;
+    options->node_listener_plan_count = 2;
 }
 
 static void initialize_prepared_vm(struct wvm_coordinator_prepared_vm *prepared,
@@ -369,6 +425,178 @@ static int persist_route_transaction_state(
                                                       error_len);
 }
 
+enum orchestrator_test_failure {
+    ORCHESTRATOR_TEST_NO_FAILURE = 0,
+    ORCHESTRATOR_TEST_RESERVATION_PREPARE = 1,
+    ORCHESTRATOR_TEST_PARTICIPANT_COMMIT = 2,
+};
+
+struct orchestrator_test_hooks {
+    const struct wvm_gateway_record *gateway;
+    struct wvm_required_ack_entry *ack_entries;
+    struct wvm_required_ack_set *ack_set;
+    uint8_t route_operation_suffix;
+    enum orchestrator_test_failure failure;
+    unsigned route_prepares;
+    unsigned route_commits;
+    unsigned route_aborts;
+    unsigned reservation_prepares;
+    unsigned reservation_commits;
+    unsigned reservation_aborts;
+    unsigned participant_prepares;
+    unsigned participant_commits;
+    unsigned participant_aborts;
+    unsigned participant_readies;
+};
+
+static int orchestrator_route_plan(
+    void *opaque, const struct wvm_coordinator_transaction *transaction,
+    struct wvm_coordinator_prepared_route *prepared_route,
+    struct wvm_route_transaction_record *route_transaction, char *error,
+    size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    return build_prepared_route(transaction, hooks->gateway, hooks->ack_entries,
+                                hooks->ack_set, prepared_route, error,
+                                error_len) == 0 &&
+                   build_route_transaction(prepared_route,
+                                            hooks->route_operation_suffix,
+                                            route_transaction, error,
+                                            error_len) == 0
+               ? 0
+               : -1;
+}
+
+static int orchestrator_route_prepare(
+    void *opaque, const struct wvm_route_transaction_record *transaction,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)transaction;
+    (void)error;
+    (void)error_len;
+    hooks->route_prepares++;
+    return 0;
+}
+
+static int orchestrator_route_commit(
+    void *opaque, const struct wvm_route_transaction_record *transaction,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)transaction;
+    (void)error;
+    (void)error_len;
+    hooks->route_commits++;
+    return 0;
+}
+
+static int orchestrator_route_abort(
+    void *opaque, const struct wvm_route_transaction_record *transaction,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)transaction;
+    (void)error;
+    (void)error_len;
+    hooks->route_aborts++;
+    return 0;
+}
+
+static int orchestrator_reservation_prepare(
+    void *opaque, const struct wvm_resource_reservation *reservation,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)reservation;
+    (void)error;
+    (void)error_len;
+    hooks->reservation_prepares++;
+    return hooks->failure == ORCHESTRATOR_TEST_RESERVATION_PREPARE ? -1 : 0;
+}
+
+static int orchestrator_reservation_commit(
+    void *opaque, const struct wvm_resource_reservation *reservation,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)reservation;
+    (void)error;
+    (void)error_len;
+    hooks->reservation_commits++;
+    return 0;
+}
+
+static int orchestrator_reservation_abort(
+    void *opaque, const struct wvm_resource_reservation *reservation,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)reservation;
+    (void)error;
+    (void)error_len;
+    hooks->reservation_aborts++;
+    return 0;
+}
+
+static int orchestrator_participant_prepare(
+    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)manifest;
+    (void)error;
+    (void)error_len;
+    hooks->participant_prepares++;
+    return 0;
+}
+
+static int orchestrator_participant_commit(
+    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)manifest;
+    (void)error;
+    (void)error_len;
+    hooks->participant_commits++;
+    return hooks->failure == ORCHESTRATOR_TEST_PARTICIPANT_COMMIT ? -1 : 0;
+}
+
+static int orchestrator_participant_abort(
+    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    (void)manifest;
+    (void)error;
+    (void)error_len;
+    hooks->participant_aborts++;
+    return 0;
+}
+
+static int orchestrator_participant_ready(
+    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    char *error, size_t error_len)
+{
+    struct orchestrator_test_hooks *hooks = opaque;
+
+    hooks->participant_readies++;
+    return wvm_runtime_ready_publish(manifest,
+                                      manifest->expected_node_instance_id,
+                                      error, error_len);
+}
+
 int main(void)
 {
     struct wvm_capability_record capabilities[8];
@@ -377,19 +605,19 @@ int main(void)
     struct wvm_cluster_record_set records;
     struct wvm_vm_request request;
     struct wvm_vm_request abort_request;
-    struct wvm_vm_namespace_record namespace_records[2];
+    struct wvm_vm_namespace_record namespace_records[5];
     struct wvm_vm_namespace_allocator namespace_allocator;
-    struct wvm_control_plane_entry control_plane_entries[2];
-    struct wvm_control_plane_route_entry control_plane_route_entries[2];
+    struct wvm_control_plane_entry control_plane_entries[5];
+    struct wvm_control_plane_route_entry control_plane_route_entries[5];
     struct wvm_control_plane_runtime_manifest_entry
-        control_plane_runtime_manifest_entries[4];
+        control_plane_runtime_manifest_entries[12];
     struct wvm_control_plane control_plane;
-    struct wvm_control_plane_entry recovered_control_plane_entries[2];
-    struct wvm_control_plane_route_entry recovered_control_plane_route_entries[2];
+    struct wvm_control_plane_entry recovered_control_plane_entries[5];
+    struct wvm_control_plane_route_entry recovered_control_plane_route_entries[5];
     struct wvm_control_plane_runtime_manifest_entry
-        recovered_runtime_manifest_entries[4];
+        recovered_runtime_manifest_entries[12];
     struct wvm_control_plane recovered_control_plane;
-    struct wvm_vm_namespace_record recovered_namespace_records[2];
+    struct wvm_vm_namespace_record recovered_namespace_records[5];
     struct wvm_vm_namespace_allocator recovered_namespace_allocator;
     struct id_provider_context provider_context = {
         .next_id = 1,
@@ -413,6 +641,12 @@ int main(void)
     struct wvm_coordinator_prepare_options options;
     struct wvm_coordinator_prepare_options abort_options;
     struct wvm_capability_ref profile_capabilities[2];
+    struct wvm_coordinator_node_launch_plan launch_plans[2];
+    struct wvm_coordinator_node_launch_plan abort_launch_plans[2];
+    struct wvm_admission_node_listener_plan listener_plans[2];
+    struct wvm_admission_node_listener_plan abort_listener_plans[2];
+    struct wvm_exclusive_lease listener_leases[2][3];
+    struct wvm_exclusive_lease abort_listener_leases[2][3];
     struct wvm_coordinator_prepared_vm prepared;
     struct wvm_coordinator_prepared_vm rejected_prepared;
     struct wvm_coordinator_prepared_vm abort_prepared;
@@ -463,7 +697,7 @@ int main(void)
                     2);
     fill_capability(&capabilities[2], WVM_CAPABILITY_ID_MODE_B_MEMORY, 17, 101,
                     3);
-    fill_capability(&capabilities[3], WVM_CAPABILITY_ID_V1_VM_ID_U32, 17, 101,
+    fill_capability(&capabilities[3], WVM_CAPABILITY_ID_VM_ID_U32, 17, 101,
                     4);
     fill_capability(&capabilities[4], WVM_CAPABILITY_ID_EXECUTION_KVM, 99, 202,
                     1);
@@ -471,7 +705,7 @@ int main(void)
                     2);
     fill_capability(&capabilities[6], WVM_CAPABILITY_ID_MODE_B_MEMORY, 99, 202,
                     3);
-    fill_capability(&capabilities[7], WVM_CAPABILITY_ID_V1_VM_ID_U32, 99, 202,
+    fill_capability(&capabilities[7], WVM_CAPABILITY_ID_VM_ID_U32, 99, 202,
                     4);
     if (expect(fill_node(&nodes[0], 17, 101, 1, capabilities, 4, gateway_ids,
                          1) == 0 &&
@@ -503,6 +737,7 @@ int main(void)
     records.inventory_revision = 10;
     records.membership_revision = 5;
     records.topology_revision = 6;
+    records.admission_eligibility_revision = 7;
     records.capability_profile_generation = 9;
 
     fill_request(&request);
@@ -562,6 +797,8 @@ int main(void)
     profile_capabilities[1] = nodes[1].capability;
     fill_options(&options, profile_capabilities, placement_bytes,
                  sizeof(placement_bytes), candidate_bytes, sizeof(candidate_bytes));
+    fill_node_launch_plans(&options, launch_plans, nodes, listener_plans,
+                           listener_leases);
     if (expect(build_prepared_route(&transaction, &gateway, ack_entries, &ack_set,
                                     &prepared_route, error, sizeof(error)) == 0,
                "build prepared canonical route ACK set")) {
@@ -588,7 +825,7 @@ int main(void)
         expect(prepared.candidate.execution_plan.backend ==
                    WVM_MANIFEST_BACKEND_TCG &&
                    prepared.candidate.namespace_abi ==
-                       WVM_MANIFEST_NAMESPACE_V1_U32 &&
+                       WVM_MANIFEST_NAMESPACE_U32 &&
                    !bytes_are_zero(prepared.candidate_manifest_digest,
                                    sizeof(prepared.candidate_manifest_digest)),
                "bind selected TCG profile to V1 candidate") ||
@@ -705,6 +942,16 @@ int main(void)
     fill_options(&abort_options, profile_capabilities, abort_placement_bytes,
                  sizeof(abort_placement_bytes), abort_candidate_bytes,
                  sizeof(abort_candidate_bytes));
+    fill_node_launch_plans(&abort_options, abort_launch_plans, nodes,
+                           abort_listener_plans, abort_listener_leases);
+    for (i = 0; i < 2; i++) {
+        abort_launch_plans[i].launch_plan.node_runtime_data_port += 20;
+        abort_launch_plans[i].launch_plan.local_executor_service_port += 20;
+        abort_listener_plans[i].node_runtime_data_port =
+            abort_launch_plans[i].launch_plan.node_runtime_data_port;
+        abort_listener_plans[i].local_executor_service_port =
+            abort_launch_plans[i].launch_plan.local_executor_service_port;
+    }
     if (expect(build_prepared_route(
                    &abort_transaction, &gateway, abort_ack_entries, &abort_ack_set,
                    &abort_prepared_route, error, sizeof(error)) == 0,
@@ -799,6 +1046,15 @@ int main(void)
         sizeof(activation_route_keys) / sizeof(activation_route_keys[0]);
     activation_options.durable_decision_sequence = 3;
     activation_options.decided_at = 2002;
+    records.admission_eligibility_revision++;
+    if (expect(wvm_coordinator_decide_activation(
+                   &request, &transaction, &records, &prepared_route,
+                   &id_provider, &activation_options, &prepared, &activation,
+                   error, sizeof(error)) != 0,
+               "reject activation after eligibility-only change")) {
+        return 1;
+    }
+    records.admission_eligibility_revision--;
     nodes[1].observed_health_state = 2;
     if (expect(wvm_coordinator_decide_activation(
                    &request, &transaction, &records, &prepared_route,
@@ -947,18 +1203,46 @@ int main(void)
                "registry preserves committed VM while aborted VM is released")) {
         return 1;
     }
-    if (expect(wvm_control_plane_transition(
-                   &control_plane, &transaction, WVM_LIFECYCLE_COMMITTED,
-                   WVM_LIFECYCLE_STARTING, error, sizeof(error)) == 0 &&
-                   wvm_control_plane_transition(
-                       &control_plane, &transaction, WVM_LIFECYCLE_STARTING,
-                       WVM_LIFECYCLE_RUNNING, error, sizeof(error)) == 0 &&
+    if (expect(wvm_control_plane_start_if_ready(
+                   &control_plane, &transaction,
+                   prepared.node_runtime_manifests,
+                   prepared.node_runtime_manifest_count, error,
+                   sizeof(error)) == -EAGAIN,
+               "reject start before runtime readiness evidence")) {
+        return 1;
+    }
+    for (i = 0; i < prepared.node_runtime_manifest_count; i++) {
+        if (expect(wvm_runtime_ready_publish(
+                       &prepared.node_runtime_manifests[i],
+                       prepared.node_runtime_manifests[i]
+                           .expected_node_instance_id,
+                       error, sizeof(error)) == 0,
+                   "publish identity-bound runtime readiness")) {
+            return 1;
+        }
+    }
+    if (expect(wvm_control_plane_start_if_ready(
+                   &control_plane, &transaction,
+                   prepared.node_runtime_manifests,
+                   prepared.node_runtime_manifest_count, error,
+                   sizeof(error)) == 0 &&
                    wvm_control_plane_transition(
                        &control_plane, &transaction, WVM_LIFECYCLE_RUNNING,
-                       WVM_LIFECYCLE_STOPPING, error, sizeof(error)) == 0 &&
-                   wvm_control_plane_transition(
-                       &control_plane, &transaction, WVM_LIFECYCLE_STOPPING,
-                       WVM_LIFECYCLE_RETIRING, error, sizeof(error)) != 0,
+                       WVM_LIFECYCLE_STOPPING, error, sizeof(error)) == 0,
+               "start only after all runtime readiness evidence")) {
+        return 1;
+    }
+    for (i = 0; i < prepared.node_runtime_manifest_count; i++) {
+        if (expect(wvm_runtime_ready_remove(
+                       &prepared.node_runtime_manifests[i], error,
+                       sizeof(error)) == 0,
+                   "remove runtime readiness after stop path begins")) {
+            return 1;
+        }
+    }
+    if (expect(wvm_control_plane_transition(
+                   &control_plane, &transaction, WVM_LIFECYCLE_STOPPING,
+                   WVM_LIFECYCLE_RETIRING, error, sizeof(error)) != 0,
                "reject retirement before exact route retirement") ||
         expect(persist_route_transaction_state(
                    &control_plane, &route_transaction,
@@ -980,6 +1264,304 @@ int main(void)
                        WVM_LIFECYCLE_STOPPED, error, sizeof(error)) == 0,
                "complete lifecycle only after exact route retirement")) {
         return 1;
+    }
+
+    {
+        struct wvm_vm_request orchestrator_request = request;
+        struct wvm_coordinator_prepare_options orchestrator_options;
+        struct wvm_coordinator_node_launch_plan orchestrator_launch_plans[2];
+        struct wvm_admission_node_listener_plan orchestrator_listener_plans[2];
+        struct wvm_exclusive_lease orchestrator_listener_leases[2][3];
+        struct wvm_capability_ref orchestrator_capabilities[2];
+        struct prepared_buffers orchestrator_buffers;
+        struct wvm_coordinator_prepared_vm orchestrator_prepared;
+        struct wvm_coordinator_prepared_route orchestrator_route;
+        struct wvm_route_transaction_record orchestrator_route_transaction;
+        struct wvm_required_ack_entry orchestrator_ack_entries[1];
+        struct wvm_required_ack_set orchestrator_ack_set;
+        struct wvm_activation_record orchestrator_activation;
+        struct wvm_route_snapshot_key orchestrator_activation_keys[1];
+        struct orchestrator_test_hooks hooks;
+        struct wvm_admission_orchestrator_callbacks callbacks;
+        struct wvm_admission_orchestrator_input orchestrator_input;
+        struct wvm_admission_recovery_input recovery_input;
+        struct wvm_coordinator_transaction orchestrator_transaction;
+        enum wvm_control_plane_submit_result orchestrator_submit_result;
+        uint8_t orchestrator_placement_bytes[8192];
+        uint8_t orchestrator_candidate_bytes[16384];
+
+        orchestrator_request.request_id[WVM_IDENTITY_ID_BYTES - 1] = 0x44;
+        orchestrator_capabilities[0] = nodes[0].capability;
+        orchestrator_capabilities[1] = nodes[1].capability;
+        fill_options(&orchestrator_options, orchestrator_capabilities,
+                     orchestrator_placement_bytes,
+                     sizeof(orchestrator_placement_bytes),
+                     orchestrator_candidate_bytes,
+                     sizeof(orchestrator_candidate_bytes));
+        fill_node_launch_plans(&orchestrator_options,
+                               orchestrator_launch_plans, nodes,
+                               orchestrator_listener_plans,
+                               orchestrator_listener_leases);
+        for (i = 0; i < 2; i++) {
+            orchestrator_launch_plans[i]
+                .launch_plan.node_runtime_data_port += 40;
+            orchestrator_launch_plans[i]
+                .launch_plan.local_executor_service_port += 40;
+            orchestrator_listener_plans[i].node_runtime_data_port =
+                orchestrator_launch_plans[i].launch_plan.node_runtime_data_port;
+            orchestrator_listener_plans[i].local_executor_service_port =
+                orchestrator_launch_plans[i]
+                    .launch_plan.local_executor_service_port;
+        }
+        memset(&orchestrator_buffers, 0, sizeof(orchestrator_buffers));
+        initialize_prepared_vm(&orchestrator_prepared, &orchestrator_buffers);
+        orchestrator_prepared.reservation_registries = registries;
+        orchestrator_prepared.reservation_registry_count =
+            sizeof(registries) / sizeof(registries[0]);
+        memset(&orchestrator_route, 0, sizeof(orchestrator_route));
+        memset(&orchestrator_route_transaction, 0,
+               sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
+        orchestrator_activation.required_route_snapshot_keys =
+            orchestrator_activation_keys;
+        orchestrator_activation.required_route_snapshot_capacity =
+            sizeof(orchestrator_activation_keys) /
+            sizeof(orchestrator_activation_keys[0]);
+        activation_options.durable_decision_sequence = 3;
+        activation_options.decided_at = 3000;
+        memset(&hooks, 0, sizeof(hooks));
+        hooks.gateway = &gateway;
+        hooks.ack_entries = orchestrator_ack_entries;
+        hooks.ack_set = &orchestrator_ack_set;
+        hooks.route_operation_suffix = 0x53;
+        memset(&callbacks, 0, sizeof(callbacks));
+        callbacks.route_plan = orchestrator_route_plan;
+        callbacks.route_prepare = orchestrator_route_prepare;
+        callbacks.route_commit = orchestrator_route_commit;
+        callbacks.route_abort = orchestrator_route_abort;
+        callbacks.reservation_prepare = orchestrator_reservation_prepare;
+        callbacks.reservation_commit = orchestrator_reservation_commit;
+        callbacks.reservation_abort = orchestrator_reservation_abort;
+        callbacks.participant_prepare = orchestrator_participant_prepare;
+        callbacks.participant_commit = orchestrator_participant_commit;
+        callbacks.participant_abort = orchestrator_participant_abort;
+        callbacks.participant_ready = orchestrator_participant_ready;
+        memset(&orchestrator_input, 0, sizeof(orchestrator_input));
+        orchestrator_input.control_plane = &control_plane;
+        orchestrator_input.namespace_allocator = &namespace_allocator;
+        orchestrator_input.id_provider = &id_provider;
+        orchestrator_input.request = &orchestrator_request;
+        orchestrator_input.records = &records;
+        orchestrator_input.prepared_route = &orchestrator_route;
+        orchestrator_input.prepare_options = &orchestrator_options;
+        orchestrator_input.prepared_vm = &orchestrator_prepared;
+        orchestrator_input.activation_options = &activation_options;
+        orchestrator_input.activation = &orchestrator_activation;
+        orchestrator_input.route_transaction =
+            &orchestrator_route_transaction;
+        orchestrator_input.callbacks = &callbacks;
+        orchestrator_input.callback_context = &hooks;
+        orchestrator_input.transaction_out = &orchestrator_transaction;
+        orchestrator_input.submit_result_out = &orchestrator_submit_result;
+        if (expect(wvm_admission_orchestrator_run(
+                       &orchestrator_input, error, sizeof(error)) == 0 &&
+                       orchestrator_submit_result ==
+                           WVM_CONTROL_PLANE_SUBMIT_NEW &&
+                       orchestrator_activation.has_activation_fence,
+                   "run callback-driven admission orchestrator") ||
+            expect(hooks.route_prepares == 1 && hooks.route_commits == 1 &&
+                       hooks.reservation_prepares == 2 &&
+                       hooks.reservation_commits == 2 &&
+                       hooks.participant_prepares == 2 &&
+                       hooks.participant_commits == 2 &&
+                       hooks.participant_readies == 2,
+                   "orchestrator executes every prepare and commit stage") ||
+            expect(wvm_control_plane_find_request(
+                       &control_plane, orchestrator_request.request_id)
+                           ->transaction.state == WVM_LIFECYCLE_RUNNING,
+                   "orchestrator reaches RUNNING only after readiness") ||
+            expect(wvm_admission_orchestrator_run(
+                       &orchestrator_input, error, sizeof(error)) == 0 &&
+                       orchestrator_submit_result ==
+                           WVM_CONTROL_PLANE_SUBMIT_REPLAY &&
+                       hooks.route_prepares == 1,
+                   "orchestrator replay does not repeat transport callbacks")) {
+            return 1;
+        }
+        for (i = 0; i < orchestrator_prepared.node_runtime_manifest_count;
+             i++) {
+            if (expect(wvm_runtime_ready_remove(
+                           &orchestrator_prepared.node_runtime_manifests[i],
+                           error, sizeof(error)) == 0,
+                       "remove orchestrator readiness evidence")) {
+                return 1;
+            }
+        }
+
+        {
+            struct wvm_admission_node failure_nodes[2];
+            struct wvm_resource_reservation failure_storage[2][4];
+            struct wvm_local_reservation_registry failure_registries_storage[2];
+            struct wvm_local_reservation_registry *failure_registries[2] = {
+                &failure_registries_storage[1], &failure_registries_storage[0]};
+
+            admission_node_from_record(&failure_nodes[0], &nodes[0]);
+            admission_node_from_record(&failure_nodes[1], &nodes[1]);
+            if (expect(wvm_local_reservation_registry_init(
+                           &failure_registries_storage[0], &failure_nodes[0],
+                           failure_storage[0],
+                           sizeof(failure_storage[0]) /
+                               sizeof(failure_storage[0][0]),
+                           error, sizeof(error)) == 0 &&
+                           wvm_local_reservation_registry_init(
+                               &failure_registries_storage[1],
+                               &failure_nodes[1], failure_storage[1],
+                               sizeof(failure_storage[1]) /
+                                   sizeof(failure_storage[1][0]),
+                               error, sizeof(error)) == 0,
+                       "initialize isolated orchestrator failure registries")) {
+                return 1;
+            }
+
+        orchestrator_request.request_id[WVM_IDENTITY_ID_BYTES - 1] = 0x45;
+        hooks.failure = ORCHESTRATOR_TEST_RESERVATION_PREPARE;
+        hooks.route_operation_suffix = 0x54;
+        hooks.route_prepares = 0;
+        hooks.route_commits = 0;
+        hooks.route_aborts = 0;
+        hooks.reservation_prepares = 0;
+        hooks.reservation_commits = 0;
+        hooks.reservation_aborts = 0;
+        hooks.participant_prepares = 0;
+        hooks.participant_commits = 0;
+        hooks.participant_aborts = 0;
+        hooks.participant_readies = 0;
+        for (i = 0; i < 2; i++) {
+            orchestrator_launch_plans[i]
+                .launch_plan.node_runtime_data_port += 40;
+            orchestrator_launch_plans[i]
+                .launch_plan.local_executor_service_port += 40;
+            orchestrator_listener_plans[i].node_runtime_data_port =
+                orchestrator_launch_plans[i].launch_plan.node_runtime_data_port;
+            orchestrator_listener_plans[i].local_executor_service_port =
+                orchestrator_launch_plans[i]
+                    .launch_plan.local_executor_service_port;
+        }
+        memset(&orchestrator_buffers, 0, sizeof(orchestrator_buffers));
+        initialize_prepared_vm(&orchestrator_prepared, &orchestrator_buffers);
+        orchestrator_prepared.reservation_registries = failure_registries;
+        orchestrator_prepared.reservation_registry_count =
+            sizeof(failure_registries) / sizeof(failure_registries[0]);
+        memset(&orchestrator_route, 0, sizeof(orchestrator_route));
+        memset(&orchestrator_route_transaction, 0,
+               sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
+        orchestrator_activation.required_route_snapshot_keys =
+            orchestrator_activation_keys;
+        orchestrator_activation.required_route_snapshot_capacity = 1;
+        if (expect(wvm_admission_orchestrator_run(
+                       &orchestrator_input, error, sizeof(error)) != 0 &&
+                       orchestrator_submit_result ==
+                           WVM_CONTROL_PLANE_SUBMIT_NEW &&
+                       wvm_control_plane_find_request(
+                           &control_plane, orchestrator_request.request_id)
+                               ->transaction.state == WVM_LIFECYCLE_ABORTED &&
+                       wvm_control_plane_find_route_transaction(
+                           &control_plane,
+                           orchestrator_route_transaction.operation_id)
+                               ->state == WVM_ROUTE_TRANSACTION_ABORTED &&
+                       hooks.route_aborts == 1 &&
+                       hooks.reservation_aborts == 2 &&
+                       failure_registries_storage[0].prepared_vcpu_slots == 0 &&
+                       failure_registries_storage[1].prepared_vcpu_slots == 0,
+                   "pre-activation failure durably aborts and cleans up")) {
+            return 1;
+        }
+
+        orchestrator_request.request_id[WVM_IDENTITY_ID_BYTES - 1] = 0x46;
+        hooks.failure = ORCHESTRATOR_TEST_PARTICIPANT_COMMIT;
+        hooks.route_operation_suffix = 0x55;
+        hooks.route_prepares = 0;
+        hooks.route_commits = 0;
+        hooks.route_aborts = 0;
+        hooks.reservation_prepares = 0;
+        hooks.reservation_commits = 0;
+        hooks.reservation_aborts = 0;
+        hooks.participant_prepares = 0;
+        hooks.participant_commits = 0;
+        hooks.participant_aborts = 0;
+        hooks.participant_readies = 0;
+        for (i = 0; i < 2; i++) {
+            orchestrator_launch_plans[i]
+                .launch_plan.node_runtime_data_port += 40;
+            orchestrator_launch_plans[i]
+                .launch_plan.local_executor_service_port += 40;
+            orchestrator_listener_plans[i].node_runtime_data_port =
+                orchestrator_launch_plans[i].launch_plan.node_runtime_data_port;
+            orchestrator_listener_plans[i].local_executor_service_port =
+                orchestrator_launch_plans[i]
+                    .launch_plan.local_executor_service_port;
+        }
+        memset(&orchestrator_buffers, 0, sizeof(orchestrator_buffers));
+        initialize_prepared_vm(&orchestrator_prepared, &orchestrator_buffers);
+        orchestrator_prepared.reservation_registries = failure_registries;
+        orchestrator_prepared.reservation_registry_count =
+            sizeof(failure_registries) / sizeof(failure_registries[0]);
+        memset(&orchestrator_route, 0, sizeof(orchestrator_route));
+        memset(&orchestrator_route_transaction, 0,
+               sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
+        orchestrator_activation.required_route_snapshot_keys =
+            orchestrator_activation_keys;
+        orchestrator_activation.required_route_snapshot_capacity = 1;
+        if (expect(wvm_admission_orchestrator_run(
+                       &orchestrator_input, error, sizeof(error)) != 0 &&
+                       orchestrator_submit_result ==
+                           WVM_CONTROL_PLANE_SUBMIT_NEW &&
+                       orchestrator_activation.has_activation_fence &&
+                       wvm_control_plane_find_request(
+                           &control_plane, orchestrator_request.request_id)
+                               ->transaction.state ==
+                           WVM_LIFECYCLE_ACTIVATION_DECIDED &&
+                       wvm_control_plane_find_route_transaction(
+                           &control_plane,
+                           orchestrator_route_transaction.operation_id)
+                               ->state == WVM_ROUTE_TRANSACTION_PREPARING &&
+                       hooks.route_aborts == 0,
+                   "post-activation failure remains recoverable")) {
+            return 1;
+        }
+        hooks.failure = ORCHESTRATOR_TEST_NO_FAILURE;
+        memset(&recovery_input, 0, sizeof(recovery_input));
+        recovery_input.control_plane = &control_plane;
+        recovery_input.transaction = &orchestrator_transaction;
+        recovery_input.prepared_vm = &orchestrator_prepared;
+        recovery_input.activation = &orchestrator_activation;
+        recovery_input.route_transaction = &orchestrator_route_transaction;
+        recovery_input.callbacks = &callbacks;
+        recovery_input.callback_context = &hooks;
+        if (expect(wvm_admission_orchestrator_recover(
+                       &recovery_input, error, sizeof(error)) == 0 &&
+                       wvm_control_plane_find_request(
+                           &control_plane, orchestrator_request.request_id)
+                               ->transaction.state == WVM_LIFECYCLE_RUNNING,
+                   "recover durable activation to RUNNING")) {
+            return 1;
+        }
+        for (i = 0; i < orchestrator_prepared.node_runtime_manifest_count;
+             i++) {
+            if (expect(wvm_runtime_ready_remove(
+                           &orchestrator_prepared.node_runtime_manifests[i],
+                           error, sizeof(error)) == 0,
+                       "remove recovered readiness evidence")) {
+                return 1;
+            }
+        }
+            wvm_local_reservation_registry_destroy(
+                &failure_registries_storage[0]);
+            wvm_local_reservation_registry_destroy(
+                &failure_registries_storage[1]);
+        }
     }
 
     capabilities[3].state = WVM_CAPABILITY_UNAVAILABLE;

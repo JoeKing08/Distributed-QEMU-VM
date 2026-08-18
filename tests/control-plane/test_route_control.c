@@ -105,7 +105,7 @@ static int encode_key(const struct wvm_route_snapshot_key *key, uint8_t *bytes,
                                          error, error_len);
 }
 
-static void make_request(struct wvm_envelope_v1 *request, uint16_t message_type,
+static void make_request(struct wvm_envelope *request, uint16_t message_type,
                          uint8_t operation_tail, const uint8_t *payload,
                          size_t payload_bytes)
 {
@@ -123,7 +123,7 @@ static void make_request(struct wvm_envelope_v1 *request, uint16_t message_type,
 }
 
 static void make_lookup_envelope(
-    struct wvm_envelope_v1 *envelope,
+    struct wvm_envelope *envelope,
     const struct wvm_route_snapshot_key *key)
 {
     memset(envelope, 0, sizeof(*envelope));
@@ -135,7 +135,7 @@ static void make_lookup_envelope(
     memcpy(envelope->route_snapshot_digest, key->snapshot_digest,
            sizeof(envelope->route_snapshot_digest));
     envelope->route.destination_kind =
-        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE;
+        WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE;
     envelope->route.destination_vnode_or_endpoint = 0;
     envelope->route.hop_limit = 4;
 }
@@ -153,8 +153,8 @@ int main(void)
     struct wvm_route_rule_record successor_rule;
     struct wvm_required_ack_entry first_ack;
     struct wvm_required_ack_entry successor_ack;
-    struct wvm_envelope_v1 request;
-    struct wvm_envelope_v1 lookup;
+    struct wvm_envelope request;
+    struct wvm_envelope lookup;
     struct wvm_route_runtime_next_hop next_hop;
     uint8_t snapshot_bytes[8192];
     uint8_t key_bytes[512];
@@ -190,7 +190,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_PREPARE, 1,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 1,
                  snapshot_bytes, snapshot_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -207,7 +207,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_COMMIT, 2, key_bytes,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_COMMIT, 2, key_bytes,
                  key_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -237,7 +237,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_PREPARE, 3,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 3,
                  snapshot_bytes, snapshot_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -251,7 +251,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_COMMIT, 4, key_bytes,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_COMMIT, 4, key_bytes,
                  key_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -265,7 +265,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_V1_MSG_ROUTE_RETIRE, 5, key_bytes,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_RETIRE, 5, key_bytes,
                  key_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,

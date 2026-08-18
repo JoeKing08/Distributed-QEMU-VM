@@ -1039,7 +1039,7 @@ ABIs without choosing contradictory alternatives.
   and guest-visible errors remain governed by the QEMU-host device authority.
 - The V1 `u32` VM namespace permits `UINT32_MAX` nonzero logical namespaces.
   Allocation above 255 requires every selected participant to negotiate
-  `WVM_CAP_V1_VM_ID_U32`; a legacy compatibility deployment remains limited to
+  `WVM_CAP_VM_ID_U32`; a legacy compatibility deployment remains limited to
   255 nonzero IDs. Mode B has no smaller architectural per-host count; admission
   is constrained by reserved resources and exclusive local names. In legacy wire
   mode a nonzero ID is reusable only after a controlled full

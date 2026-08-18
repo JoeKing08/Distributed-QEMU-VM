@@ -1,0 +1,335 @@
+#include "wavevm_admission_orchestrator.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "wavevm_membership.h"
+
+static void set_error(char *error, size_t error_len, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!error || error_len == 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(error, error_len, fmt, ap);
+    va_end(ap);
+}
+
+static int route_snapshot_key_matches(
+    const struct wvm_route_snapshot_key *left,
+    const struct wvm_route_snapshot_key *right)
+{
+    return left && right &&
+           left->scope_key.vm_id == right->scope_key.vm_id &&
+           left->scope_key.vm_incarnation == right->scope_key.vm_incarnation &&
+           left->scope_key.route_scope_id == right->scope_key.route_scope_id &&
+           left->topology_revision == right->topology_revision &&
+           left->route_generation == right->route_generation &&
+           memcmp(left->snapshot_digest, right->snapshot_digest,
+                  sizeof(left->snapshot_digest)) == 0;
+}
+
+static int callbacks_valid(
+    const struct wvm_admission_orchestrator_callbacks *callbacks,
+    char *error, size_t error_len)
+{
+    if (!callbacks || !callbacks->route_plan || !callbacks->route_prepare ||
+        !callbacks->route_commit ||
+        !callbacks->route_abort || !callbacks->reservation_prepare ||
+        !callbacks->reservation_commit || !callbacks->reservation_abort ||
+        !callbacks->participant_prepare || !callbacks->participant_commit ||
+        !callbacks->participant_abort || !callbacks->participant_ready) {
+        set_error(error, error_len,
+                  "admission orchestrator transport callbacks are incomplete");
+        return -1;
+    }
+    return 0;
+}
+
+static int callback_reservations(
+    const struct wvm_admission_orchestrator_input *input,
+    wvm_admission_reservation_stage_fn callback, char *error, size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->reservation_count; i++) {
+        if (callback(input->callback_context,
+                     &input->prepared_vm->reservations[i], error,
+                     error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int callback_participants(
+    const struct wvm_admission_orchestrator_input *input,
+    wvm_admission_participant_stage_fn callback, char *error, size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
+        if (callback(input->callback_context,
+                     &input->prepared_vm->node_runtime_manifests[i], error,
+                     error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int durable_route_state(
+    const struct wvm_admission_orchestrator_input *input, uint16_t state,
+    char *error, size_t error_len)
+{
+    input->route_transaction->state = state;
+    return wvm_control_plane_record_route_transaction(
+        input->control_plane, input->route_transaction, error, error_len);
+}
+
+static int abort_pre_activation(
+    const struct wvm_admission_orchestrator_input *input,
+    struct wvm_coordinator_transaction *transaction, int route_prepared,
+    char *error, size_t error_len)
+{
+    int cleanup_failed = 0;
+    char cleanup_error[256] = {0};
+
+    if (wvm_coordinator_decide_abort(
+            transaction, input->activation_options, input->prepared_vm,
+            input->activation, error, error_len) != 0 ||
+        wvm_control_plane_record_activation(
+            input->control_plane, transaction, input->activation, error,
+            error_len) != 0) {
+        return -1;
+    }
+
+    if (callback_participants(input, input->callbacks->participant_abort,
+                              cleanup_error, sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (callback_reservations(input, input->callbacks->reservation_abort,
+                              cleanup_error, sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (wvm_coordinator_abort_local(transaction, input->prepared_vm,
+                                    input->activation, cleanup_error,
+                                    sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (route_prepared &&
+        input->callbacks->route_abort(input->callback_context,
+                                       input->route_transaction, cleanup_error,
+                                       sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (!cleanup_failed &&
+        durable_route_state(input, WVM_ROUTE_TRANSACTION_ABORTED, cleanup_error,
+                            sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (!cleanup_failed &&
+        wvm_control_plane_transition(
+            input->control_plane, transaction, WVM_LIFECYCLE_ABORTING,
+            WVM_LIFECYCLE_ABORTED, cleanup_error, sizeof(cleanup_error)) != 0) {
+        cleanup_failed = 1;
+    }
+    if (cleanup_failed) {
+        set_error(error, error_len, "pre-activation cleanup is incomplete: %s",
+                  cleanup_error[0] ? cleanup_error : "unknown cleanup error");
+        return -1;
+    }
+    return -1;
+}
+
+static int abort_unpersisted_local(
+    const struct wvm_admission_orchestrator_input *input,
+    struct wvm_coordinator_transaction *transaction, char *error,
+    size_t error_len)
+{
+    if (wvm_coordinator_decide_abort(
+            transaction, input->activation_options, input->prepared_vm,
+            input->activation, error, error_len) != 0 ||
+        wvm_coordinator_abort_local(transaction, input->prepared_vm,
+                                    input->activation, error, error_len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int abort_identity_transaction(
+    const struct wvm_admission_orchestrator_input *input,
+    struct wvm_coordinator_transaction *transaction, char *error,
+    size_t error_len)
+{
+    if (wvm_control_plane_transition(
+            input->control_plane, transaction, WVM_LIFECYCLE_IDENTITY_ALLOCATED,
+            WVM_LIFECYCLE_ABORTING, error, error_len) != 0 ||
+        wvm_control_plane_transition(
+            input->control_plane, transaction, WVM_LIFECYCLE_ABORTING,
+            WVM_LIFECYCLE_ABORTED, error, error_len) != 0) {
+        return -1;
+    }
+    return -1;
+}
+
+static int input_valid(const struct wvm_admission_orchestrator_input *input,
+                       char *error, size_t error_len)
+{
+    if (!input || !input->control_plane || !input->namespace_allocator ||
+        !input->id_provider || !input->request || !input->records ||
+        !input->prepared_route || !input->prepare_options ||
+        !input->prepared_vm || !input->activation_options ||
+        !input->activation || !input->route_transaction ||
+        !input->transaction_out || !input->submit_result_out) {
+        set_error(error, error_len, "admission orchestrator input is invalid");
+        return -1;
+    }
+    return callbacks_valid(input->callbacks, error, error_len);
+}
+
+int wvm_admission_orchestrator_run(
+    const struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
+{
+    enum wvm_control_plane_submit_result submit_result;
+    struct wvm_coordinator_transaction *transaction;
+    int route_prepared = 0;
+    int candidate_durable = 0;
+    int route_durable = 0;
+
+    if (input_valid(input, error, error_len) != 0) {
+        return -1;
+    }
+    transaction = input->transaction_out;
+    if (wvm_control_plane_begin(
+            input->control_plane, input->request, input->namespace_allocator,
+            input->id_provider, &submit_result, transaction, error,
+            error_len) != 0) {
+        return -1;
+    }
+    *input->submit_result_out = submit_result;
+    if (submit_result == WVM_CONTROL_PLANE_SUBMIT_REPLAY) {
+        return 0;
+    }
+    if (input->callbacks->route_plan(
+            input->callback_context, transaction, input->prepared_route,
+            input->route_transaction, error, error_len) != 0) {
+        return abort_identity_transaction(input, transaction, error, error_len);
+    }
+    if (wvm_coordinator_prepare(
+            input->request, transaction, input->records, input->prepared_route,
+            input->prepare_options, input->prepared_vm, error, error_len) != 0) {
+        return abort_identity_transaction(input, transaction, error, error_len);
+    }
+    if (wvm_route_transaction_record_validate(input->route_transaction, error,
+                                              error_len) != 0 ||
+        input->route_transaction->state != WVM_ROUTE_TRANSACTION_PREPARING ||
+        !route_snapshot_key_matches(
+            &input->route_transaction->route_snapshot_key,
+            &input->prepared_vm->candidate.prepared_route_snapshot_key)) {
+        if (abort_unpersisted_local(input, transaction, error, error_len) != 0) {
+            return -1;
+        }
+        set_error(error, error_len,
+                  "admission route transaction does not match candidate");
+        return abort_identity_transaction(input, transaction, error, error_len);
+    }
+    if (wvm_control_plane_record_candidate(
+            input->control_plane, transaction, &input->prepared_vm->candidate,
+            error, error_len) != 0) {
+        (void)abort_unpersisted_local(input, transaction, NULL, 0);
+        return -1;
+    }
+    candidate_durable = 1;
+    if (wvm_control_plane_record_route_transaction(
+            input->control_plane, input->route_transaction, error,
+            error_len) != 0) {
+        (void)wvm_coordinator_abort_local(transaction, input->prepared_vm,
+                                          input->activation, NULL, 0);
+        return -1;
+    }
+    route_durable = 1;
+    route_prepared = 1;
+    if (input->callbacks->route_prepare(input->callback_context,
+                                        input->route_transaction, error,
+                                        error_len) != 0) {
+        return abort_pre_activation(input, transaction, route_prepared, error,
+                                    error_len);
+    }
+    if (wvm_control_plane_transition(
+            input->control_plane, transaction, WVM_LIFECYCLE_PLANNED,
+            WVM_LIFECYCLE_ROUTE_SCOPE_PREPARED, error, error_len) != 0 ||
+        callback_reservations(input, input->callbacks->reservation_prepare,
+                              error, error_len) != 0) {
+        return candidate_durable && route_durable
+                   ? abort_pre_activation(input, transaction, route_prepared,
+                                          error, error_len)
+                   : -1;
+    }
+    if (wvm_control_plane_transition(
+            input->control_plane, transaction,
+            WVM_LIFECYCLE_ROUTE_SCOPE_PREPARED,
+            WVM_LIFECYCLE_RESERVATIONS_PREPARED, error, error_len) != 0 ||
+        callback_participants(input, input->callbacks->participant_prepare,
+                              error, error_len) != 0 ||
+        wvm_control_plane_transition(
+            input->control_plane, transaction,
+            WVM_LIFECYCLE_RESERVATIONS_PREPARED,
+            WVM_LIFECYCLE_PARTICIPANTS_PREPARED, error, error_len) != 0 ||
+        wvm_coordinator_decide_activation(
+            input->request, transaction, input->records, input->prepared_route,
+            input->id_provider, input->activation_options, input->prepared_vm,
+            input->activation, error, error_len) != 0 ||
+        wvm_control_plane_record_activation(input->control_plane, transaction,
+                                            input->activation, error,
+                                            error_len) != 0) {
+        return abort_pre_activation(input, transaction, route_prepared, error,
+                                    error_len);
+    }
+
+    /* From this point the durable activation decision is authoritative. */
+    if (wvm_coordinator_commit_local(transaction, input->prepared_vm,
+                                     input->activation, error, error_len) != 0 ||
+        callback_reservations(input, input->callbacks->reservation_commit,
+                              error, error_len) != 0 ||
+        callback_participants(input, input->callbacks->participant_commit,
+                              error, error_len) != 0) {
+        return -1;
+    }
+    {
+        size_t i;
+
+        for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
+            if (wvm_control_plane_record_runtime_manifest(
+                    input->control_plane, transaction,
+                    &input->prepared_vm->node_runtime_manifests[i], error,
+                    error_len) != 0) {
+                return -1;
+            }
+        }
+    }
+    if (input->callbacks->route_commit(input->callback_context,
+                                        input->route_transaction, error,
+                                        error_len) != 0 ||
+        durable_route_state(input, WVM_ROUTE_TRANSACTION_ACTIVATED, error,
+                            error_len) != 0 ||
+        wvm_control_plane_transition(
+            input->control_plane, transaction, WVM_LIFECYCLE_ACTIVATION_DECIDED,
+            WVM_LIFECYCLE_COMMITTED, error, error_len) != 0) {
+        return -1;
+    }
+    if (callback_participants(input, input->callbacks->participant_ready,
+                              error, error_len) != 0 ||
+        wvm_control_plane_start_if_ready(
+            input->control_plane, transaction,
+            input->prepared_vm->node_runtime_manifests,
+            input->prepared_vm->node_runtime_manifest_count, error,
+            error_len) != 0) {
+        return -1;
+    }
+    return 0;
+}

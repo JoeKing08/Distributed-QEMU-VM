@@ -97,7 +97,7 @@ static int finalize_snapshot(struct wvm_route_snapshot_record *snapshot,
     return wvm_route_snapshot_record_validate(snapshot, error, error_len);
 }
 
-static void envelope_for_snapshot(struct wvm_envelope_v1 *envelope,
+static void envelope_for_snapshot(struct wvm_envelope *envelope,
                                   const struct wvm_route_snapshot_key *key,
                                   uint16_t destination_kind,
                                   uint64_t destination_scope, uint32_t vnode)
@@ -129,7 +129,7 @@ int main(void)
     struct wvm_required_ack_entry flat_acks[1];
     struct wvm_required_ack_entry successor_acks[1];
     struct wvm_required_ack_entry fractal_acks[1];
-    struct wvm_envelope_v1 envelope;
+    struct wvm_envelope envelope;
     struct wvm_route_runtime_next_hop next_hop;
     struct wvm_route_snapshot_key returned_key;
     char error[256] = {0};
@@ -171,7 +171,7 @@ int main(void)
         return 1;
     }
     envelope_for_snapshot(&envelope, &flat.route_snapshot_key,
-                          WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE, 0, 0);
+                          WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE, 0, 0);
     if (expect(wvm_route_runtime_lookup(&runtime, &envelope, &next_hop, error,
                                         sizeof(error)) == 0 &&
                    next_hop.next_hop_endpoint.data_port == 19011 &&
@@ -180,7 +180,7 @@ int main(void)
                "look up flat vnode zero without raw-ID fallback") ||
         expect(wvm_route_runtime_lookup_destination(
                    &runtime, &flat.route_snapshot_key,
-                   WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE, 0, 0,
+                   WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE, 0, 0,
                    &next_hop, error, sizeof(error)) == 0 &&
                    next_hop.hop_limit == 4 &&
                    next_hop.next_hop_endpoint.data_port == 19011,
@@ -211,7 +211,7 @@ int main(void)
         return 1;
     }
     envelope_for_snapshot(&envelope, &successor.route_snapshot_key,
-                          WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE, 0, 0);
+                          WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE, 0, 0);
     if (expect(wvm_route_runtime_lookup(&runtime, &envelope, &next_hop, error,
                                         sizeof(error)) == 0 &&
                    next_hop.next_hop_endpoint.data_port == 19112,
@@ -233,7 +233,7 @@ int main(void)
         return 1;
     }
     envelope_for_snapshot(&envelope, &fractal.route_snapshot_key,
-                          WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE, 41,
+                          WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE, 41,
                           0);
     if (expect(wvm_route_runtime_lookup(&runtime, &envelope, &next_hop, error,
                                         sizeof(error)) == 0 &&
@@ -245,7 +245,7 @@ int main(void)
         return 1;
     }
     envelope_for_snapshot(&envelope, &fractal.route_snapshot_key,
-                          WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE, 99,
+                          WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE, 99,
                           77);
     if (expect(wvm_route_runtime_lookup(&runtime, &envelope, &next_hop, error,
                                         sizeof(error)) == 0 &&
@@ -255,7 +255,7 @@ int main(void)
                "route fractal scope through prefix next hop") ||
         expect(wvm_route_runtime_lookup_destination(
                    &runtime, &fractal.route_snapshot_key,
-                   WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE, 99, 77,
+                   WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE, 99, 77,
                    &next_hop, error, sizeof(error)) == 0 &&
                    next_hop.hop_limit == 3 &&
                    next_hop.matched_destination_kind ==

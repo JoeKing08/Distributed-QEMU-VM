@@ -46,8 +46,11 @@ int main(void)
     struct wvm_resource_reservation stored[4];
     struct wvm_resource_reservation first;
     struct wvm_resource_reservation conflicting;
+    struct wvm_resource_reservation distinct;
+    struct wvm_resource_reservation replay_mismatch;
     struct wvm_exclusive_lease first_lease;
     struct wvm_exclusive_lease conflict_lease;
+    struct wvm_exclusive_lease distinct_lease;
     struct wvm_local_reservation_registry registry;
     struct wvm_activation_record activation;
     enum wvm_reservation_runtime_result result;
@@ -61,22 +64,34 @@ int main(void)
     node.allocatable_memory_bytes = 16384;
 
     memset(&first_lease, 0, sizeof(first_lease));
-    first_lease.lease_kind = 1;
+    first_lease.lease_kind = WVM_EXCLUSIVE_LEASE_KIND_KERNEL_CONTEXT;
     first_lease.lease_generation = 1;
-    strcpy(first_lease.lease_name, "vm-101-qemu");
+    strcpy(first_lease.lease_name, "kernel-context");
     fill_reservation(&first, 1, 17);
     first.exclusive_leases.entries = &first_lease;
     first.has_prepared_expiry = 1;
     first.prepared_expiry_unix_time_ms = 10;
 
     memset(&conflict_lease, 0, sizeof(conflict_lease));
-    conflict_lease.lease_kind = 1;
-    conflict_lease.lease_generation = 1;
-    strcpy(conflict_lease.lease_name, "vm-101-qemu");
+    conflict_lease.lease_kind = WVM_EXCLUSIVE_LEASE_KIND_KERNEL_CONTEXT;
+    conflict_lease.lease_generation = 2;
+    strcpy(conflict_lease.lease_name, "kernel-context");
     fill_reservation(&conflicting, 2, 17);
     conflicting.exclusive_leases.entries = &conflict_lease;
     conflicting.has_prepared_expiry = 1;
     conflicting.prepared_expiry_unix_time_ms = 20;
+
+    memset(&distinct_lease, 0, sizeof(distinct_lease));
+    distinct_lease.lease_kind = 1;
+    distinct_lease.lease_generation = 9;
+    strcpy(distinct_lease.lease_name, "vm-103-qemu");
+    fill_reservation(&distinct, 3, 17);
+    distinct.exclusive_leases.entries = &distinct_lease;
+    distinct.has_prepared_expiry = 1;
+    distinct.prepared_expiry_unix_time_ms = 30;
+
+    replay_mismatch = first;
+    replay_mismatch.exclusive_leases.entries = &conflict_lease;
 
     if (expect(wvm_local_reservation_registry_init(
                    &registry, &node, stored, 4, error, sizeof(error)) == 0,
@@ -90,8 +105,22 @@ int main(void)
                    result == WVM_RESERVATION_RUNTIME_REPLAY,
                "replay identical prepare") ||
         expect(wvm_local_reservation_prepare(
+                   &registry, &replay_mismatch, &result, error, sizeof(error)) != 0,
+               "reject replay with a different lease generation") ||
+        expect(wvm_local_reservation_prepare(
                    &registry, &conflicting, &result, error, sizeof(error)) != 0,
-               "reject conflicting lease")) {
+               "reject a second single-context kernel reservation") ||
+        expect(wvm_local_reservation_prepare(
+                   &registry, &distinct, &result, error, sizeof(error)) == 0 &&
+                   result == WVM_RESERVATION_RUNTIME_NEW,
+               "allow a distinct lease resource")) {
+        wvm_local_reservation_registry_destroy(&registry);
+        return 1;
+    }
+    if (expect(wvm_local_reservation_abort(
+                   &registry, distinct.reservation_id, &result, error,
+                   sizeof(error)) == 0,
+               "release distinct reservation before reap check")) {
         wvm_local_reservation_registry_destroy(&registry);
         return 1;
     }

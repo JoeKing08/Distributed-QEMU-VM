@@ -201,4 +201,15 @@ int wvm_control_plane_record_activation(
     const struct wvm_activation_record *activation, char *error,
     size_t error_len);
 
+/*
+ * Advance a committed VM only after every durable local runtime projection
+ * presents identity-bound readiness evidence. Missing evidence returns
+ * -EAGAIN and leaves the durable lifecycle state unchanged.
+ */
+int wvm_control_plane_start_if_ready(
+    struct wvm_control_plane *plane,
+    const struct wvm_coordinator_transaction *transaction,
+    const struct wvm_node_runtime_manifest *runtime_manifests,
+    size_t runtime_manifest_count, char *error, size_t error_len);
+
 #endif /* WAVEVM_CONTROL_PLANE_H */

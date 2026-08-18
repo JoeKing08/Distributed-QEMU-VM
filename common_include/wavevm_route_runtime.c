@@ -212,12 +212,12 @@ static int route_destination_fields_valid(uint16_t destination_kind,
                                           char *error, size_t error_len)
 {
     if (destination_vnode_or_endpoint ==
-        WVM_ENVELOPE_V1_ROUTE_DESTINATION_UNSPECIFIED) {
+        WVM_ENVELOPE_ROUTE_DESTINATION_UNSPECIFIED) {
         set_error(error, error_len, "route destination is unspecified");
         return -1;
     }
     if (destination_kind ==
-        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FLAT_VNODE) {
+        WVM_ENVELOPE_ROUTE_DESTINATION_FLAT_VNODE) {
         if (destination_scope == 0) {
             return 0;
         }
@@ -226,7 +226,7 @@ static int route_destination_fields_valid(uint16_t destination_kind,
         return -1;
     }
     if (destination_kind ==
-        WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE &&
+        WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE &&
         destination_scope != 0) {
         return 0;
     }
@@ -234,7 +234,7 @@ static int route_destination_fields_valid(uint16_t destination_kind,
     return -1;
 }
 
-static int route_destination_valid(const struct wvm_envelope_v1 *envelope,
+static int route_destination_valid(const struct wvm_envelope *envelope,
                                    char *error, size_t error_len)
 {
     if (!envelope || envelope->vm_id == 0 || envelope->vm_incarnation == 0 ||
@@ -482,7 +482,7 @@ int wvm_route_runtime_lookup_destination(
     rule = find_rule(&scope->active, WVM_ROUTE_DESTINATION_EXACT_VNODE,
                      destination_scope, destination_vnode_or_endpoint);
     if (!rule && destination_kind ==
-                     WVM_ENVELOPE_V1_ROUTE_DESTINATION_FRACTAL_VNODE) {
+                     WVM_ENVELOPE_ROUTE_DESTINATION_FRACTAL_VNODE) {
         rule = find_rule(&scope->active, WVM_ROUTE_DESTINATION_PREFIX,
                          destination_scope, 0);
     }
@@ -503,7 +503,7 @@ int wvm_route_runtime_lookup_destination(
 
 int wvm_route_runtime_lookup(
     const struct wvm_route_runtime *runtime,
-    const struct wvm_envelope_v1 *envelope,
+    const struct wvm_envelope *envelope,
     struct wvm_route_runtime_next_hop *next_hop_out, char *error,
     size_t error_len)
 {

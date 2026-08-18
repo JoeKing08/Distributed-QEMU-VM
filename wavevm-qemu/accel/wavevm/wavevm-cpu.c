@@ -21,6 +21,7 @@
 #include "../../../common_include/wavevm_config.h"
 #include "../../../common_include/wavevm_ioctl.h"
 #include "wavevm-accel.h"
+#include "wavevm-runtime-registration.h"
 #include "qemu/thread.h"
 #include "qemu/guest-random.h"
 #include "tcg/tcg.h"
@@ -115,18 +116,17 @@ static int connect_to_master_helper(void)
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     const char *env_path;
-    char fallback[128];
 
     if (sock < 0) {
         return -1;
     }
 
-    env_path = getenv("WVM_ENV_SOCK_PATH");
+    env_path = wavevm_qemu_runtime_socket_path();
     if (!env_path) {
-        const char *inst_id = getenv("WVM_INSTANCE_ID");
-        snprintf(fallback, sizeof(fallback), "/tmp/wvm_user_%s.sock",
-                 inst_id ? inst_id : "0");
-        env_path = fallback;
+        fprintf(stderr,
+                "[WaveVM-CPU] manifest-derived QEMU socket path is missing\n");
+        close(sock);
+        return -1;
     }
 
     strncpy(addr.sun_path, env_path, sizeof(addr.sun_path) - 1);

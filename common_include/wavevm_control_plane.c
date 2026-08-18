@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "wavevm_canonical.h"
+#include "wavevm_runtime_names.h"
 #include "wavevm_membership.h"
 #include "wavevm_sha256.h"
 
@@ -1395,7 +1396,7 @@ static int restore_namespace(
      * reconciliation proves every route/cache/operation reference is gone.
      */
     return wvm_vm_namespace_restore(
-        namespace_allocator, WVM_NAMESPACE_ABI_V1_U32, transaction->vm_id,
+        namespace_allocator, WVM_NAMESPACE_ABI_U32, transaction->vm_id,
         transaction->vm_incarnation, state, error, error_len);
 }
 
@@ -2733,4 +2734,99 @@ int wvm_control_plane_record_activation(
            sizeof(updated_transaction.activation_record_digest));
     free(activation_bytes);
     return append_transaction(plane, &updated_transaction, error, error_len);
+}
+
+int wvm_control_plane_start_if_ready(
+    struct wvm_control_plane *plane,
+    const struct wvm_coordinator_transaction *transaction,
+    const struct wvm_node_runtime_manifest *runtime_manifests,
+    size_t runtime_manifest_count, char *error, size_t error_len)
+{
+    struct wvm_control_plane_entry *entry;
+    size_t durable_count = 0;
+    size_t i;
+
+    if (!plane || !transaction || !runtime_manifests ||
+        runtime_manifest_count == 0) {
+        set_error(error, error_len, "runtime readiness input is invalid");
+        return -1;
+    }
+    entry = find_mutable_request(plane, transaction->request_id);
+    if (!entry || entry->transaction.vm_id != transaction->vm_id ||
+        entry->transaction.vm_incarnation != transaction->vm_incarnation ||
+        !entry->transaction.has_candidate_manifest_digest ||
+        memcmp(entry->transaction.admission_tx_id,
+               transaction->admission_tx_id,
+               sizeof(transaction->admission_tx_id)) != 0) {
+        set_error(error, error_len,
+                  "runtime readiness transaction is not durable");
+        return -1;
+    }
+    if (entry->transaction.state == WVM_LIFECYCLE_RUNNING) {
+        return 0;
+    }
+    if (entry->transaction.state != WVM_LIFECYCLE_COMMITTED) {
+        set_error(error, error_len,
+                  "runtime readiness requires COMMITTED lifecycle state");
+        return -1;
+    }
+    for (i = 0; i < plane->runtime_manifest_entry_count; i++) {
+        if (memcmp(plane->runtime_manifest_entries[i]
+                       .candidate_manifest_digest,
+                   entry->transaction.candidate_manifest_digest,
+                   sizeof(entry->transaction.candidate_manifest_digest)) == 0) {
+            durable_count++;
+        }
+    }
+    if (durable_count != runtime_manifest_count) {
+        set_error(error, error_len,
+                  "runtime readiness projection count does not match durable state");
+        return -1;
+    }
+    if (durable_runtime_manifests_complete(plane, transaction, error,
+                                           error_len) != 0) {
+        return -1;
+    }
+    for (i = 0; i < runtime_manifest_count; i++) {
+        const struct wvm_node_runtime_manifest *manifest =
+            &runtime_manifests[i];
+        size_t j;
+
+        if (memcmp(manifest->candidate_manifest_digest,
+                   entry->transaction.candidate_manifest_digest,
+                   sizeof(manifest->candidate_manifest_digest)) != 0 ||
+            manifest->vm_id != entry->transaction.vm_id ||
+            manifest->vm_incarnation != entry->transaction.vm_incarnation ||
+            !manifest->has_activation_fence) {
+            set_error(error, error_len,
+                      "runtime readiness manifest identity mismatch");
+            return -1;
+        }
+        for (j = 0; j < i; j++) {
+            if (runtime_manifests[j].physical_node_id ==
+                manifest->physical_node_id) {
+                set_error(error, error_len,
+                          "runtime readiness contains duplicate physical node");
+                return -1;
+            }
+        }
+        {
+            int ready_result = wvm_runtime_ready_validate(
+                manifest, manifest->expected_node_instance_id, error,
+                error_len);
+
+            if (ready_result != 0) {
+                return ready_result == -EAGAIN ? -EAGAIN : -1;
+            }
+        }
+    }
+    if (wvm_control_plane_transition(
+            plane, transaction, WVM_LIFECYCLE_COMMITTED,
+            WVM_LIFECYCLE_STARTING, error, error_len) != 0 ||
+        wvm_control_plane_transition(
+            plane, transaction, WVM_LIFECYCLE_STARTING,
+            WVM_LIFECYCLE_RUNNING, error, error_len) != 0) {
+        return -1;
+    }
+    return 0;
 }

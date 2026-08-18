@@ -148,7 +148,7 @@ int wvm_canonical_record_finish(struct wvm_canonical_builder *builder,
         return -1;
     }
 
-    write_be16(builder->bytes, WVM_CANONICAL_SCHEMA_V1);
+    write_be16(builder->bytes, WVM_CANONICAL_SCHEMA);
     write_be16(builder->bytes + 2, builder->record_type);
     write_be32(builder->bytes + 4, (uint32_t)body_bytes);
     builder->finished = 1;
@@ -168,7 +168,7 @@ int wvm_canonical_record_parse(const uint8_t *bytes, size_t record_bytes,
 
     if (!bytes || !record ||
         record_bytes < WVM_CANONICAL_RECORD_HEADER_BYTES ||
-        read_be16(bytes) != WVM_CANONICAL_SCHEMA_V1 ||
+        read_be16(bytes) != WVM_CANONICAL_SCHEMA ||
         read_be16(bytes + 2) == 0) {
         return -1;
     }

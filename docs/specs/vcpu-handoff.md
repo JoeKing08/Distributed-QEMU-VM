@@ -84,14 +84,18 @@ VcpuHandoffRequest {
     vcpu_index;
     handoff_sequence;
     operation_id;
-    semantic_payload_digest;
     backend;                 // KVM or TCG
     destination_executor_id;
+    reply_destination_kind;
+    reply_destination_scope;
+    reply_destination_vnode;
     memory_fence_id;
     memory_fence_result;
-    exported_cpu_context;
     local_interrupt_watermark;
     device_event_watermark;
+    context_schema_version;
+    context_valid_fields;
+    exported_cpu_context;
 }
 
 VcpuHandoffResult {
@@ -122,6 +126,11 @@ handoff_sequence, operation_id}`. `operation_id` is a nonwrapping 128-bit value
 allocated by that origin runtime; a new runtime instance never reuses its
 predecessor's identity.
 
+The outer `WVM` envelope owns the semantic digest for the complete canonical
+handoff record. The record itself carries a separate digest of
+`exported_cpu_context`; this avoids a self-referential payload digest while
+still detecting a context change independently of forwarding metadata.
+
 `ForwardingMetadata` is outside the semantic payload digest. A retry keeps the
 same deduplication key, context, and semantic payload digest, but may use a new
 route snapshot/delivery attempt after G -> G+1 replacement. That reroute must
@@ -130,6 +139,58 @@ not create a second executable request.
 The current `wvm_ipc_cpu_run_req` has `mode_tcg`, `slave_id`, `vcpu_index`, and
 a KVM/TCG context union. The successor must carry the semantic identity above;
 existing fields remain compatibility fields until wire/local ABI transition.
+
+### 3.1 Typed Request Encoding
+
+`wavevm_vcpu_handoff` serializes a request as an explicitly big-endian header
+followed by `context_bytes` opaque context bytes. The header is fixed at 168
+bytes; reserved bytes are zero and rejected otherwise.
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 2 | `protocol_version` |
+| 2 | 2 | `backend` (`KVM` or `TCG`) |
+| 4 | 2 | `context_schema_version` |
+| 6 | 2 | `memory_fence_result` |
+| 8 | 4 | `vm_id` |
+| 12 | 4 | `origin_physical_node_id` |
+| 16 | 4 | `vcpu_index` |
+| 20 | 2 | `reply_destination_kind` (`FLAT_VNODE` or `FRACTAL_VNODE`) |
+| 22 | 2 | reserved zero |
+| 24 | 8 | `vm_incarnation` |
+| 32 | 8 | `manifest_generation` |
+| 40 | 8 | `origin_runtime_instance_id` |
+| 48 | 8 | `destination_executor_id` |
+| 56 | 8 | `handoff_sequence` |
+| 64 | 8 | `memory_fence_id` |
+| 72 | 8 | `local_interrupt_watermark` |
+| 80 | 8 | `device_event_watermark` |
+| 88 | 8 | `reply_destination_scope` |
+| 96 | 4 | `reply_destination_vnode` |
+| 100 | 4 | reserved zero |
+| 104 | 16 | `operation_id` |
+| 120 | 8 | `context_valid_fields` |
+| 128 | 4 | `context_bytes` |
+| 132 | 4 | reserved zero |
+| 136 | 32 | SHA-256 of `exported_cpu_context` |
+| 168 | variable | `exported_cpu_context` |
+
+The request duplicates the envelope's immutable operation identity. A
+destination node runtime rejects a record unless `vm_id`, incarnation,
+manifest generation, origin physical/runtime identity, operation ID, and
+destination executor equal the admitted envelope. `memory_fence_result` must
+be successful before an executor may accept the operation. Context schema
+version and valid-field bitmap are mandatory. The current accepted schema is
+`WVM_VCPU_CONTEXT_SCHEMA_X86`; a receiver must not infer absent CPU, interrupt,
+timer, or device-resume state from zero-filled bytes.
+
+The request also carries the complete return leaf RouteKey. It is semantic
+payload, not mutable forwarding metadata: flat destinations require scope zero;
+fractal destinations require a nonzero scope; the unspecified vnode rejects.
+The destination node runtime resolves this exact key against the same admitted
+immutable route snapshot before creating `VCPU_EXIT`. It must not infer a
+return path from the sender address, a physical-node ID, a legacy `slave_id`,
+or a reverse route lookup.
 
 ## 4. Context Contract
 
@@ -210,10 +271,15 @@ failure before the VM starts, never an implicit context conversion.
 6. The executor deduplicates the operation, imports context in the documented
    backend order, executes until a defined exit, captures dirty effects and
    required CPU/device state, and records a completion before transmitting it.
-7. The origin validates result identity, sequence, backend, and context schema;
+7. The destination resolves the request's explicit reply leaf RouteKey against
+   its admitted immutable route snapshot, creates a typed `VCPU_EXIT` with the
+   original operation identity, and submits it through its local
+   sidecar/gateway boundary.
+8. The origin validates result identity, sequence, backend, context schema, and
+   returned leaf RouteKey;
    it merges returned state without erasing local events that arrived after the
    send watermark.
-8. It completes required returned-memory processing, performs device/MMIO/PIO
+9. It completes required returned-memory processing, performs device/MMIO/PIO
    work at QEMU authority when needed, and returns the vCPU to `LOCAL_OWNED`.
 
 Network sends, waits, page fetches, and device operations must not occur while
@@ -228,6 +294,12 @@ by the complete semantic deduplication key above. It retains the entry through
 the maximum route predecessor/query horizon; a later query receives
 `RESULT_EXPIRED`, never permission to execute again.
 
+`vcpu_handoff_record_capacity` is an admitted node-runtime launch-plan limit,
+separate from executor worker concurrency. It bounds in-progress and retained
+completion records for the local VM incarnation. Capacity exhaustion returns
+typed backpressure before any guest interval runs; it must not evict a result
+whose route retry/query horizon has not elapsed.
+
 | Condition | Required behavior |
 | --- | --- |
 | Duplicate request before completion | Return `IN_PROGRESS` or wait/query result; do not execute a second slice. |
@@ -237,6 +309,11 @@ the maximum route predecessor/query horizon; a later query receives
 | Initial delivery loss | Retransmit the identical semantic request in a bounded delivery window; only forwarding metadata may change after route refresh. |
 | Execution exceeds watchdog duration | Mark operation uncertain/in-progress according to recorded executor state; never send a second executable run. |
 | Destination/process failure before durable completion | Return a failed/degraded vCPU operation; recovery requires a separately specified VM fault policy. |
+
+`IN_PROGRESS`, `BACKPRESSURE`, `STALE`, and `RESULT_EXPIRED` are typed
+non-exit statuses. They use exit class `NONE` and carry no CPU context,
+memory-fence result, or event watermark. `EXECUTOR_FAILURE` uses
+`EXECUTOR_ERROR`; `MEMORY_FAILURE` uses `MEMORY_ERROR`.
 
 The current long `VCPU_RUN` timeout and retry window in `logic_core.c` are
 implementation guardrails. They do not make a repeated UDP send semantically
@@ -255,6 +332,12 @@ safe unless the destination cache enforces this contract.
 | `EXCEPTION` / shutdown / reset | Return exact architecture state and map to the authoritative QEMU lifecycle. |
 | `MEMORY_ERROR` | Include affected GPA/status; origin enters consistency recovery before another dependent execution interval. |
 | `EXECUTOR_ERROR` | Return typed non-success; no fake CPU completion. |
+
+The return envelope retains the request's VM/incarnation, manifest generation,
+origin runtime identity, operation ID, route-snapshot key, and semantic result
+payload. Its mutable delivery attempt and route hop state are newly created.
+Its route leaf must equal the request's explicit reply RouteKey and begin with
+hop count zero and a nonzero hop limit resolved from the active snapshot.
 
 Timers and TSC are guest architectural state. KVM uses its selected MSR/LAPIC
 mechanics; TCG translates values relative to its virtual-clock epoch. A fixed

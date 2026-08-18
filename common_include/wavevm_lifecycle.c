@@ -27,6 +27,13 @@ static int lifecycle_storage_assignment_list_validate(
     uint32_t physical_node_id,
     const uint8_t reservation_id[WVM_IDENTITY_ID_BYTES], char *error,
     size_t error_len);
+static uint16_t lifecycle_read_be16(const uint8_t *src);
+static uint32_t lifecycle_read_be32(const uint8_t *src);
+static uint64_t lifecycle_read_be64(const uint8_t *src);
+static int lifecycle_parse_record_fields(
+    const uint8_t *bytes, size_t encoded_bytes, uint16_t expected_record_type,
+    struct wvm_canonical_field *fields, unsigned char *present,
+    size_t field_capacity, char *error, size_t error_len);
 
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
 {
@@ -418,6 +425,8 @@ int wvm_node_runtime_manifest_validate(
             &runtime_manifest->negotiated_profile, error, error_len) != 0 ||
         bytes_are_zero(runtime_manifest->reservation_id,
                        sizeof(runtime_manifest->reservation_id)) ||
+        wvm_node_runtime_launch_plan_validate(&runtime_manifest->launch_plan,
+                                              error, error_len) != 0 ||
         lifecycle_vcpu_assignment_list_validate(
             &runtime_manifest->local_vcpu_assignments,
             runtime_manifest->physical_node_id, runtime_manifest->reservation_id,
@@ -441,11 +450,204 @@ int wvm_node_runtime_manifest_validate(
     return 0;
 }
 
+static int machine_config_equal(const struct wvm_machine_config *left,
+                                const struct wvm_machine_config *right)
+{
+    return left && right && strcmp(left->architecture, right->architecture) == 0 &&
+           strcmp(left->machine_type, right->machine_type) == 0 &&
+           left->qemu_compat_version == right->qemu_compat_version &&
+           left->firmware_policy == right->firmware_policy;
+}
+
+static int consistency_policy_equal(const struct wvm_consistency_policy *left,
+                                    const struct wvm_consistency_policy *right)
+{
+    return left && right &&
+           left->dirty_batch_size == right->dirty_batch_size &&
+           left->handoff_commit_policy == right->handoff_commit_policy &&
+           left->subscriber_delivery_policy == right->subscriber_delivery_policy &&
+           left->max_commit_latency_ms == right->max_commit_latency_ms;
+}
+
+static int candidate_total_memory_bytes(
+    const struct wvm_candidate_vm_manifest *candidate, uint64_t *total_out)
+{
+    uint64_t total = 0;
+    size_t i;
+
+    if (!candidate || !total_out) {
+        return -1;
+    }
+    for (i = 0; i < candidate->memory_placements.count; i++) {
+        const uint64_t bytes = candidate->memory_placements.entries[i].bytes;
+
+        if (bytes == 0 || bytes > UINT64_MAX - total) {
+            return -1;
+        }
+        total += bytes;
+    }
+    *total_out = total;
+    return 0;
+}
+
+int wvm_node_runtime_launch_plan_validate(
+    const struct wvm_node_runtime_launch_plan *launch_plan, char *error,
+    size_t error_len)
+{
+    if (!launch_plan ||
+        launch_plan->plan_version != WVM_NODE_RUNTIME_LAUNCH_PLAN_VERSION ||
+        launch_plan->node_runtime_data_port == 0 ||
+        launch_plan->node_runtime_control_port == 0 ||
+        launch_plan->local_executor_service_port == 0 ||
+        launch_plan->local_executor_control_port == 0 ||
+        launch_plan->node_runtime_data_port ==
+            launch_plan->local_executor_service_port ||
+        launch_plan->executor_worker_count == 0 ||
+        launch_plan->vcpu_handoff_record_capacity == 0 ||
+        launch_plan->sync_batch_size == 0 ||
+        launch_plan->guest_total_memory_bytes == 0 ||
+        launch_plan->guest_total_memory_bytes % WVM_MANIFEST_PAGE_BYTES != 0 ||
+        wvm_machine_config_validate(&launch_plan->guest_machine, error,
+                                    error_len) != 0 ||
+        wvm_consistency_policy_validate(&launch_plan->consistency_policy, error,
+                                        error_len) != 0) {
+        set_error(error, error_len, "node runtime launch plan is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_node_runtime_launch_plan_encode(
+    const struct wvm_node_runtime_launch_plan *launch_plan, uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len)
+{
+    struct wvm_canonical_builder builder;
+    uint8_t machine_bytes[256];
+    uint8_t consistency_bytes[128];
+    uint8_t *field_value;
+    size_t machine_encoded_bytes;
+    size_t consistency_encoded_bytes;
+
+    if (wvm_node_runtime_launch_plan_validate(launch_plan, error, error_len) !=
+            0 ||
+        wvm_machine_config_encode(&launch_plan->guest_machine, machine_bytes,
+                                  sizeof(machine_bytes), &machine_encoded_bytes,
+                                  error, error_len) != 0 ||
+        wvm_consistency_policy_encode(
+            &launch_plan->consistency_policy, consistency_bytes,
+            sizeof(consistency_bytes), &consistency_encoded_bytes, error,
+            error_len) != 0 ||
+        wvm_canonical_record_begin(&builder, bytes, capacity,
+                                   WVM_RECORD_NODE_RUNTIME_LAUNCH_PLAN) != 0 ||
+        wvm_canonical_field_append_u16(&builder, 1,
+                                       launch_plan->plan_version) != 0 ||
+        wvm_canonical_field_append_u16(&builder, 2,
+                                       launch_plan->node_runtime_data_port) !=
+            0 ||
+        wvm_canonical_field_append_u16(
+            &builder, 3, launch_plan->node_runtime_control_port) != 0 ||
+        wvm_canonical_field_append_u16(
+            &builder, 4, launch_plan->local_executor_service_port) != 0 ||
+        wvm_canonical_field_append_u16(
+            &builder, 5, launch_plan->local_executor_control_port) != 0 ||
+        wvm_canonical_field_append_u32(
+            &builder, 6, launch_plan->executor_worker_count) != 0 ||
+        wvm_canonical_field_append_u32(&builder, 7,
+                                       launch_plan->sync_batch_size) != 0 ||
+        wvm_canonical_field_append_u64(
+            &builder, 8, launch_plan->guest_total_memory_bytes) != 0 ||
+        wvm_canonical_field_reserve(&builder, 9,
+                                    (uint32_t)machine_encoded_bytes,
+                                    &field_value) != 0) {
+        set_error(error, error_len, "cannot encode node runtime launch plan");
+        return -1;
+    }
+    memcpy(field_value, machine_bytes, machine_encoded_bytes);
+    if (wvm_canonical_field_reserve(&builder, 10,
+                                    (uint32_t)consistency_encoded_bytes,
+                                    &field_value) != 0) {
+        set_error(error, error_len, "cannot encode node runtime launch plan");
+        return -1;
+    }
+    memcpy(field_value, consistency_bytes, consistency_encoded_bytes);
+    if (wvm_canonical_field_append_u32(
+            &builder, 11, launch_plan->vcpu_handoff_record_capacity) != 0) {
+        set_error(error, error_len, "cannot encode node runtime launch plan");
+        return -1;
+    }
+    if (wvm_canonical_record_finish(&builder, encoded_bytes) != 0) {
+        set_error(error, error_len, "cannot finish node runtime launch plan");
+        return -1;
+    }
+    return 0;
+}
+
+int wvm_node_runtime_launch_plan_decode(
+    const uint8_t *bytes, size_t encoded_bytes,
+    struct wvm_node_runtime_launch_plan *launch_plan, char *error,
+    size_t error_len)
+{
+    struct wvm_canonical_field fields[12];
+    unsigned char present[12];
+    size_t i;
+
+    if (!launch_plan ||
+        lifecycle_parse_record_fields(
+            bytes, encoded_bytes, WVM_RECORD_NODE_RUNTIME_LAUNCH_PLAN, fields,
+            present, sizeof(present), error, error_len) != 0) {
+        return -1;
+    }
+    for (i = 1; i <= 11; i++) {
+        if (!present[i]) {
+            set_error(error, error_len,
+                      "node runtime launch plan misses field %zu", i);
+            return -1;
+        }
+    }
+    if (fields[1].value_bytes != 2 || fields[2].value_bytes != 2 ||
+        fields[3].value_bytes != 2 || fields[4].value_bytes != 2 ||
+        fields[5].value_bytes != 2 || fields[6].value_bytes != 4 ||
+        fields[7].value_bytes != 4 || fields[8].value_bytes != 8 ||
+        fields[11].value_bytes != 4) {
+        set_error(error, error_len,
+                  "node runtime launch plan has invalid fields");
+        return -1;
+    }
+    memset(launch_plan, 0, sizeof(*launch_plan));
+    launch_plan->plan_version = lifecycle_read_be16(fields[1].value);
+    launch_plan->node_runtime_data_port =
+        lifecycle_read_be16(fields[2].value);
+    launch_plan->node_runtime_control_port =
+        lifecycle_read_be16(fields[3].value);
+    launch_plan->local_executor_service_port =
+        lifecycle_read_be16(fields[4].value);
+    launch_plan->local_executor_control_port =
+        lifecycle_read_be16(fields[5].value);
+    launch_plan->executor_worker_count = lifecycle_read_be32(fields[6].value);
+    launch_plan->sync_batch_size = lifecycle_read_be32(fields[7].value);
+    launch_plan->guest_total_memory_bytes =
+        lifecycle_read_be64(fields[8].value);
+    launch_plan->vcpu_handoff_record_capacity =
+        lifecycle_read_be32(fields[11].value);
+    if (wvm_machine_config_decode(fields[9].value, fields[9].value_bytes,
+                                  &launch_plan->guest_machine, error,
+                                  error_len) != 0 ||
+        wvm_consistency_policy_decode(
+            fields[10].value, fields[10].value_bytes,
+            &launch_plan->consistency_policy, error, error_len) != 0) {
+        return -1;
+    }
+    return wvm_node_runtime_launch_plan_validate(launch_plan, error,
+                                                 error_len);
+}
+
 int wvm_node_runtime_manifest_project(
     const struct wvm_candidate_vm_manifest *candidate,
     const uint8_t candidate_manifest_digest[WVM_SHA256_DIGEST_BYTES],
     const struct wvm_resource_reservation *reservation,
-    const struct wvm_activation_record *activation, uint64_t local_role_bits,
+    const struct wvm_activation_record *activation,
+    const struct wvm_node_runtime_launch_plan *launch_plan,
+    uint64_t local_role_bits,
     struct wvm_node_runtime_manifest *runtime_manifest, char *error,
     size_t error_len)
 {
@@ -455,6 +657,8 @@ int wvm_node_runtime_manifest_project(
     struct wvm_memory_chunk_assignment_list memory;
     struct wvm_storage_assignment_list storage;
     struct wvm_startup_dependency_list dependencies;
+    struct wvm_node_runtime_launch_plan retained_launch_plan;
+    uint64_t total_memory_bytes;
     size_t i;
 
     if (!candidate || !reservation || !runtime_manifest ||
@@ -484,6 +688,20 @@ int wvm_node_runtime_manifest_project(
                 WVM_SHA256_DIGEST_BYTES) != 0)) {
         return -1;
     }
+    retained_launch_plan =
+        launch_plan ? *launch_plan : runtime_manifest->launch_plan;
+    if (wvm_node_runtime_launch_plan_validate(&retained_launch_plan, error,
+                                              error_len) != 0 ||
+        !machine_config_equal(&retained_launch_plan.guest_machine,
+                              &candidate->guest_machine) ||
+        !consistency_policy_equal(&retained_launch_plan.consistency_policy,
+                                  &candidate->consistency_policy) ||
+        candidate_total_memory_bytes(candidate, &total_memory_bytes) != 0 ||
+        retained_launch_plan.guest_total_memory_bytes != total_memory_bytes) {
+        set_error(error, error_len,
+                  "runtime launch plan does not match candidate manifest");
+        return -1;
+    }
 
     vcpus = runtime_manifest->local_vcpu_assignments;
     memory = runtime_manifest->local_memory_assignments;
@@ -500,6 +718,7 @@ int wvm_node_runtime_manifest_project(
     runtime_manifest->local_memory_assignments = memory;
     runtime_manifest->local_storage_assignments = storage;
     runtime_manifest->startup_dependencies = dependencies;
+    runtime_manifest->launch_plan = retained_launch_plan;
     runtime_manifest->local_vcpu_assignments.count = 0;
     runtime_manifest->local_memory_assignments.count = 0;
     runtime_manifest->local_storage_assignments.count = 0;
@@ -948,13 +1167,7 @@ static int lifecycle_exclusive_lease_compare(
         return left->lease_kind < right->lease_kind ? -1 : 1;
     }
     comparison = strcmp(left->lease_name, right->lease_name);
-    if (comparison != 0) {
-        return comparison;
-    }
-    if (left->lease_generation != right->lease_generation) {
-        return left->lease_generation < right->lease_generation ? -1 : 1;
-    }
-    return 0;
+    return comparison;
 }
 
 static int lifecycle_exclusive_lease_list_validate(
@@ -1777,6 +1990,7 @@ int wvm_node_runtime_manifest_encode(
     uint8_t *field_value;
     uint8_t route_snapshot_key_bytes[256];
     uint8_t local_names_bytes[512];
+    uint8_t launch_plan_bytes[512];
     size_t vcpu_bytes;
     size_t memory_bytes;
     size_t storage_bytes;
@@ -1784,6 +1998,7 @@ int wvm_node_runtime_manifest_encode(
     size_t local_names_encoded_bytes;
     size_t profile_bytes;
     size_t startup_dependencies_bytes;
+    size_t launch_plan_encoded_bytes;
 
     if (wvm_node_runtime_manifest_validate(runtime_manifest, error, error_len) !=
             0 ||
@@ -1811,6 +2026,10 @@ int wvm_node_runtime_manifest_encode(
                                         sizeof(local_names_bytes),
                                         &local_names_encoded_bytes, error,
                                         error_len) != 0 ||
+        wvm_node_runtime_launch_plan_encode(
+            &runtime_manifest->launch_plan, launch_plan_bytes,
+            sizeof(launch_plan_bytes), &launch_plan_encoded_bytes, error,
+            error_len) != 0 ||
         lifecycle_execution_fault_profile_size(
             &runtime_manifest->negotiated_profile, &profile_bytes) != 0 ||
         lifecycle_record_list_size(
@@ -1907,7 +2126,14 @@ int wvm_node_runtime_manifest_encode(
             lifecycle_startup_dependency_size,
             lifecycle_startup_dependency_encode_adapter, field_value,
             startup_dependencies_bytes, error, error_len) != 0 ||
-        wvm_canonical_record_finish(&builder, encoded_bytes) != 0) {
+        wvm_canonical_field_reserve(&builder, 19,
+                                    (uint32_t)launch_plan_encoded_bytes,
+                                    &field_value) != 0) {
+        set_error(error, error_len, "cannot finish node runtime manifest");
+        return -1;
+    }
+    memcpy(field_value, launch_plan_bytes, launch_plan_encoded_bytes);
+    if (wvm_canonical_record_finish(&builder, encoded_bytes) != 0) {
         set_error(error, error_len, "cannot finish node runtime manifest");
         return -1;
     }
@@ -1919,8 +2145,8 @@ int wvm_node_runtime_manifest_decode(
     struct wvm_node_runtime_manifest *runtime_manifest, char *error,
     size_t error_len)
 {
-    struct wvm_canonical_field fields[19];
-    unsigned char present[19];
+    struct wvm_canonical_field fields[20];
+    unsigned char present[20];
     struct wvm_vcpu_assignment_list vcpus;
     struct wvm_memory_chunk_assignment_list memory;
     struct wvm_storage_assignment_list storage;
@@ -1935,7 +2161,7 @@ int wvm_node_runtime_manifest_decode(
                                       error_len) != 0) {
         return -1;
     }
-    for (i = 1; i <= 18; i++) {
+    for (i = 1; i <= 19; i++) {
         if (i != 7 && !present[i]) {
             set_error(error, error_len,
                       "node runtime manifest misses field %zu", i);
@@ -2026,7 +2252,10 @@ int wvm_node_runtime_manifest_decode(
             sizeof(*runtime_manifest->startup_dependencies.entries),
             &runtime_manifest->startup_dependencies.count,
             lifecycle_startup_dependency_decode_adapter, error, error_len) !=
-            0) {
+            0 ||
+        wvm_node_runtime_launch_plan_decode(
+            fields[19].value, fields[19].value_bytes,
+            &runtime_manifest->launch_plan, error, error_len) != 0) {
         return -1;
     }
     return wvm_node_runtime_manifest_validate(runtime_manifest, error, error_len);

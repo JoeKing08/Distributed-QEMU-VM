@@ -1271,7 +1271,7 @@ int wvm_handle_local_fault_fastpath(uint64_t gpa, void* page_buffer, uint64_t *v
     return -1; // 失败
 }
 
-int wvm_handle_local_commit_v1(uint64_t gpa, uint64_t base_version,
+int wvm_handle_local_commit(uint64_t gpa, uint64_t base_version,
                                uint16_t offset, const uint8_t *data,
                                size_t data_bytes, uint64_t *result_version)
 {
@@ -1324,7 +1324,7 @@ int wvm_handle_local_commit_v1(uint64_t gpa, uint64_t base_version,
     return 0;
 }
 
-int wvm_publish_local_commit_v1(uint64_t gpa, uint64_t result_version,
+int wvm_publish_local_commit(uint64_t gpa, uint64_t result_version,
                                 uint16_t offset, const uint8_t *data,
                                 size_t data_bytes, uint32_t writer_node_id)
 {

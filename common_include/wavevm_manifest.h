@@ -37,6 +37,11 @@
 #define WVM_MANIFEST_CONSTRAINT_SUBJECT_MAX_BYTES 128U
 #define WVM_MANIFEST_CONSTRAINT_VALUE_MAX_BYTES 255U
 
+/* Exclusive resources owned by one admitted node-runtime instance. */
+#define WVM_EXCLUSIVE_LEASE_KIND_NODE_RUNTIME_DATA_UDP 1U
+#define WVM_EXCLUSIVE_LEASE_KIND_LOCAL_EXECUTOR_SERVICE_UDP 2U
+#define WVM_EXCLUSIVE_LEASE_KIND_KERNEL_CONTEXT 3U
+
 enum wvm_manifest_backend {
     WVM_MANIFEST_BACKEND_KVM = 1,
     WVM_MANIFEST_BACKEND_TCG = 2,
@@ -98,7 +103,7 @@ enum wvm_manifest_member_state {
 
 enum wvm_manifest_namespace_abi {
     WVM_MANIFEST_NAMESPACE_LEGACY = WVM_NAMESPACE_ABI_LEGACY,
-    WVM_MANIFEST_NAMESPACE_V1_U32 = WVM_NAMESPACE_ABI_V1_U32,
+    WVM_MANIFEST_NAMESPACE_U32 = WVM_NAMESPACE_ABI_U32,
 };
 
 struct wvm_vm_route_scope_key {

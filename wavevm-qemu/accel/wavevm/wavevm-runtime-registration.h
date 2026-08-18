@@ -16,6 +16,16 @@ static inline int wavevm_qemu_runtime_gate_enabled(void)
     return value && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
+static inline const char *wavevm_qemu_runtime_socket_path(void)
+{
+    const char *path = getenv("WVM_RUNTIME_SOCKET");
+
+    if (!path || path[0] == '\0') {
+        path = getenv("WVM_ENV_SOCK_PATH");
+    }
+    return path && path[0] != '\0' ? path : NULL;
+}
+
 static inline int wavevm_qemu_parse_u64_env(const char *name,
                                             uint64_t *value)
 {
