@@ -34,6 +34,18 @@ struct wvm_membership_controller_member_entry {
     uint8_t activation_route_operation_id[WVM_IDENTITY_ID_BYTES];
 };
 
+/* A lock-safe, pointer-free view of one registered member. */
+struct wvm_membership_controller_member_status {
+    enum wvm_membership_member_kind kind;
+    struct wvm_member_key member_key;
+    enum wvm_manifest_member_state desired_membership_state;
+    enum wvm_membership_health_state observed_health_state;
+    uint64_t active_dependency_count;
+    uint64_t membership_revision;
+    uint64_t topology_revision;
+    uint64_t admission_eligibility_revision;
+};
+
 struct wvm_membership_controller_route_ack_state {
     struct wvm_member_key member_key;
     int prepared;
@@ -251,9 +263,10 @@ int wvm_membership_controller_gateway_drain_abort(
 
 /*
  * Apply one canonical gateway-drain action under the controller lock. The
- * expected revisions fence the action at its authority linearization point;
- * retry after a controller-only durable commit/abort is recognized only when
- * the exact target, route operation, and post-action revisions match.
+ * expected revisions name the state observed before PREPARE. COMMIT and
+ * ABORT validate the durable intermediate eligibility revision created by
+ * PREPARE; retries are accepted only when the exact target, route operation,
+ * and resulting revisions match.
  */
 int wvm_membership_controller_gateway_drain_apply(
     struct wvm_membership_controller *controller,
@@ -269,6 +282,13 @@ int wvm_membership_controller_gateway_drain_apply(
 int wvm_membership_controller_remove(
     struct wvm_membership_controller *controller,
     const struct wvm_member_key *member_key, char *error, size_t error_len);
+
+/* Copy one member's state while holding the controller lock. */
+int wvm_membership_controller_member_status(
+    const struct wvm_membership_controller *controller,
+    const struct wvm_member_key *member_key,
+    struct wvm_membership_controller_member_status *status, char *error,
+    size_t error_len);
 
 /*
  * Members may report only their own HEALTHY/RECOVERING observations.  A local

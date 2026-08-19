@@ -399,7 +399,7 @@ tags starting at one; no listed field is optional unless marked optional.
 | --- | --- | --- | --- | --- |
 | `0x0101` | `REGISTER_MEMBER` | Exact canonical `NodeRecord` or `GatewayRecord` payload; the receiver derives `MemberKey` from that record | `vm_id=0`, fresh member instance, authenticated registrar | Registered `PENDING`/`RECOVERING` desired-state record; retained through member removal/quarantine. |
 | `0x0102` | `CORDON` | Exact canonical `MemberCordonRequest` (`0x102c`) | Authenticated actor is an `EXECUTOR` principal accepted by the separately configured membership-management authorizer. Target is a registered `NODE_RUNTIME` or `GATEWAY`; all three expected revisions are exact. | Target enters `CORDONED`; membership and admission-eligibility revisions advance by one, topology revision is unchanged; one durable replayable result is retained through removal/quarantine. |
-| `0x0103` | `DRAIN` | Exact canonical `GatewayDrainRequest` (`0x102b`) | Authenticated actor is an `EXECUTOR` principal accepted by the receiver's separately configured management-authorizer callback. A missing callback fails closed. `PREPARE` requires exact current membership/topology/eligibility revisions and one complete successor route at `topology_revision = current + 1`; `COMMIT` and `ABORT` require the post-prepare fence. | One durable replayable result per operation. `PREPARE` advances eligibility only; `COMMIT` atomically activates the successor, marks the target gateway `DRAINING`, and advances all three revisions; `ABORT` leaves revisions unchanged. |
+| `0x0103` | `DRAIN` | Exact canonical `GatewayDrainRequest` (`0x102b`) | Authenticated actor is an `EXECUTOR` principal accepted by the receiver's separately configured management-authorizer callback. A missing callback fails closed. `PREPARE` requires exact current membership/topology/eligibility revisions and one complete successor route at `topology_revision = current + 1`; `COMMIT` and `ABORT` carry the same pre-prepare fence and the controller validates the durable post-prepare eligibility state. | One durable replayable result per operation. `PREPARE` advances eligibility only; `COMMIT` atomically activates the successor, marks the target gateway `DRAINING`, and advances all three revisions; `ABORT` leaves membership/topology unchanged but retains the monotonic eligibility invalidation from `PREPARE`. |
 | `0x0201` | `PREPARE_RESERVATION` | `admission_tx_id:ID16`, candidate `Digest32`, eligibility-fence `Digest32`, plan `Digest32`, expected `MemberKey`, resource reservation record, `prepared_expiry:u64` | Member/capability/fence still eligible and local capacity/name lease free | Prepared reservation ID/digest/expiry; retained until abort or expiry if no activation fence. |
 | `0x0202` | `COMMIT_RESERVATION` | `admission_tx_id`, candidate digest, eligibility-fence digest, `activation_fence:ID16`, reservation ID | Matching unexpired prepared record and durable activation decision | Committed reservation digest; retained through VM retirement. |
 | `0x0203` | `ABORT_RESERVATION` | `admission_tx_id`, candidate digest, reservation ID, reason | No matching activation fence, or explicit compensating-teardown record | Released/teardown-pending result; retained through cleanup horizon. |
@@ -456,10 +456,15 @@ callback, a non-executor actor, or an authorization denial is
 topology, and admission-eligibility revisions must exactly equal the current
 controller values. On success the controller durably reserves the successor
 topology generation and advances eligibility only. `COMMIT` and `ABORT` omit
-the successor records and carry the post-prepare fence. Commit atomically
+the successor records and carry the same pre-prepare membership/topology/
+eligibility fence. The controller checks that `PREPARE` has durably advanced
+eligibility by exactly one before applying either action. Commit atomically
 activates the successor, marks the target gateway `DRAINING`, and advances
 membership, topology, and eligibility revisions. Abort records the successor
-as aborted without advancing any revision.
+as aborted, leaves membership/topology unchanged, and retains the one-step
+eligibility invalidation. This keeps the eligibility revision monotonic and
+prevents an admission captured during the abandoned drain from becoming valid
+again.
 
 Every successful action is stored in the result journal under the envelope
 operation ID and semantic digest. A retry after the controller frame became

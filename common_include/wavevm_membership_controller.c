@@ -3040,8 +3040,9 @@ int wvm_membership_controller_gateway_drain_apply(
         if (controller->gateway_drain.active &&
             controller->membership_revision == expected_membership_revision &&
             controller->topology_revision == expected_topology_revision &&
+            expected_admission_eligibility_revision != UINT64_MAX &&
             controller->admission_eligibility_revision ==
-                expected_admission_eligibility_revision &&
+                expected_admission_eligibility_revision + 1U &&
             member_key_equal(&controller->gateway_drain.gateway_member_key,
                              gateway_member_key) &&
             gateway_drain_matches_operation(controller, route_operation_id)) {
@@ -3049,13 +3050,13 @@ int wvm_membership_controller_gateway_drain_apply(
                                                  error, error_len);
         } else if (expected_membership_revision != UINT64_MAX &&
                    expected_topology_revision != UINT64_MAX &&
-                   expected_admission_eligibility_revision != UINT64_MAX &&
+                   expected_admission_eligibility_revision <= UINT64_MAX - 2U &&
                    controller->membership_revision ==
                        expected_membership_revision + 1U &&
                    controller->topology_revision ==
                        expected_topology_revision + 1U &&
                    controller->admission_eligibility_revision ==
-                       expected_admission_eligibility_revision + 1U &&
+                       expected_admission_eligibility_revision + 2U &&
                    gateway_drain_terminal_matches_locked(
                        controller, gateway_member_key, route_operation_id,
                        WVM_ROUTE_TRANSACTION_ACTIVATED) &&
@@ -3071,8 +3072,9 @@ int wvm_membership_controller_gateway_drain_apply(
         if (controller->gateway_drain.active &&
             controller->membership_revision == expected_membership_revision &&
             controller->topology_revision == expected_topology_revision &&
+            expected_admission_eligibility_revision != UINT64_MAX &&
             controller->admission_eligibility_revision ==
-                expected_admission_eligibility_revision &&
+                expected_admission_eligibility_revision + 1U &&
             member_key_equal(&controller->gateway_drain.gateway_member_key,
                              gateway_member_key) &&
             gateway_drain_matches_operation(controller, route_operation_id)) {
@@ -3082,8 +3084,9 @@ int wvm_membership_controller_gateway_drain_apply(
                    controller->membership_revision ==
                        expected_membership_revision &&
                    controller->topology_revision == expected_topology_revision &&
+                   expected_admission_eligibility_revision != UINT64_MAX &&
                    controller->admission_eligibility_revision ==
-                       expected_admission_eligibility_revision &&
+                       expected_admission_eligibility_revision + 1U &&
                    gateway_drain_terminal_matches_locked(
                        controller, gateway_member_key, route_operation_id,
                        WVM_ROUTE_TRANSACTION_ABORTED)) {
@@ -3293,6 +3296,42 @@ int wvm_membership_controller_remove(
     }
     pthread_mutex_unlock(&controller->lock);
     return result;
+}
+
+int wvm_membership_controller_member_status(
+    const struct wvm_membership_controller *controller,
+    const struct wvm_member_key *member_key,
+    struct wvm_membership_controller_member_status *status, char *error,
+    size_t error_len)
+{
+    const struct wvm_membership_controller_member_entry *entry;
+    struct wvm_membership_controller *mutable_controller;
+
+    if (!controller || controller->journal_fd < 0 || !member_key || !status ||
+        wvm_member_key_validate(member_key, error, error_len) != 0) {
+        set_error(error, error_len, "member status input is invalid");
+        return -1;
+    }
+    mutable_controller = (struct wvm_membership_controller *)controller;
+    pthread_mutex_lock(&mutable_controller->lock);
+    entry = find_member_mutable(mutable_controller, member_key);
+    if (!entry) {
+        set_error(error, error_len, "member status names an unknown member");
+        pthread_mutex_unlock(&mutable_controller->lock);
+        return -1;
+    }
+    memset(status, 0, sizeof(*status));
+    status->kind = entry->kind;
+    status->member_key = entry->member_key;
+    status->desired_membership_state = entry_state(entry);
+    status->observed_health_state = entry_health(entry);
+    status->active_dependency_count = entry->active_dependency_count;
+    status->membership_revision = mutable_controller->membership_revision;
+    status->topology_revision = mutable_controller->topology_revision;
+    status->admission_eligibility_revision =
+        mutable_controller->admission_eligibility_revision;
+    pthread_mutex_unlock(&mutable_controller->lock);
+    return 0;
 }
 
 int wvm_membership_controller_report_self_health(

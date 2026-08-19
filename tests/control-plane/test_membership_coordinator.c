@@ -201,6 +201,104 @@ static void build_transaction(struct wvm_route_transaction_record *transaction,
     transaction->state = WVM_ROUTE_TRANSACTION_PREPARING;
 }
 
+static int build_gateway_successor_transaction(
+    struct wvm_route_transaction_record *transaction,
+    struct wvm_route_snapshot_record *snapshot,
+    struct wvm_route_rule_record *rule,
+    struct wvm_required_ack_entry snapshot_ack_entries[2],
+    struct wvm_required_ack_entry transaction_ack_entries[2],
+    struct wvm_required_ack_entry decoded_transaction_ack_entries[2],
+    struct wvm_required_ack_set *ack_set,
+    struct wvm_required_ack_entry optional_departure_entries[1],
+    uint64_t topology_revision, uint64_t membership_revision,
+    uint64_t route_generation, uint8_t operation_tail,
+    const struct wvm_route_snapshot_key *predecessor_key,
+    const struct wvm_member_key *node_member,
+    const struct wvm_endpoint *node_endpoint,
+    const struct wvm_member_key *departing_gateway_member,
+    const struct wvm_endpoint *departing_gateway_endpoint,
+    const struct wvm_member_key *successor_gateway_member,
+    const struct wvm_endpoint *successor_gateway_endpoint, char *error,
+    size_t error_len)
+{
+    uint8_t encoded[8192];
+    uint8_t digest[WVM_SHA256_DIGEST_BYTES];
+    size_t encoded_bytes;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->route_snapshot_key.scope_key = predecessor_key->scope_key;
+    snapshot->route_snapshot_key.topology_revision = topology_revision;
+    snapshot->route_snapshot_key.route_generation = route_generation;
+    snapshot->membership_revision = membership_revision;
+    snapshot->topology_kind = 1;
+    snapshot->has_predecessor_snapshot_key = 1;
+    snapshot->predecessor_snapshot_key = *predecessor_key;
+    snapshot->operation_retention_horizon_ms = 5000;
+    snapshot->retirement_policy = 1;
+
+    memset(rule, 0, sizeof(*rule));
+    rule->destination_kind = WVM_ROUTE_DESTINATION_EXACT_VNODE;
+    rule->next_hop_kind = WVM_ROUTE_NEXT_HOP_GATEWAY;
+    rule->next_hop_member = *successor_gateway_member;
+    rule->next_hop_endpoint = *successor_gateway_endpoint;
+    rule->hop_limit = 4;
+    snapshot->next_hop_rules.entries = rule;
+    snapshot->next_hop_rules.count = 1;
+    snapshot->next_hop_rules.capacity = 1;
+
+    memset(snapshot_ack_entries, 0, 2 * sizeof(*snapshot_ack_entries));
+    snapshot_ack_entries[0].member_key = *node_member;
+    snapshot_ack_entries[0].endpoint = *node_endpoint;
+    snapshot_ack_entries[0].role_type = WVM_MANIFEST_ROLE_NODE_RUNTIME;
+    snapshot_ack_entries[0].expected_snapshot_key =
+        snapshot->route_snapshot_key;
+    snapshot_ack_entries[1].member_key = *successor_gateway_member;
+    snapshot_ack_entries[1].endpoint = *successor_gateway_endpoint;
+    snapshot_ack_entries[1].role_type = WVM_MANIFEST_ROLE_GATEWAY;
+    snapshot_ack_entries[1].expected_snapshot_key =
+        snapshot->route_snapshot_key;
+    snapshot->required_ack_set.entries.entries = snapshot_ack_entries;
+    snapshot->required_ack_set.entries.count = 2;
+    snapshot->required_ack_set.entries.capacity = 2;
+    if (wvm_route_snapshot_record_encode(snapshot, encoded, sizeof(encoded),
+                                         &encoded_bytes, digest, error,
+                                         error_len) != 0) {
+        return -1;
+    }
+    memcpy(snapshot->route_snapshot_key.snapshot_digest, digest, sizeof(digest));
+    memcpy(snapshot_ack_entries[0].expected_snapshot_key.snapshot_digest,
+           digest, sizeof(digest));
+    memcpy(snapshot_ack_entries[1].expected_snapshot_key.snapshot_digest,
+           digest, sizeof(digest));
+    if (wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0 ||
+        build_ack_set(ack_set, transaction_ack_entries,
+                      decoded_transaction_ack_entries, 2,
+                      &snapshot->route_snapshot_key, node_member, node_endpoint,
+                      successor_gateway_member, successor_gateway_endpoint,
+                      error, error_len) != 0) {
+        return -1;
+    }
+    memset(transaction, 0, sizeof(*transaction));
+    transaction->operation_id[WVM_IDENTITY_ID_BYTES - 1] = operation_tail;
+    transaction->route_snapshot_key = snapshot->route_snapshot_key;
+    transaction->has_predecessor_snapshot_key = 1;
+    transaction->predecessor_snapshot_key = *predecessor_key;
+    transaction->required_ack_set = *ack_set;
+    memset(optional_departure_entries, 0,
+           sizeof(*optional_departure_entries));
+    optional_departure_entries[0].member_key = *departing_gateway_member;
+    optional_departure_entries[0].endpoint = *departing_gateway_endpoint;
+    optional_departure_entries[0].role_type = WVM_MANIFEST_ROLE_GATEWAY;
+    optional_departure_entries[0].expected_snapshot_key = *predecessor_key;
+    transaction->optional_departure_drain_set.entries =
+        optional_departure_entries;
+    transaction->optional_departure_drain_set.count = 1;
+    transaction->optional_departure_drain_set.capacity = 1;
+    transaction->operation_retention_horizon_ms = 5000;
+    transaction->state = WVM_ROUTE_TRANSACTION_PREPARING;
+    return wvm_route_transaction_record_validate(transaction, error, error_len);
+}
+
 static int route_prepare(void *context,
                          const struct wvm_route_transaction_record *transaction,
                          const struct wvm_required_ack_entry *ack_entry,
@@ -246,35 +344,39 @@ static int activate_gateway(struct wvm_membership_controller *controller,
                       error_len) != 0) {
         return -1;
     }
-    build_transaction(&transaction, 0x41, &route_key, &ack_set);
-    return wvm_membership_controller_route_begin(controller, &transaction,
-                                                 error, error_len) ||
-                   wvm_membership_controller_route_ack_prepare(
-                       controller, transaction.operation_id, gateway_member,
-                       error, error_len) ||
-                   wvm_membership_controller_route_commit(
-                       controller, transaction.operation_id, error, error_len) ||
-                   wvm_membership_controller_activate_member(
-                       controller, gateway_member, transaction.operation_id,
-                       error, error_len)
-               ? -1
-               : 0;
+    build_transaction(&transaction, (uint8_t)(0x40 + gateway->gateway_id),
+                      &route_key, &ack_set);
+    if (wvm_membership_controller_route_begin(controller, &transaction, error,
+                                              error_len) != 0 ||
+        wvm_membership_controller_route_ack_prepare(
+            controller, transaction.operation_id, gateway_member, error,
+            error_len) != 0 ||
+        wvm_membership_controller_route_commit(
+            controller, transaction.operation_id, error, error_len) != 0 ||
+        wvm_membership_controller_activate_member(
+            controller, gateway_member, transaction.operation_id, error,
+            error_len) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 int main(void)
 {
     char journal_path[] = "/tmp/wavevm-membership-coordinator.XXXXXX";
-    struct wvm_membership_controller_member_entry members[4];
-    struct wvm_membership_controller_member_entry recovered_members[4];
-    struct wvm_membership_controller_route_entry routes[4];
-    struct wvm_membership_controller_route_entry recovered_routes[4];
-    struct wvm_membership_dependency dependencies[4];
-    struct wvm_membership_dependency recovered_dependencies[4];
+    struct wvm_membership_controller_member_entry members[8];
+    struct wvm_membership_controller_member_entry recovered_members[8];
+    struct wvm_membership_controller_route_entry routes[8];
+    struct wvm_membership_controller_route_entry recovered_routes[8];
+    struct wvm_membership_dependency dependencies[8];
+    struct wvm_membership_dependency recovered_dependencies[8];
     struct wvm_membership_controller controller;
     struct wvm_membership_controller recovered_controller;
     struct wvm_gateway_record gateway;
+    struct wvm_gateway_record successor_gateway;
     struct wvm_node_record node;
     struct wvm_member_key gateway_member;
+    struct wvm_member_key successor_gateway_member;
     struct wvm_member_key node_member;
     struct wvm_route_snapshot_key route_key;
     struct wvm_required_ack_entry ack_entries[2];
@@ -282,6 +384,27 @@ int main(void)
     struct wvm_required_ack_set ack_set;
     struct wvm_route_transaction_record failed_transaction;
     struct wvm_route_transaction_record successful_transaction;
+    struct wvm_route_snapshot_key predecessor_route_key;
+    struct wvm_route_snapshot_record failed_successor_snapshot;
+    struct wvm_route_snapshot_record committed_successor_snapshot;
+    struct wvm_route_rule_record failed_successor_rule;
+    struct wvm_route_rule_record committed_successor_rule;
+    struct wvm_required_ack_entry failed_snapshot_ack_entries[2];
+    struct wvm_required_ack_entry committed_snapshot_ack_entries[2];
+    struct wvm_required_ack_entry failed_transaction_ack_entries[2];
+    struct wvm_required_ack_entry committed_transaction_ack_entries[2];
+    struct wvm_required_ack_entry decoded_failed_transaction_ack_entries[2];
+    struct wvm_required_ack_entry decoded_committed_transaction_ack_entries[2];
+    struct wvm_required_ack_set failed_successor_ack_set;
+    struct wvm_required_ack_set committed_successor_ack_set;
+    struct wvm_required_ack_entry failed_optional_departure_entries[1];
+    struct wvm_required_ack_entry committed_optional_departure_entries[1];
+    struct wvm_route_transaction_record failed_successor_transaction;
+    struct wvm_route_transaction_record committed_successor_transaction;
+    struct wvm_membership_controller_member_status member_status;
+    struct wvm_membership_compute_drain_request compute_drain;
+    struct wvm_membership_gateway_drain_request gateway_drain;
+    struct wvm_membership_dependency dependency;
     struct wvm_membership_join_request join_request;
     struct prepare_capture capture;
     const struct wvm_membership_controller_member_entry *entry;
@@ -296,17 +419,31 @@ int main(void)
     }
     close(fd);
     fill_gateway(&gateway);
+    successor_gateway = gateway;
+    successor_gateway.gateway_id = 8;
+    successor_gateway.gateway_instance_id = 801;
+    fill_endpoint(&successor_gateway.endpoint, 19, 19320, 19321);
     fill_node(&node);
     gateway_key(&gateway, &gateway_member);
+    gateway_key(&successor_gateway, &successor_gateway_member);
     node_key(&node, &node_member);
-    wvm_membership_controller_init(&controller, members, 4, routes, 4,
-                                   dependencies, 4, authorize, NULL);
+    wvm_membership_controller_init(&controller, members, 8, routes, 8,
+                                   dependencies, 8, authorize, NULL);
     if (expect(wvm_membership_controller_open(&controller, journal_path, error,
                                               sizeof(error)) == 0,
                "open membership controller") ||
         expect(activate_gateway(&controller, &gateway, &gateway_member, error,
                                 sizeof(error)) == 0,
                "activate existing route participant")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
+
+    if (expect(activate_gateway(&controller, &successor_gateway,
+                                &successor_gateway_member, error,
+                                sizeof(error)) == 0,
+               "activate successor gateway")) {
         wvm_membership_controller_close(&controller);
         unlink(journal_path);
         return 1;
@@ -370,11 +507,150 @@ int main(void)
         unlink(journal_path);
         return 1;
     }
+
+    memset(&dependency, 0, sizeof(dependency));
+    dependency.member_key = node_member;
+    dependency.vm_id = 256;
+    dependency.vm_incarnation = 1;
+    dependency.manifest_generation = 1;
+    dependency.dependency_kind = 2;
+    memset(&compute_drain, 0, sizeof(compute_drain));
+    compute_drain.member_key = node_member;
+    if (expect(wvm_membership_controller_dependency_acquire(
+                   &controller, &dependency, error, sizeof(error)) == 0,
+               "record gateway dependency before drain") ||
+        expect(wvm_membership_coordinator_drain_compute(
+                   &controller, &compute_drain, error, sizeof(error)) != 0,
+               "reject compute drain while a VM dependency exists") ||
+        expect(wvm_membership_controller_dependency_release(
+                   &controller, &dependency, error, sizeof(error)) == 0,
+               "release compute drain test dependency")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
+
+    predecessor_route_key = successful_transaction.route_snapshot_key;
+    memset(&dependency, 0, sizeof(dependency));
+    dependency.member_key = gateway_member;
+    dependency.vm_id = predecessor_route_key.scope_key.vm_id;
+    dependency.vm_incarnation = predecessor_route_key.scope_key.vm_incarnation;
+    dependency.manifest_generation = 1;
+    dependency.dependency_kind = 2;
+    memset(&gateway_drain, 0, sizeof(gateway_drain));
+    gateway_drain.gateway_member_key = &gateway_member;
+    gateway_drain.expected_membership_revision = controller.membership_revision;
+    gateway_drain.expected_topology_revision = controller.topology_revision;
+    gateway_drain.expected_admission_eligibility_revision =
+        controller.admission_eligibility_revision;
+    gateway_drain.route_prepare = route_prepare;
+    gateway_drain.route_prepare_context = &capture;
+    if (expect(wvm_membership_controller_dependency_acquire(
+                   &controller, &dependency, error, sizeof(error)) == 0,
+               "record gateway drain dependency") ||
+        expect(build_gateway_successor_transaction(
+                   &failed_successor_transaction, &failed_successor_snapshot,
+                   &failed_successor_rule, failed_snapshot_ack_entries,
+                   failed_transaction_ack_entries,
+                   decoded_failed_transaction_ack_entries,
+                   &failed_successor_ack_set, failed_optional_departure_entries,
+                   controller.topology_revision + 1U,
+                   controller.membership_revision, 3, 0x44,
+                   &predecessor_route_key, &node_member, &node.control_endpoint,
+                   &gateway_member, &gateway.endpoint, &successor_gateway_member,
+                   &successor_gateway.endpoint, error, sizeof(error)) == 0,
+               "build failed gateway successor") ||
+        expect((gateway_drain.successor_transaction =
+                    &failed_successor_transaction,
+                gateway_drain.successor_snapshot = &failed_successor_snapshot,
+                capture.calls = 0, capture.fail_on_call = 1,
+                wvm_membership_coordinator_drain_gateway(
+                    &controller, &gateway_drain, error, sizeof(error)) != 0),
+               "abort gateway drain after participant prepare failure") ||
+        expect(capture.calls == 1 &&
+                   wvm_membership_controller_route_state(
+                       &controller, failed_successor_transaction.operation_id,
+                       &route_state, error, sizeof(error)) == 0 &&
+                   route_state == WVM_ROUTE_TRANSACTION_ABORTED,
+               "failed gateway drain is durably aborted")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
+
+    gateway_drain.expected_membership_revision = controller.membership_revision;
+    gateway_drain.expected_topology_revision = controller.topology_revision;
+    gateway_drain.expected_admission_eligibility_revision =
+        controller.admission_eligibility_revision;
+    if (expect(build_gateway_successor_transaction(
+                   &committed_successor_transaction,
+                   &committed_successor_snapshot, &committed_successor_rule,
+                   committed_snapshot_ack_entries,
+                   committed_transaction_ack_entries,
+                   decoded_committed_transaction_ack_entries,
+                   &committed_successor_ack_set,
+                   committed_optional_departure_entries,
+                   controller.topology_revision + 1U,
+                   controller.membership_revision, 4, 0x45,
+                   &predecessor_route_key, &node_member, &node.control_endpoint,
+                   &gateway_member, &gateway.endpoint, &successor_gateway_member,
+                   &successor_gateway.endpoint, error, sizeof(error)) == 0,
+               "build committed gateway successor") ||
+        expect((gateway_drain.successor_transaction =
+                    &committed_successor_transaction,
+                gateway_drain.successor_snapshot = &committed_successor_snapshot,
+                capture.calls = 0, capture.fail_on_call = 0,
+                wvm_membership_coordinator_drain_gateway(
+                    &controller, &gateway_drain, error, sizeof(error)) == 0),
+               "commit gateway drain after all participant ACKs") ||
+        expect(capture.calls == 2 &&
+                   wvm_membership_coordinator_drain_gateway(
+                       &controller, &gateway_drain, error, sizeof(error)) == 0 &&
+                   capture.calls == 2,
+               "replay committed gateway drain without re-preparing") ||
+        expect(wvm_membership_coordinator_remove_gateway(
+                   &controller, &gateway_member, error, sizeof(error)) != 0,
+               "retain drained gateway while dependency exists")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
+
+    if (expect(wvm_membership_controller_dependency_release(
+                   &controller, &dependency, error, sizeof(error)) == 0,
+               "release gateway drain dependency") ||
+        expect(wvm_membership_coordinator_remove_gateway(
+                   &controller, &gateway_member, error, sizeof(error)) == 0,
+               "remove dependency-free drained gateway") ||
+        expect(wvm_membership_coordinator_remove_gateway(
+                   &controller, &gateway_member, error, sizeof(error)) == 0,
+               "replay gateway removal") ||
+        expect(wvm_membership_controller_member_status(
+                   &controller, &gateway_member, &member_status, error,
+                   sizeof(error)) == 0 &&
+                   member_status.desired_membership_state ==
+                       WVM_MANIFEST_MEMBER_REMOVED,
+               "gateway removal state is observable through a copy")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
+
+    if (expect(wvm_membership_coordinator_remove_compute(
+                   &controller, &compute_drain, error, sizeof(error)) == 0,
+               "drain and remove dependency-free compute member") ||
+        expect(wvm_membership_coordinator_remove_compute(
+                   &controller, &compute_drain, error, sizeof(error)) == 0,
+               "replay compute removal")) {
+        wvm_membership_controller_close(&controller);
+        unlink(journal_path);
+        return 1;
+    }
     wvm_membership_controller_close(&controller);
 
-    wvm_membership_controller_init(&recovered_controller, recovered_members, 4,
-                                   recovered_routes, 4, recovered_dependencies,
-                                   4, authorize, NULL);
+    wvm_membership_controller_init(&recovered_controller, recovered_members, 8,
+                                   recovered_routes, 8, recovered_dependencies,
+                                   8, authorize, NULL);
     if (expect(wvm_membership_controller_open(&recovered_controller,
                                               journal_path, error,
                                               sizeof(error)) == 0,
@@ -382,18 +658,29 @@ int main(void)
         expect((entry = wvm_membership_controller_find(&recovered_controller,
                                                         &node_member)) != NULL &&
                    entry->node.desired_membership_state ==
-                       WVM_MANIFEST_MEMBER_ACTIVE &&
-                   entry->has_activation_route_operation_id &&
-                   memcmp(entry->activation_route_operation_id,
-                          successful_transaction.operation_id,
-                          WVM_IDENTITY_ID_BYTES) == 0,
-               "recover active member route authorization") ||
-        expect((capture.calls = 0,
-                wvm_membership_coordinator_join(&recovered_controller,
-                                                &join_request, error,
-                                                sizeof(error)) == 0 &&
-                capture.calls == 0),
-               "replay skips already committed participant prepares")) {
+                       WVM_MANIFEST_MEMBER_REMOVED,
+               "recover removed compute member") ||
+        expect((entry = wvm_membership_controller_find(
+                    &recovered_controller, &gateway_member)) != NULL &&
+                   entry->gateway.desired_membership_state ==
+                       WVM_MANIFEST_MEMBER_REMOVED,
+               "recover removed gateway member") ||
+        expect((entry = wvm_membership_controller_find(
+                    &recovered_controller, &successor_gateway_member)) != NULL &&
+                   entry->gateway.desired_membership_state ==
+                       WVM_MANIFEST_MEMBER_ACTIVE,
+               "recover surviving gateway member") ||
+        expect(wvm_membership_controller_route_state(
+                   &recovered_controller, failed_successor_transaction.operation_id,
+                   &route_state, error, sizeof(error)) == 0 &&
+                   route_state == WVM_ROUTE_TRANSACTION_ABORTED &&
+                   wvm_membership_controller_route_state(
+                       &recovered_controller,
+                       committed_successor_transaction.operation_id,
+                       &route_state, error, sizeof(error)) == 0 &&
+                   route_state == WVM_ROUTE_TRANSACTION_ACTIVATED &&
+                   !recovered_controller.gateway_drain.active,
+               "recover gateway drain abort and commit decisions")) {
         wvm_membership_controller_close(&recovered_controller);
         unlink(journal_path);
         return 1;

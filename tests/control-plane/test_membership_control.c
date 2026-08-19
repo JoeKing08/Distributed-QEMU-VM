@@ -579,6 +579,7 @@ int main(void)
     uint64_t cordon_membership_revision;
     uint64_t cordon_topology_revision;
     uint64_t cordon_eligibility_revision;
+    uint64_t drain_eligibility_revision;
     uint64_t retained_membership_revision;
     char error[256] = {0};
     int fd;
@@ -953,6 +954,7 @@ int main(void)
         goto fail;
     }
 
+    drain_eligibility_revision = controller.admission_eligibility_revision;
     if (expect(make_drain_envelope(
                    &drain_envelope, drain_bytes, sizeof(drain_bytes),
                    &drain_byte_count, 0x32,
@@ -978,7 +980,7 @@ int main(void)
                    WVM_GATEWAY_DRAIN_ACTION_PREPARE, &executor_member,
                    &gateway_member, committed_successor_transaction.operation_id,
                    controller.membership_revision, controller.topology_revision,
-                   controller.admission_eligibility_revision,
+                   drain_eligibility_revision,
                    &committed_successor_transaction,
                    &committed_successor_snapshot, error, sizeof(error)) == 0 &&
                    wvm_membership_control_apply(
@@ -997,7 +999,7 @@ int main(void)
                    WVM_GATEWAY_DRAIN_ACTION_ABORT, &executor_member,
                    &gateway_member, committed_successor_transaction.operation_id,
                    controller.membership_revision, controller.topology_revision,
-                   controller.admission_eligibility_revision, NULL, NULL, error,
+                   drain_eligibility_revision, NULL, NULL, error,
                    sizeof(error)) == 0 &&
                    wvm_membership_control_apply(
                        &control, &drain_envelope, &executor_member,
@@ -1005,6 +1007,8 @@ int main(void)
                    drain_abort_result.status_code ==
                        WVM_MEMBERSHIP_CONTROL_SUCCESS &&
                    !controller.gateway_drain.active &&
+                   controller.admission_eligibility_revision ==
+                       drain_eligibility_revision + 1U &&
                    controller.routes[2].transaction.state ==
                        WVM_ROUTE_TRANSACTION_ABORTED,
                "abort the prepared gateway drain")) {
@@ -1019,6 +1023,7 @@ int main(void)
         goto fail;
     }
 
+    drain_eligibility_revision = controller.admission_eligibility_revision;
     if (expect(build_gateway_successor_transaction(
                    &committed_successor_transaction,
                    &committed_successor_snapshot, &committed_successor_rule,
@@ -1039,7 +1044,7 @@ int main(void)
                        &gateway_member,
                        committed_successor_transaction.operation_id,
                        controller.membership_revision, controller.topology_revision,
-                       controller.admission_eligibility_revision,
+                       drain_eligibility_revision,
                        &committed_successor_transaction,
                        &committed_successor_snapshot, error, sizeof(error)) ==
                        0 &&
@@ -1061,7 +1066,7 @@ int main(void)
                        &gateway_member,
                        committed_successor_transaction.operation_id,
                        controller.membership_revision, controller.topology_revision,
-                       controller.admission_eligibility_revision, NULL, NULL,
+                       drain_eligibility_revision, NULL, NULL,
                        error, sizeof(error)) == 0 &&
                    wvm_membership_control_apply(
                        &control, &drain_envelope, &executor_member,

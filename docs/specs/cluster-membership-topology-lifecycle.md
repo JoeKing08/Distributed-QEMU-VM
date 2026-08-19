@@ -324,6 +324,12 @@ revisions, and stamps all records. A crash after the ordinary route prepare
 but before the drain plan leaves an orphan future-topology route that cannot
 ACK or commit; recovery permits only an explicit abort of that route.
 
+An abort retires the prepared successor and clears the live topology
+reservation without changing membership or topology revision. It does not
+decrement `admission_eligibility_revision`: the one-step invalidation remains
+monotonic so an admission captured while the drain was prepared cannot be
+resurrected by a later abort replay.
+
 The predecessor is retained until every operation reference completes or its
 documented query/retry horizon expires with a typed result. A fixed arbitrary
 timer is not sufficient. If any surviving required ACK holder is unreachable,
@@ -505,6 +511,7 @@ completion from a member process still being alive.
 | --- | --- | --- |
 | `common_include/wavevm_resources.c` | Parses static `NODE` records and allocates sequential vnode ranges at startup. | Import as bootstrap input into the control-plane registry; do not make it the long-term authority. |
 | `common_include/wavevm_membership_controller.c` and `wavevm_membership_control.c` | The authority persists authenticated node/gateway registration, desired and observed member state, dependency counts, route prepare/ACK/commit/retire decisions, one-scope fail-closed gateway-drain prepare/commit/abort frames, and fenced compute/gateway cordon transitions. The V1 receiver exposes canonical `GatewayDrainRequest` and `MemberCordonRequest` only to transport-authenticated `EXECUTOR` actors accepted by separately configured route-management and membership-management callbacks, and durably replays successful registration, rejoin, drain, and cordon results. | Extend the bounded one-scope drain into an explicit aggregate transaction before permitting multi-scope gateway or host drains. Bind both management authorization callbacks to the real executor/control-plane trust domain rather than test adapters. The coordinator/topology owner captures deep-copied controller records, then combines that immutable membership revision with separately owned capability and reservation evidence. It must not construct runtime membership from `NODE`/`ROUTE` files. |
+| `common_include/wavevm_membership_coordinator.c` | Composes authenticated join, compute cordon/drain/remove, and one-scope gateway successor prepare/required-ACK/commit-or-abort operations. Replays committed or removed operations from the controller's durable state and uses a lock-safe member status copy. | Connect this coordinator to the real control-plane transport and manifest/topology planner. Aggregate multiple affected VM scopes and host-role drains before allowing production removal. |
 | `gateway_service/aggregator.c` | Parses `ROUTE` groups, learns addresses, and offers an in-place route add/update control path. | Consume prepared immutable snapshots; do not infer membership from packet source or modify live maps as membership operations. |
 | `master_core/user_backend.c` | Uses a fixed `WVM_MAX_GATEWAYS` table and sends through a local sidecar. | Keep only local sidecar/derived next-hop state in the node runtime; remove global flat-target assumptions after the route-scope contract exists. |
 | `master_core/kernel_backend.c` | Holds module-global route state keyed by current fixed limits. | Convert to versioned per-VM accelerator cache after `kernel-accelerator.md`; it cannot be membership truth. |

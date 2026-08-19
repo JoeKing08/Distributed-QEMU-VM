@@ -211,6 +211,254 @@ int wvm_membership_coordinator_join(
     return 0;
 }
 
+static int compute_member_key_valid(
+    const struct wvm_membership_compute_drain_request *request, char *error,
+    size_t error_len)
+{
+    return request &&
+               request->member_key.role_type == WVM_MANIFEST_ROLE_NODE_RUNTIME &&
+               wvm_member_key_validate(&request->member_key, error, error_len) ==
+                   0
+           ? 0
+           : (set_error(error, error_len,
+                        "compute membership operation target is invalid"),
+              -1);
+}
+
+int wvm_membership_coordinator_drain_compute(
+    struct wvm_membership_controller *controller,
+    const struct wvm_membership_compute_drain_request *request, char *error,
+    size_t error_len)
+{
+    struct wvm_membership_controller_member_status status;
+
+    if (!controller || compute_member_key_valid(request, error, error_len) !=
+                           0 ||
+        wvm_membership_controller_member_status(
+            controller, &request->member_key, &status, error, error_len) != 0 ||
+        status.kind != WVM_MEMBERSHIP_COMPUTE) {
+        set_error(error, error_len, "compute member is not drainable");
+        return -1;
+    }
+    if (status.desired_membership_state == WVM_MANIFEST_MEMBER_REMOVED ||
+        status.desired_membership_state == WVM_MANIFEST_MEMBER_DRAINING) {
+        return 0;
+    }
+    if (status.desired_membership_state == WVM_MANIFEST_MEMBER_ACTIVE) {
+        if (status.active_dependency_count != 0) {
+            set_error(error, error_len,
+                      "compute member has active VM dependencies");
+            return -1;
+        }
+        if (wvm_membership_controller_cordon(
+                controller, &request->member_key, error, error_len) != 0) {
+            return -1;
+        }
+    } else if (status.desired_membership_state != WVM_MANIFEST_MEMBER_CORDONED) {
+        set_error(error, error_len,
+                  "compute member must be ACTIVE or CORDONED to drain");
+        return -1;
+    }
+    return wvm_membership_controller_begin_drain(
+        controller, &request->member_key, error, error_len);
+}
+
+int wvm_membership_coordinator_remove_compute(
+    struct wvm_membership_controller *controller,
+    const struct wvm_membership_compute_drain_request *request, char *error,
+    size_t error_len)
+{
+    struct wvm_membership_controller_member_status status;
+
+    if (wvm_membership_coordinator_drain_compute(
+            controller, request, error, error_len) != 0) {
+        /* A dependency failure is intentionally not hidden by removal. */
+        if (!request || !controller ||
+            wvm_membership_controller_member_status(
+                controller, &request->member_key, &status, NULL, 0) != 0 ||
+            status.desired_membership_state != WVM_MANIFEST_MEMBER_DRAINING) {
+            return -1;
+        }
+    }
+    if (!request || !controller ||
+        wvm_membership_controller_member_status(
+            controller, &request->member_key, &status, error, error_len) != 0 ||
+        status.kind != WVM_MEMBERSHIP_COMPUTE) {
+        set_error(error, error_len, "compute member removal target is invalid");
+        return -1;
+    }
+    if (status.desired_membership_state == WVM_MANIFEST_MEMBER_REMOVED) {
+        return 0;
+    }
+    if (status.desired_membership_state != WVM_MANIFEST_MEMBER_DRAINING ||
+        status.active_dependency_count != 0) {
+        set_error(error, error_len,
+                  "compute member must be drained before removal");
+        return -1;
+    }
+    return wvm_membership_controller_remove(
+        controller, &request->member_key, error, error_len);
+}
+
+static int gateway_request_valid(
+    const struct wvm_membership_gateway_drain_request *request, char *error,
+    size_t error_len)
+{
+    if (!request || !request->gateway_member_key ||
+        request->gateway_member_key->role_type != WVM_MANIFEST_ROLE_GATEWAY ||
+        wvm_member_key_validate(request->gateway_member_key, error, error_len) !=
+            0 ||
+        !request->successor_transaction || !request->successor_snapshot ||
+        !request->route_prepare ||
+        request->expected_membership_revision == 0 ||
+        request->expected_topology_revision == 0 ||
+        request->expected_admission_eligibility_revision == 0 ||
+        operation_id_is_zero(request->successor_transaction->operation_id)) {
+        set_error(error, error_len, "gateway drain operation input is invalid");
+        return -1;
+    }
+    if (wvm_route_transaction_record_validate(
+            request->successor_transaction, error, error_len) != 0 ||
+        wvm_route_snapshot_record_validate(request->successor_snapshot, error,
+                                           error_len) != 0 ||
+        memcmp(request->successor_transaction->route_snapshot_key.snapshot_digest,
+               request->successor_snapshot->route_snapshot_key.snapshot_digest,
+               WVM_SHA256_DIGEST_BYTES) != 0) {
+        set_error(error, error_len, "gateway drain successor is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+static int abort_gateway_drain(
+    struct wvm_membership_controller *controller,
+    const struct wvm_membership_gateway_drain_request *request,
+    char *error, size_t error_len)
+{
+    return wvm_membership_controller_gateway_drain_apply(
+        controller, WVM_GATEWAY_DRAIN_ACTION_ABORT,
+        request->gateway_member_key, NULL, NULL,
+        request->successor_transaction->operation_id,
+        request->expected_membership_revision, request->expected_topology_revision,
+        request->expected_admission_eligibility_revision, error, error_len);
+}
+
+int wvm_membership_coordinator_drain_gateway(
+    struct wvm_membership_controller *controller,
+    const struct wvm_membership_gateway_drain_request *request, char *error,
+    size_t error_len)
+{
+    uint16_t route_state;
+    size_t i;
+    int have_route = 0;
+
+    if (!controller || gateway_request_valid(request, error, error_len) != 0) {
+        return -1;
+    }
+    if (wvm_membership_controller_route_state(
+            controller, request->successor_transaction->operation_id,
+            &route_state, NULL, 0) == 0) {
+        have_route = 1;
+    } else {
+        memset(error, 0, error_len);
+    }
+    if (!have_route || route_state == WVM_ROUTE_TRANSACTION_PREPARING) {
+        if (wvm_membership_controller_gateway_drain_apply(
+                controller, WVM_GATEWAY_DRAIN_ACTION_PREPARE,
+                request->gateway_member_key, request->successor_transaction,
+                request->successor_snapshot,
+                request->successor_transaction->operation_id,
+                request->expected_membership_revision,
+                request->expected_topology_revision,
+                request->expected_admission_eligibility_revision, error,
+                error_len) != 0) {
+            return -1;
+        }
+        if (wvm_membership_controller_route_state(
+                controller, request->successor_transaction->operation_id,
+                &route_state, error, error_len) != 0) {
+            return -1;
+        }
+    }
+    if (route_state == WVM_ROUTE_TRANSACTION_ABORTED) {
+        set_error(error, error_len,
+                  "gateway drain operation was previously aborted");
+        return -1;
+    }
+    if (route_state == WVM_ROUTE_TRANSACTION_PREPARING) {
+        for (i = 0;
+             i < request->successor_transaction->required_ack_set.entries.count;
+             i++) {
+            const struct wvm_required_ack_entry *ack =
+                &request->successor_transaction->required_ack_set.entries
+                     .entries[i];
+
+            if (request->route_prepare(request->route_prepare_context,
+                                       request->successor_transaction, ack,
+                                       error, error_len) != 0 ||
+                wvm_membership_controller_route_ack_prepare(
+                    controller, request->successor_transaction->operation_id,
+                    &ack->member_key, error, error_len) != 0) {
+                char abort_error[256] = {0};
+
+                if (abort_gateway_drain(controller, request, abort_error,
+                                        sizeof(abort_error)) != 0) {
+                    set_error(error, error_len,
+                              "gateway drain prepare failed and abort failed: %s",
+                              abort_error);
+                }
+                return -1;
+            }
+        }
+        return wvm_membership_controller_gateway_drain_apply(
+            controller, WVM_GATEWAY_DRAIN_ACTION_COMMIT,
+            request->gateway_member_key, NULL, NULL,
+            request->successor_transaction->operation_id,
+            request->expected_membership_revision,
+            request->expected_topology_revision,
+            request->expected_admission_eligibility_revision, error, error_len);
+    }
+    if (route_state == WVM_ROUTE_TRANSACTION_ACTIVATED) {
+        return wvm_membership_controller_gateway_drain_apply(
+            controller, WVM_GATEWAY_DRAIN_ACTION_COMMIT,
+            request->gateway_member_key, NULL, NULL,
+            request->successor_transaction->operation_id,
+            request->expected_membership_revision,
+            request->expected_topology_revision,
+            request->expected_admission_eligibility_revision, error, error_len);
+    }
+    set_error(error, error_len, "gateway drain route is not replayable");
+    return -1;
+}
+
+int wvm_membership_coordinator_remove_gateway(
+    struct wvm_membership_controller *controller,
+    const struct wvm_member_key *gateway_member_key, char *error,
+    size_t error_len)
+{
+    struct wvm_membership_controller_member_status status;
+
+    if (!controller || !gateway_member_key ||
+        gateway_member_key->role_type != WVM_MANIFEST_ROLE_GATEWAY ||
+        wvm_membership_controller_member_status(
+            controller, gateway_member_key, &status, error, error_len) != 0 ||
+        status.kind != WVM_MEMBERSHIP_GATEWAY) {
+        set_error(error, error_len, "gateway removal target is invalid");
+        return -1;
+    }
+    if (status.desired_membership_state == WVM_MANIFEST_MEMBER_REMOVED) {
+        return 0;
+    }
+    if (status.desired_membership_state != WVM_MANIFEST_MEMBER_DRAINING ||
+        status.active_dependency_count != 0) {
+        set_error(error, error_len,
+                  "gateway must be drained and dependency-free before removal");
+        return -1;
+    }
+    return wvm_membership_controller_remove(controller, gateway_member_key,
+                                            error, error_len);
+}
+
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
 {
     va_list ap;
