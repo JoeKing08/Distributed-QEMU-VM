@@ -37,7 +37,6 @@ static int bind_unix_socket(const char *path)
     struct sockaddr_un address;
     int fd;
 
-    unlink(path);
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         return -1;

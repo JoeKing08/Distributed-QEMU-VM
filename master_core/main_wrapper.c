@@ -1937,10 +1937,33 @@ int main(int argc, char **argv) {
 
     printf("[System] Initializing SHM: %s (Size: %lu MB)\n", shm_path, ram_mb);
 
-    // 清理残留
-    shm_unlink(shm_path);
-    
-    int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR, 0666);
+    /* An admitted namespace is owned by one live launch. Do not let a
+     * duplicate start unlink another instance's backing store. */
+    if (g_runtime_gate_active) {
+        int existing_shm_fd = shm_open(shm_path, O_RDWR, 0);
+
+        if (existing_shm_fd >= 0) {
+            close(existing_shm_fd);
+            fprintf(stderr,
+                    "[System] admitted SHM is already owned: %s\n",
+                    shm_path);
+            return 1;
+        }
+        if (errno != ENOENT) {
+            fprintf(stderr,
+                    "[System] cannot inspect admitted SHM '%s': %s\n",
+                    shm_path, strerror(errno));
+            return 1;
+        }
+    } else {
+        shm_unlink(shm_path);
+    }
+
+    int shm_flags = O_CREAT | O_RDWR;
+    if (g_runtime_gate_active) {
+        shm_flags |= O_EXCL;
+    }
+    int shm_fd = shm_open(shm_path, shm_flags, 0666);
     if (shm_fd < 0) { 
         fprintf(stderr, "[-] Failed to open shm file '%s': %s\n", shm_path, strerror(errno));
         return 1; 
@@ -1990,7 +2013,17 @@ int main(int argc, char **argv) {
     }
 
     strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
-    unlink(sock_path); // 绑定前确保文件不存在
+    if (g_runtime_gate_active) {
+        if (access(sock_path, F_OK) == 0 || errno != ENOENT) {
+            fprintf(stderr,
+                    "[System] admitted runtime socket is already owned: %s\n",
+                    sock_path);
+            close(listen_fd);
+            return 1;
+        }
+    } else {
+        unlink(sock_path); // 绑定前确保文件不存在
+    }
 
     printf("[System] Control Socket: %s\n", sock_path);
 
