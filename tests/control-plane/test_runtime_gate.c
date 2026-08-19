@@ -20,6 +20,7 @@ int main(void)
     struct wvm_runtime_gate gate;
     struct wvm_runtime_registration registration;
     struct wvm_runtime_operation operation;
+    struct wvm_runtime_registration invalid_registration;
     struct wvm_capability_ref capability;
     struct wvm_local_name_identity name_identity;
     struct wvm_runtime_manifest_storage loaded_storage;
@@ -163,6 +164,20 @@ int main(void)
            sizeof(registration.capability_profile_digest));
     strcpy(registration.requested_endpoint_name,
            manifest.local_names.namespace_name);
+    invalid_registration = registration;
+    invalid_registration.candidate_manifest_digest[0] ^= 0xffU;
+    if (expect(wvm_runtime_gate_register(&gate, &invalid_registration, NULL,
+                                         error, sizeof(error)) != 0,
+               "reject registration with a stale manifest digest")) {
+        return 1;
+    }
+    invalid_registration = registration;
+    invalid_registration.connection_role = WVM_MANIFEST_ROLE_GATEWAY;
+    if (expect(wvm_runtime_gate_register(&gate, &invalid_registration, NULL,
+                                         error, sizeof(error)) != 0,
+               "reject registration for an unauthorized local role")) {
+        return 1;
+    }
     if (expect(wvm_runtime_gate_register(&gate, &registration, &connection_id,
                                          error, sizeof(error)) == 0 &&
                    connection_id != 0,
