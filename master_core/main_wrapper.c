@@ -1415,11 +1415,7 @@ void* client_handler(void *socket_desc) {
                         break;
                     }
                     if (ipc_hdr.len !=
-                            sizeof(struct wvm_ipc_runtime_registration) ||
-                        runtime_gate_register_qemu(
-                            (const struct wvm_ipc_runtime_registration *)
-                                payload_buf,
-                            &runtime_connection_id) != 0) {
+                            sizeof(struct wvm_ipc_runtime_registration)) {
                         fprintf(stderr,
                                 "[IPC] manifest-bound registration failed "
                                 "fd=%d len=%u\n",
@@ -1434,6 +1430,16 @@ void* client_handler(void *socket_desc) {
                                 "[IPC] invalid manifest-bound channel role "
                                 "fd=%d role=%u\n",
                                 qemu_fd, (unsigned)role);
+                        break;
+                    }
+                    if (runtime_gate_register_qemu(
+                            (const struct wvm_ipc_runtime_registration *)
+                                payload_buf,
+                            &runtime_connection_id) != 0) {
+                        fprintf(stderr,
+                                "[IPC] manifest-bound registration failed "
+                                "fd=%d len=%u\n",
+                                qemu_fd, (unsigned)ipc_hdr.len);
                         break;
                     }
                     fprintf(stderr,
