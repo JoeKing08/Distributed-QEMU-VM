@@ -111,7 +111,9 @@ static void wavevm_try_import_split_from_peer(int sock)
 #endif
 }
 
-static int connect_to_master_helper(void)
+static int write_full(int fd, const void *buf, size_t len);
+
+static int connect_to_master_helper_role(uint32_t role)
 {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -134,8 +136,41 @@ static int connect_to_master_helper(void)
         close(sock);
         return -1;
     }
+    if (role != 0) {
+        struct wvm_ipc_runtime_registration registration;
+        const void *payload = &role;
+        size_t payload_size = sizeof(role);
+        wvm_ipc_header_t registration_header;
+
+        if (wavevm_qemu_runtime_gate_enabled()) {
+            if (wavevm_qemu_fill_runtime_registration(
+                    (uint16_t)role, &registration) != 0) {
+                fprintf(stderr,
+                        "[WaveVM-CPU] runtime registration identity is "
+                        "incomplete\n");
+                close(sock);
+                return -1;
+            }
+            payload = &registration;
+            payload_size = sizeof(registration);
+        }
+        registration_header.type = WVM_IPC_TYPE_REGISTER;
+        registration_header.len = (uint32_t)payload_size;
+        if (write_full(sock, &registration_header,
+                       sizeof(registration_header)) < 0 ||
+            write_full(sock, payload, payload_size) < 0) {
+            close(sock);
+            return -1;
+        }
+    }
     wavevm_try_import_split_from_peer(sock);
     return sock;
+}
+
+static int connect_to_master_helper(void)
+{
+    return connect_to_master_helper_role(
+        wavevm_qemu_runtime_gate_enabled() ? WVM_IPC_ROLE_SYNC : 0);
 }
 
 static int write_full(int fd, const void *buf, size_t len)
