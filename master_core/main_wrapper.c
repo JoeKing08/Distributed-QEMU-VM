@@ -1408,6 +1408,12 @@ void* client_handler(void *socket_desc) {
                 uint32_t role = 0;
 
                 if (g_runtime_gate_active) {
+                    if (runtime_connection_id != 0) {
+                        fprintf(stderr,
+                                "[IPC] duplicate registration on fd=%d\n",
+                                qemu_fd);
+                        break;
+                    }
                     if (ipc_hdr.len !=
                             sizeof(struct wvm_ipc_runtime_registration) ||
                         runtime_gate_register_qemu(

@@ -596,19 +596,7 @@ int wvm_runtime_gate_register(
         set_error(error, error_len, "runtime registration rejected");
         return -1;
     }
-    for (i = 0; i < WVM_RUNTIME_MAX_CONNECTIONS; i++) {
-        struct wvm_runtime_connection *connection = &gate->connections[i];
-
-        if (connection->state == WVM_RUNTIME_CONNECTION_REGISTERED &&
-            connection->role == registration->connection_role &&
-            connection->caller_process_instance_id ==
-                registration->caller_process_instance_id) {
-            if (connection_id_out) {
-                *connection_id_out = connection->connection_id;
-            }
-            return 0;
-        }
-    }
+    /* One registration represents one local transport connection. */
     for (i = 0; i < WVM_RUNTIME_MAX_CONNECTIONS; i++) {
         struct wvm_runtime_connection *connection = &gate->connections[i];
 

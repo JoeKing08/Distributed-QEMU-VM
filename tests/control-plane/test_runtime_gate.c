@@ -25,6 +25,7 @@ int main(void)
     struct wvm_runtime_manifest_storage loaded_storage;
     uint8_t profile_digest[WVM_SHA256_DIGEST_BYTES];
     uint64_t connection_id = 0;
+    uint64_t second_connection_id = 0;
     char manifest_path[] = "/tmp/wavevm-runtime-manifest.XXXXXX";
     char error[256] = {0};
     int manifest_fd;
@@ -166,6 +167,12 @@ int main(void)
                                          error, sizeof(error)) == 0 &&
                    connection_id != 0,
                "register QEMU before activation") ||
+        expect(wvm_runtime_gate_register(&gate, &registration,
+                                         &second_connection_id, error,
+                                         sizeof(error)) == 0 &&
+                   second_connection_id != 0 &&
+                   second_connection_id != connection_id,
+               "register separate local connection from same process") ||
         expect(wvm_runtime_gate_activate(&gate, manifest.activation_fence, error,
                                          sizeof(error)) == 0,
                "activate exact fence")) {
@@ -195,11 +202,28 @@ int main(void)
                "reject stale route generation")) {
         return 1;
     }
+    operation.connection_id = second_connection_id;
+    operation.route_snapshot_key = manifest.required_route_snapshot_key;
+    operation.operation_id[15] = 2;
+    if (expect(wvm_runtime_gate_authorize(&gate, &operation, error,
+                                          sizeof(error)) == 0,
+               "authorize the second local connection")) {
+        return 1;
+    }
+    operation.connection_id = connection_id;
     if (expect(wvm_runtime_gate_revoke(&gate, connection_id, error,
                                        sizeof(error)) == 0 &&
                    wvm_runtime_gate_authorize(&gate, &operation, error,
                                               sizeof(error)) != 0,
                "reject revoked connection")) {
+        return 1;
+    }
+    operation.connection_id = second_connection_id;
+    if (expect(wvm_runtime_gate_authorize(&gate, &operation, error,
+                                          sizeof(error)) == 0 &&
+                   wvm_runtime_gate_revoke(&gate, second_connection_id, error,
+                                           sizeof(error)) == 0,
+               "keep the second local connection authorized")) {
         return 1;
     }
 
