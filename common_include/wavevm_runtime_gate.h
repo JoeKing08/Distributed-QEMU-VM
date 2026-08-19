@@ -4,10 +4,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "wavevm_config.h"
 #include "wavevm_lifecycle.h"
 
 #define WVM_RUNTIME_MANIFEST_MAX_BYTES (4U * 1024U * 1024U)
-#define WVM_RUNTIME_MAX_CONNECTIONS 32U
+/* One QEMU sync channel per vCPU plus fixed memory, push, IRQ, and block
+ * channels. The capacity is derived from the shared vCPU limit so it cannot
+ * become an accidental smaller VM-size limit. */
+#define WVM_RUNTIME_MAX_CONNECTIONS (MAX_VCPUS + 8U)
 #define WVM_RUNTIME_MAX_CAPABILITIES 256U
 #define WVM_RUNTIME_MAX_DEPENDENCIES WVM_MAX_SLAVES
 
