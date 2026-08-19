@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +158,29 @@ int main(void)
         remove_vm_resources(&names_a, sockets_a, shm_a);
         remove_vm_resources(&names_b, sockets_b, shm_b);
         return 1;
+    }
+
+    {
+        int duplicate_socket = bind_unix_socket(names_a.runtime_socket);
+        int duplicate_shm = shm_open(names_a.shm_name,
+                                     O_CREAT | O_RDWR | O_EXCL, 0600);
+
+        if (duplicate_socket >= 0) {
+            close(duplicate_socket);
+            unlink(names_a.runtime_socket);
+        }
+        if (duplicate_shm >= 0) {
+            close(duplicate_shm);
+            shm_unlink(names_a.shm_name);
+        }
+        if (expect(duplicate_socket < 0,
+                   "reject duplicate runtime socket ownership") ||
+            expect(duplicate_shm < 0 && errno == EEXIST,
+                   "reject duplicate SHM ownership")) {
+            remove_vm_resources(&names_a, sockets_a, shm_a);
+            remove_vm_resources(&names_b, sockets_b, shm_b);
+            return 1;
+        }
     }
 
     remove_vm_resources(&names_a, sockets_a, shm_a);
