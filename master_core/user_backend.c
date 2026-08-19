@@ -1064,7 +1064,22 @@ static void* tx_worker_thread(void *arg) {
 
 // --- 驱动接口实现：发送 ---
 static int u_send_packet(void *data, int len, uint32_t target_id) {
+    const char *legacy_route_mode;
+
     if (g_tx_socket < 0) return -1;
+    legacy_route_mode = getenv("WVM_RUNTIME_LEGACY_ROUTE_MODE");
+    if (getenv("WVM_RUNTIME_GATE_ACTIVE") &&
+        (!legacy_route_mode || strcmp(legacy_route_mode, "flat") != 0)) {
+        /*
+         * Fractal admitted traffic must enter through the typed node-runtime
+         * services.  Sending the old header to the local sidecar would lose
+         * its scope and turn a valid route into an accidental raw-vnode hop.
+         */
+        fprintf(stderr,
+                "[Route] refusing legacy packet in typed runtime target=%u\n",
+                target_id);
+        return -EPROTONOSUPPORT;
+    }
     if (getenv("WVM_RUNTIME_GATE_ACTIVE") &&
         g_my_vm_id != 0 &&
         (!wvm_logic_route_snapshot_valid() ||

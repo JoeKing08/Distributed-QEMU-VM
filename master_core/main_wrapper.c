@@ -280,6 +280,29 @@ static int apply_runtime_dispatch(void)
         return -1;
     }
     dispatch = &g_runtime_dispatch_storage.projection;
+
+    /*
+     * A fractal route has no lossless representation in the legacy logic-core
+     * arrays: the pod/scope is part of the destination identity.  The local
+     * node-runtime services already consume the typed projection, so the only
+     * compatibility state needed here is the local sidecar endpoint.  Keep
+     * the legacy route cache entirely out of this path instead of flattening a
+     * scoped destination into a raw vnode.
+     */
+    if (dispatch->route_topology_kind == WVM_ROUTE_TOPOLOGY_FRACTAL) {
+        memcpy(&sidecar_ip, dispatch->local_sidecar_endpoint.data_address,
+               sizeof(sidecar_ip));
+        if (!u_ops.set_gateway_ip ||
+            dispatch->local_primary.destination_vnode >= WVM_MAX_GATEWAYS ||
+            dispatch->local_sidecar_endpoint.data_port == 0) {
+            return -1;
+        }
+        u_ops.set_gateway_ip(
+            WVM_ENCODE_ID(g_my_vm_id,
+                          dispatch->local_primary.destination_vnode),
+            sidecar_ip, htons(dispatch->local_sidecar_endpoint.data_port));
+        return 0;
+    }
     if (runtime_dispatch_legacy_vnode_count(dispatch, &legacy_vnode_count) !=
         0) {
         /*
@@ -1744,20 +1767,29 @@ int main(int argc, char **argv) {
     uint32_t my_local_cores;
     uint64_t required_memory_bytes;
     uint32_t total_vnodes;
+    int legacy_route_enabled = 1;
 
     if (g_runtime_gate_active) {
         const struct wvm_runtime_dispatch_projection *dispatch =
             &g_runtime_dispatch_storage.projection;
 
-        if (runtime_dispatch_legacy_vnode_count(dispatch, &total_vnodes) !=
-            0) {
+        my_virtual_id = (int)dispatch->local_primary.destination_vnode;
+        legacy_route_enabled =
+            dispatch->route_topology_kind == WVM_ROUTE_TOPOLOGY_FLAT;
+        total_vnodes = 0;
+        if (legacy_route_enabled &&
+            runtime_dispatch_legacy_vnode_count(dispatch, &total_vnodes) != 0) {
             fprintf(stderr,
-                    "[RuntimeDispatch] fractal route scopes require the "
-                    "typed V1 coordinator path; legacy logic-core startup "
-                    "is refused.\n");
+                    "[-] Failed to derive admitted flat route cache size\n");
             return 1;
         }
-        my_virtual_id = (int)dispatch->local_primary.destination_vnode;
+        if (setenv("WVM_RUNTIME_LEGACY_ROUTE_MODE",
+                   legacy_route_enabled ? "flat" : "typed", 1) != 0) {
+            fprintf(stderr,
+                    "[-] Failed to publish admitted route mode: %s\n",
+                    strerror(errno));
+            return 1;
+        }
         if (runtime_dispatch_local_reservation(&my_local_cores,
                                                &required_memory_bytes) != 0 ||
             user_backend_init(my_virtual_id, local_port) != 0) {
@@ -1859,16 +1891,22 @@ int main(int argc, char **argv) {
     wvm_set_my_node_id(my_virtual_id);
     printf("[Init] Identity Mapped: PhysID %d -> VirtualID %d (Primary)\n", my_phys_id, my_virtual_id);
     // Mode A owns a separate Logic Core instance inside wavevm.ko.
-    inject_vm_id(g_my_vm_id);
-    inject_mem_global(0, total_vnodes);
-    inject_mem_global(1, (uint32_t)my_virtual_id);
-    inject_cpu_route_table();
-    if (!g_runtime_gate_active || g_runtime_dispatch_kernel_memory_cache) {
-        inject_memory_route_table();
-    } else if (g_dev_fd >= 0) {
+    if (!g_runtime_gate_active || legacy_route_enabled) {
+        inject_vm_id(g_my_vm_id);
+        inject_mem_global(0, total_vnodes);
+        inject_mem_global(1, (uint32_t)my_virtual_id);
+        inject_cpu_route_table();
+        if (!g_runtime_gate_active || g_runtime_dispatch_kernel_memory_cache) {
+            inject_memory_route_table();
+        } else if (g_dev_fd >= 0) {
+            fprintf(stderr,
+                    "[RuntimeDispatch] skipped legacy Mode A memory cache for "
+                    "non-1GiB manifest ranges\n");
+        }
+    } else {
         fprintf(stderr,
-                "[RuntimeDispatch] skipped legacy Mode A memory cache for "
-                "non-1GiB manifest ranges\n");
+                "[RuntimeDispatch] fractal projection uses typed node-runtime "
+                "dispatch; legacy route caches are disabled\n");
     }
     {
         char split_buf[32];
