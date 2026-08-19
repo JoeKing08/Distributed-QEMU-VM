@@ -216,8 +216,23 @@ int wvm_runtime_ready_publish(
         return -1;
     }
     close(fd);
-    if (rename(temporary_path, names.ready_file) != 0) {
-        set_error(error, error_len, "cannot publish runtime readiness: %s",
+    if (link(temporary_path, names.ready_file) != 0) {
+        int saved_errno = errno;
+
+        unlink(temporary_path);
+        if (saved_errno == EEXIST &&
+            wvm_runtime_ready_validate(manifest, node_instance_id, error,
+                                       error_len) == 0) {
+            return 0;
+        }
+        set_error(error, error_len,
+                  "cannot claim runtime readiness: %s",
+                  strerror(saved_errno));
+        return -1;
+    }
+    if (unlink(temporary_path) != 0 && errno != ENOENT) {
+        set_error(error, error_len,
+                  "cannot remove runtime readiness temporary file: %s",
                   strerror(errno));
         unlink(temporary_path);
         return -1;
@@ -269,6 +284,19 @@ int wvm_runtime_ready_remove(
     if (wvm_runtime_name_set_derive(
             manifest ? &manifest->local_names : NULL, &names, error,
             error_len) != 0) {
+        return -1;
+    }
+    if (access(names.ready_file, F_OK) == 0) {
+        if (wvm_runtime_ready_validate(
+                manifest, manifest->expected_node_instance_id, error,
+                error_len) != 0) {
+            set_error(error, error_len,
+                      "runtime readiness is owned by another manifest");
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        set_error(error, error_len, "cannot inspect runtime readiness: %s",
+                  strerror(errno));
         return -1;
     }
     if (unlink(names.ready_file) != 0 && errno != ENOENT) {

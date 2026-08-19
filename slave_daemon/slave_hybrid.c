@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include "uthash.h"
 #include "slave_vfio.h"
 
@@ -44,6 +45,14 @@
 #include "../common_include/wavevm_runtime_gate.h"
 #include "../node_runtime/kvm_page_cache.h"
 #include "../node_runtime/memory_service.h"
+
+/* The unified node runtime owns this flag.  The weak definition keeps the
+ * standalone executor linkable while the strong runtime definition is used
+ * when master and executor share one process image. */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+volatile sig_atomic_t g_shutdown_requested = 0;
 
 // --- 全局配置变量 ---
 static int g_service_port = 9000;
@@ -467,8 +476,12 @@ static void vcpu_exit_cache_complete(uint64_t req_id, uint32_t requester,
  */
 void *vfio_irq_thread_adapter(void *arg) {
     pthread_mutex_lock(&g_master_mutex);
-    while (!g_master_ready) {
+    while (!g_master_ready && !g_shutdown_requested) {
         pthread_cond_wait(&g_master_cond, &g_master_mutex);
+    }
+    if (g_shutdown_requested) {
+        pthread_mutex_unlock(&g_master_mutex);
+        return NULL;
     }
     struct sockaddr_in target = g_master_addr;
     pthread_mutex_unlock(&g_master_mutex);
@@ -1588,6 +1601,10 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
     timer_settime(ktimer, 0, &its, NULL);
 
     for (;;) {
+        if (g_shutdown_requested) {
+            ret = -EINTR;
+            break;
+        }
         if (g_kvm_immediate_exit) {
             __atomic_store_n(&t_kvm_run->immediate_exit, 0, __ATOMIC_RELEASE);
         }
@@ -2640,7 +2657,7 @@ void* kvm_worker_thread(void *arg) {
     }
     for(int i=0;i<BATCH_SIZE;i++) { iov[i].iov_base=rx_pool + (size_t)i * WVM_MAX_PACKET_SIZE; iov[i].iov_len=WVM_MAX_PACKET_SIZE; msgs[i].msg_hdr.msg_iov=&iov[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&c[i]; msgs[i].msg_hdr.msg_namelen=sizeof(c[i]); }
 
-    while(1) {
+    while(!g_shutdown_requested) {
         for (int i = 0; i < BATCH_SIZE; i++) {
             msgs[i].msg_hdr.msg_namelen = sizeof(c[i]);
             msgs[i].msg_hdr.msg_flags = 0;
@@ -2648,7 +2665,11 @@ void* kvm_worker_thread(void *arg) {
         }
         int recv_flags = g_nonblock_recv ? MSG_DONTWAIT : MSG_WAITFORONE;
         int n = recvmmsg(s, msgs, BATCH_SIZE, recv_flags, NULL);
-        if (n<=0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
+        if (n<=0) {
+            if (g_shutdown_requested) break;
+            if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100);
+            continue;
+        }
         for(int i=0;i<n;i++) {
             uint8_t *pkt = (uint8_t *)iov[i].iov_base;
             struct wvm_header *h = (struct wvm_header*)pkt;
@@ -2820,7 +2841,14 @@ void spawn_tcg_processes(int base_id) {
         tcg_endpoints[i].push_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         tcg_endpoints[i].push_addr.sin_port = htons(port_push);
 
-        if (fork() == 0) {
+        {
+            pid_t parent_pid = getpid();
+
+            if (fork() == 0) {
+            if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 ||
+                getppid() != parent_pid) {
+                _exit(127);
+            }
             int sock_cmd = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in addr_cmd = { .sin_family=AF_INET, .sin_addr.s_addr=htonl(INADDR_LOOPBACK), .sin_port=htons(port_cmd) };
             if (sock_cmd < 0 || bind(sock_cmd, (struct sockaddr*)&addr_cmd, sizeof(addr_cmd)) != 0) {
@@ -2892,6 +2920,7 @@ void spawn_tcg_processes(int base_id) {
             execvp(qemu_bin, qemu_argv);
             perror("[Hybrid] execlp qemu");
             _exit(127);
+            }
         }
         // parent: sockets are only created in child branch
     }
@@ -2930,7 +2959,7 @@ void* tcg_proxy_thread(void *arg) {
 
     printf("[Proxy] Tri-Channel NAT Active (CMD/REQ/PUSH) + MESI Support.\n");
 
-    while(1) {
+    while(!g_shutdown_requested) {
         for (int i = 0; i < BATCH_SIZE; i++) {
             msgs[i].msg_hdr.msg_namelen = sizeof(src_addrs[i]);
             msgs[i].msg_hdr.msg_flags = 0;
@@ -2938,7 +2967,11 @@ void* tcg_proxy_thread(void *arg) {
         }
         int recv_flags = g_nonblock_recv ? MSG_DONTWAIT : MSG_WAITFORONE;
         int n = recvmmsg(sockfd, msgs, BATCH_SIZE, recv_flags, NULL);
-        if (n <= 0) { if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100); continue; }
+        if (n <= 0) {
+            if (g_shutdown_requested) break;
+            if (g_nonblock_recv && (errno == EAGAIN || errno == EWOULDBLOCK)) usleep(100);
+            continue;
+        }
 
         for (int i=0; i<n; i++) {
             uint8_t *pkt = (uint8_t *)iovecs[i].iov_base;

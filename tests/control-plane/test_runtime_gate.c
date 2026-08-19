@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "wavevm_runtime_gate.h"
+#include "wavevm_runtime_names.h"
 
 static int expect(int condition, const char *message)
 {
@@ -23,6 +24,7 @@ int main(void)
     struct wvm_runtime_registration invalid_registration;
     struct wvm_capability_ref capability;
     struct wvm_local_name_identity name_identity;
+    struct wvm_runtime_name_set runtime_names;
     struct wvm_runtime_manifest_storage loaded_storage;
     uint8_t profile_digest[WVM_SHA256_DIGEST_BYTES];
     uint64_t connection_id = 0;
@@ -61,7 +63,8 @@ int main(void)
     name_identity.vm_incarnation = manifest.vm_incarnation;
     name_identity.manifest_generation = manifest.manifest_generation;
     name_identity.physical_node_id = manifest.physical_node_id;
-    memset(name_identity.manifest_id, 0x66, sizeof(name_identity.manifest_id));
+    memset(name_identity.manifest_id,
+           (unsigned char)(getpid() & 0xff), sizeof(name_identity.manifest_id));
     memcpy(name_identity.admission_tx_id, manifest.admission_tx_id,
            sizeof(name_identity.admission_tx_id));
     if (expect(wvm_local_name_namespace_derive(
@@ -110,6 +113,60 @@ int main(void)
         expect(wvm_runtime_manifest_profile_digest(
                    &manifest, profile_digest, error, sizeof(error)) == 0,
                "derive capability profile digest")) {
+        return 1;
+    }
+
+    if (expect(wvm_runtime_name_set_derive(&manifest.local_names, &runtime_names,
+                                           error, sizeof(error)) == 0,
+               "derive runtime resource names") ||
+        expect(wvm_runtime_ready_remove(&manifest, error, sizeof(error)) == 0,
+               "clear only this test instance readiness")) {
+        return 1;
+    }
+    if (expect(wvm_runtime_ready_publish(&manifest, manifest.expected_node_instance_id,
+                                         error, sizeof(error)) == 0,
+               "claim runtime readiness") ||
+        expect(wvm_runtime_ready_validate(&manifest,
+                                          manifest.expected_node_instance_id,
+                                          error, sizeof(error)) == 0,
+               "validate claimed runtime readiness") ||
+        expect(wvm_runtime_ready_publish(&manifest,
+                                         manifest.expected_node_instance_id,
+                                         error, sizeof(error)) == 0,
+               "allow idempotent readiness publish")) {
+        wvm_runtime_ready_remove(&manifest, NULL, 0);
+        return 1;
+    }
+    {
+        struct wvm_node_runtime_manifest conflicting_manifest = manifest;
+
+        conflicting_manifest.candidate_manifest_digest[0] ^= 0xffU;
+        if (expect(wvm_runtime_ready_publish(
+                       &conflicting_manifest,
+                       conflicting_manifest.expected_node_instance_id, error,
+                       sizeof(error)) != 0,
+                   "reject readiness overwrite from a different manifest")) {
+            wvm_runtime_ready_remove(&manifest, NULL, 0);
+            return 1;
+        }
+        if (expect(wvm_runtime_ready_remove(&conflicting_manifest, error,
+                                            sizeof(error)) != 0,
+                   "reject readiness removal from a different manifest") ||
+            expect(wvm_runtime_ready_validate(
+                       &manifest, manifest.expected_node_instance_id, error,
+                       sizeof(error)) == 0,
+                   "retain readiness after rejected removal")) {
+            wvm_runtime_ready_remove(&manifest, NULL, 0);
+            return 1;
+        }
+    }
+    if (expect(wvm_runtime_ready_remove(&manifest, error, sizeof(error)) == 0,
+               "release runtime readiness") ||
+        expect(wvm_runtime_ready_validate(&manifest,
+                                          manifest.expected_node_instance_id,
+                                          error, sizeof(error)) != 0,
+               "reject readiness after release")) {
+        wvm_runtime_ready_remove(&manifest, NULL, 0);
         return 1;
     }
 

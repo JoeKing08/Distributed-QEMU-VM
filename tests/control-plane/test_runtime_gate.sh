@@ -12,6 +12,7 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_identity.c" \
     "$repo_root/common_include/wavevm_manifest.c" \
     "$repo_root/common_include/wavevm_lifecycle.c" \
+    "$repo_root/common_include/wavevm_runtime_names.c" \
     "$repo_root/common_include/wavevm_runtime_gate.c" \
     "$repo_root/tests/control-plane/test_runtime_gate.c" \
     -o "$tmpdir/test_runtime_gate"

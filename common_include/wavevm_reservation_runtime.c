@@ -334,6 +334,8 @@ int wvm_local_reservation_prepare(
     size_t error_len)
 {
     struct wvm_resource_reservation *existing;
+    size_t insertion_index;
+    size_t i;
 
     if (!registry || !reservation ||
         wvm_resource_reservation_validate(reservation, error, error_len) != 0 ||
@@ -360,7 +362,14 @@ int wvm_local_reservation_prepare(
         }
         return 0;
     }
-    if (registry->reservation_count == registry->reservation_capacity ||
+    insertion_index = registry->reservation_count;
+    for (i = 0; i < registry->reservation_count; i++) {
+        if (registry->reservations[i].state == WVM_RESERVATION_RELEASED) {
+            insertion_index = i;
+            break;
+        }
+    }
+    if (insertion_index == registry->reservation_capacity ||
         leases_conflict(registry, reservation) ||
         !capacity_allows(registry, reservation)) {
         pthread_mutex_unlock(&registry->lock);
@@ -368,13 +377,15 @@ int wvm_local_reservation_prepare(
                   "reservation conflicts with local capacity or lease");
         return -1;
     }
-    registry->reservations[registry->reservation_count] = *reservation;
+    registry->reservations[insertion_index] = *reservation;
     if (account_add(registry, reservation) != 0) {
         pthread_mutex_unlock(&registry->lock);
         set_error(error, error_len, "reservation accounting overflow");
         return -1;
     }
-    registry->reservation_count++;
+    if (insertion_index == registry->reservation_count) {
+        registry->reservation_count++;
+    }
     pthread_mutex_unlock(&registry->lock);
     if (result) {
         *result = WVM_RESERVATION_RUNTIME_NEW;

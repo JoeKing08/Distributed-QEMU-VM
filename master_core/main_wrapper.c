@@ -61,8 +61,31 @@ static int g_runtime_dispatch_active = 0;
 static int g_runtime_dispatch_kernel_memory_cache = 0;
 static pthread_mutex_t g_runtime_gate_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_runtime_operation_sequence = 1;
+volatile sig_atomic_t g_shutdown_requested = 0;
 
 #define MAX_QEMU_CLIENTS 8
+
+static void request_shutdown(int signal_number)
+{
+    (void)signal_number;
+    g_shutdown_requested = 1;
+}
+
+static int install_shutdown_handlers(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = request_shutdown;
+    sigemptyset(&action.sa_mask);
+    /* Do not use SA_RESTART: accept() must return so the main thread owns
+     * the lifecycle teardown instead of leaving readiness published forever. */
+    if (sigaction(SIGINT, &action, NULL) != 0 ||
+        sigaction(SIGTERM, &action, NULL) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 static int parse_runtime_u64(const char *text, uint64_t *value)
 {
@@ -1716,6 +1739,10 @@ void load_initial_seeds(const char *config_file) {
 int main(int argc, char **argv) {
     // Prevent process-wide termination on EPIPE when a peer disconnects.
     signal(SIGPIPE, SIG_IGN);
+    if (install_shutdown_handlers() != 0) {
+        perror("[Lifecycle] cannot install shutdown handlers");
+        return 1;
+    }
 
     // 参数检查
     if (argc < 7) {
@@ -2076,10 +2103,15 @@ int main(int argc, char **argv) {
     }
 
     // 14. 主循环：接受 QEMU 连接
-    while (1) {
+    while (!g_shutdown_requested) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (g_shutdown_requested) {
+                    break;
+                }
+                continue;
+            }
             perror("accept error");
             // 生产环境可能选择 sleep 并重试，而非退出
             sleep(1);
@@ -2116,6 +2148,48 @@ int main(int argc, char **argv) {
             perror("malloc failed");
             close(client_fd);
         }
+    }
+
+    /* Only the main thread performs teardown.  The signal handler above only
+     * changes the stop flag, so these calls remain outside signal context. */
+    if (g_runtime_gate_active) {
+        char error[256] = {0};
+
+        pthread_mutex_lock(&g_runtime_gate_lock);
+        if (wvm_runtime_gate_quiesce(&g_runtime_gate, error, sizeof(error)) !=
+            0) {
+            fprintf(stderr, "[Lifecycle] runtime gate quiesce failed: %s\n",
+                    error[0] ? error : "unknown error");
+        }
+        pthread_mutex_unlock(&g_runtime_gate_lock);
+        if (wvm_runtime_ready_remove(&g_runtime_storage.manifest, error,
+                                     sizeof(error)) != 0) {
+            fprintf(stderr, "[Lifecycle] readiness removal failed: %s\n",
+                    error[0] ? error : "unknown error");
+        }
+    }
+    close(listen_fd);
+    if (sock_path && sock_path[0] != '\0') {
+        unlink(sock_path);
+    }
+    if (g_shm_ptr && g_shm_ptr != MAP_FAILED) {
+        munmap(g_shm_ptr, g_shm_size);
+        g_shm_ptr = NULL;
+    }
+    if (shm_path && shm_path[0] != '\0') {
+        shm_unlink(shm_path);
+    }
+    if (g_dev_fd >= 0) {
+        close(g_dev_fd);
+        g_dev_fd = -1;
+    }
+    if (g_runtime_dispatch_active) {
+        wvm_runtime_dispatch_storage_free(&g_runtime_dispatch_storage);
+        g_runtime_dispatch_active = 0;
+    }
+    if (g_runtime_gate_active) {
+        wvm_runtime_manifest_storage_free(&g_runtime_storage);
+        g_runtime_gate_active = 0;
     }
 
     return 0;
