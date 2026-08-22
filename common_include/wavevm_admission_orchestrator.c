@@ -176,23 +176,37 @@ static int abort_identity_transaction(
     return -1;
 }
 
-static int input_valid(const struct wvm_admission_orchestrator_input *input,
-                       char *error, size_t error_len)
+static int identity_input_valid(
+    const struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
 {
     if (!input || !input->control_plane || !input->namespace_allocator ||
-        !input->id_provider || !input->request || !input->records ||
-        !input->prepared_route || !input->prepare_options ||
-        !input->prepared_vm || !input->activation_options ||
-        !input->activation || !input->route_transaction ||
-        !input->transaction_out || !input->submit_result_out) {
-        set_error(error, error_len, "admission orchestrator input is invalid");
+        !input->id_provider || !input->request || !input->transaction_out ||
+        !input->submit_result_out) {
+        set_error(error, error_len,
+                  "admission identity transaction input is invalid");
+        return -1;
+    }
+    return 0;
+}
+
+static int prepared_input_valid(
+    const struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
+{
+    if (!input || !input->records || !input->prepared_route ||
+        !input->prepare_options || !input->prepared_vm ||
+        !input->activation_options || !input->activation ||
+        !input->route_transaction) {
+        set_error(error, error_len,
+                  "admission authority did not supply complete planning input");
         return -1;
     }
     return callbacks_valid(input->callbacks, error, error_len);
 }
 
 int wvm_admission_orchestrator_run(
-    const struct wvm_admission_orchestrator_input *input, char *error,
+    struct wvm_admission_orchestrator_input *input, char *error,
     size_t error_len)
 {
     enum wvm_control_plane_submit_result submit_result;
@@ -201,7 +215,7 @@ int wvm_admission_orchestrator_run(
     int candidate_durable = 0;
     int route_durable = 0;
 
-    if (input_valid(input, error, error_len) != 0) {
+    if (identity_input_valid(input, error, error_len) != 0) {
         return -1;
     }
     transaction = input->transaction_out;
@@ -214,6 +228,12 @@ int wvm_admission_orchestrator_run(
     *input->submit_result_out = submit_result;
     if (submit_result == WVM_CONTROL_PLANE_SUBMIT_REPLAY) {
         return 0;
+    }
+    if (!input->prepare_input ||
+        input->prepare_input(input->prepare_input_context, input->request,
+                             transaction, input, error, error_len) != 0 ||
+        prepared_input_valid(input, error, error_len) != 0) {
+        return abort_identity_transaction(input, transaction, error, error_len);
     }
     if (input->callbacks->route_plan(
             input->callback_context, transaction, input->prepared_route,

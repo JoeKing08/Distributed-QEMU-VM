@@ -30,6 +30,19 @@ typedef int (*wvm_admission_participant_stage_fn)(
     void *context, const struct wvm_node_runtime_manifest *runtime_manifest,
     char *error, size_t error_len);
 
+struct wvm_admission_orchestrator_input;
+
+/*
+ * An authority supplies the current membership, capability, inventory, route,
+ * and participant projections only for a newly allocated transaction.  A
+ * durable replay therefore never reconstructs transient planning state.
+ */
+typedef int (*wvm_admission_input_prepare_fn)(
+    void *context, const struct wvm_vm_request *request,
+    const struct wvm_coordinator_transaction *transaction,
+    struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len);
+
 struct wvm_admission_orchestrator_callbacks {
     wvm_admission_route_plan_fn route_plan;
     wvm_admission_route_stage_fn route_prepare;
@@ -58,6 +71,8 @@ struct wvm_admission_orchestrator_input {
     struct wvm_route_transaction_record *route_transaction;
     const struct wvm_admission_orchestrator_callbacks *callbacks;
     void *callback_context;
+    wvm_admission_input_prepare_fn prepare_input;
+    void *prepare_input_context;
     struct wvm_coordinator_transaction *transaction_out;
     enum wvm_control_plane_submit_result *submit_result_out;
 };
@@ -71,7 +86,7 @@ struct wvm_admission_orchestrator_input {
  * recovery/reconciliation path and never issues a pre-activation abort.
  */
 int wvm_admission_orchestrator_run(
-    const struct wvm_admission_orchestrator_input *input, char *error,
+    struct wvm_admission_orchestrator_input *input, char *error,
     size_t error_len);
 
 struct wvm_admission_recovery_input {

@@ -25,12 +25,19 @@ enum wvm_control_journal_kind {
     WVM_CONTROL_JOURNAL_ACTIVATION = 4,
     WVM_CONTROL_JOURNAL_ROUTE_TRANSACTION = 5,
     WVM_CONTROL_JOURNAL_RUNTIME_MANIFEST = 6,
+    WVM_CONTROL_JOURNAL_ROUTE_SNAPSHOT = 7,
 };
 
 struct decoded_route_transaction {
     struct wvm_route_transaction_record record;
     struct wvm_required_ack_entry *required_ack_entries;
     struct wvm_required_ack_entry *optional_drain_entries;
+};
+
+struct decoded_route_snapshot {
+    struct wvm_route_snapshot_record record;
+    struct wvm_route_rule_record *rules;
+    struct wvm_required_ack_entry *required_ack_entries;
 };
 
 struct runtime_manifest_identity {
@@ -398,6 +405,16 @@ static void decoded_route_transaction_destroy(
     memset(decoded, 0, sizeof(*decoded));
 }
 
+static void decoded_route_snapshot_destroy(struct decoded_route_snapshot *decoded)
+{
+    if (!decoded) {
+        return;
+    }
+    free(decoded->rules);
+    free(decoded->required_ack_entries);
+    memset(decoded, 0, sizeof(*decoded));
+}
+
 static int record_list_entry_count(const uint8_t *bytes, size_t byte_count,
                                    size_t *count_out)
 {
@@ -430,6 +447,116 @@ static int record_list_entry_count(const uint8_t *bytes, size_t byte_count,
         return -1;
     }
     *count_out = encoded_count;
+    return 0;
+}
+
+static int required_ack_set_entry_count(const uint8_t *bytes,
+                                        size_t byte_count, size_t *count_out)
+{
+    struct wvm_canonical_record record;
+    struct wvm_canonical_field field;
+    size_t offset = 0;
+    int have_entries = 0;
+    int next;
+
+    if (!bytes || !count_out ||
+        wvm_canonical_record_parse(bytes, byte_count, &record) != 0 ||
+        record.record_type != WVM_RECORD_REQUIRED_ACK_SET) {
+        return -1;
+    }
+    while ((next = wvm_canonical_record_next(&record, &offset, &field)) == 1) {
+        if (field.tag == 1) {
+            if (have_entries ||
+                record_list_entry_count(field.value, field.value_bytes,
+                                        count_out) != 0) {
+                return -1;
+            }
+            have_entries = 1;
+        }
+    }
+    return next == 0 && have_entries ? 0 : -1;
+}
+
+static int route_snapshot_list_capacities(const uint8_t *bytes,
+                                          size_t byte_count,
+                                          size_t *rule_count,
+                                          size_t *required_ack_count)
+{
+    struct wvm_canonical_record outer;
+    struct wvm_canonical_field field;
+    size_t offset = 0;
+    int have_rules = 0;
+    int have_required_ack_set = 0;
+    int next;
+
+    if (!bytes || !rule_count || !required_ack_count ||
+        wvm_canonical_record_parse(bytes, byte_count, &outer) != 0 ||
+        outer.record_type != WVM_RECORD_ROUTE_SNAPSHOT) {
+        return -1;
+    }
+    while ((next = wvm_canonical_record_next(&outer, &offset, &field)) == 1) {
+        if (field.tag == 4) {
+            if (have_rules ||
+                record_list_entry_count(field.value, field.value_bytes,
+                                        rule_count) != 0) {
+                return -1;
+            }
+            have_rules = 1;
+        } else if (field.tag == 5) {
+            if (have_required_ack_set ||
+                required_ack_set_entry_count(field.value, field.value_bytes,
+                                             required_ack_count) != 0) {
+                return -1;
+            }
+            have_required_ack_set = 1;
+        }
+    }
+    return next == 0 && have_rules && have_required_ack_set ? 0 : -1;
+}
+
+static int decode_route_snapshot_alloc(
+    const uint8_t *bytes, size_t byte_count,
+    struct decoded_route_snapshot *decoded, char *error, size_t error_len)
+{
+    size_t rule_count;
+    size_t required_ack_count;
+
+    if (!decoded ||
+        route_snapshot_list_capacities(bytes, byte_count, &rule_count,
+                                       &required_ack_count) != 0 ||
+        rule_count > SIZE_MAX / sizeof(*decoded->rules) ||
+        required_ack_count > SIZE_MAX / sizeof(*decoded->required_ack_entries)) {
+        set_error(error, error_len, "route snapshot record is malformed");
+        return -1;
+    }
+    memset(decoded, 0, sizeof(*decoded));
+    if (rule_count != 0) {
+        decoded->rules = calloc(rule_count, sizeof(*decoded->rules));
+        if (!decoded->rules) {
+            set_error(error, error_len, "cannot allocate route snapshot rules");
+            return -1;
+        }
+    }
+    if (required_ack_count != 0) {
+        decoded->required_ack_entries =
+            calloc(required_ack_count, sizeof(*decoded->required_ack_entries));
+        if (!decoded->required_ack_entries) {
+            decoded_route_snapshot_destroy(decoded);
+            set_error(error, error_len,
+                      "cannot allocate route snapshot ACK entries");
+            return -1;
+        }
+    }
+    decoded->record.next_hop_rules.entries = decoded->rules;
+    decoded->record.next_hop_rules.capacity = rule_count;
+    decoded->record.required_ack_set.entries.entries =
+        decoded->required_ack_entries;
+    decoded->record.required_ack_set.entries.capacity = required_ack_count;
+    if (wvm_route_snapshot_record_decode(bytes, byte_count, &decoded->record,
+                                         error, error_len) != 0) {
+        decoded_route_snapshot_destroy(decoded);
+        return -1;
+    }
     return 0;
 }
 
@@ -549,6 +676,108 @@ static int decode_route_transaction_alloc(
     return 0;
 }
 
+static int endpoint_equal(const struct wvm_endpoint *left,
+                          const struct wvm_endpoint *right)
+{
+    if (!left || !right || left->data_transport != right->data_transport ||
+        left->data_address_bytes != right->data_address_bytes ||
+        left->data_port != right->data_port ||
+        left->control_transport != right->control_transport ||
+        left->has_control_address != right->has_control_address ||
+        left->control_port != right->control_port ||
+        left->has_server_name != right->has_server_name ||
+        memcmp(left->data_address, right->data_address,
+               left->data_address_bytes) != 0) {
+        return 0;
+    }
+    if (left->has_control_address &&
+        (left->control_address_bytes != right->control_address_bytes ||
+         memcmp(left->control_address, right->control_address,
+                left->control_address_bytes) != 0)) {
+        return 0;
+    }
+    return !left->has_server_name ||
+           strcmp(left->server_name, right->server_name) == 0;
+}
+
+static int member_key_equal(const struct wvm_member_key *left,
+                            const struct wvm_member_key *right)
+{
+    return left && right && left->role_type == right->role_type &&
+           left->role_id == right->role_id &&
+           left->instance_id == right->instance_id;
+}
+
+static int required_ack_sets_equal(const struct wvm_required_ack_set *left,
+                                   const struct wvm_required_ack_set *right)
+{
+    size_t i;
+
+    if (!left || !right || left->entries.count != right->entries.count) {
+        return 0;
+    }
+    for (i = 0; i < left->entries.count; i++) {
+        const struct wvm_required_ack_entry *left_entry =
+            &left->entries.entries[i];
+        const struct wvm_required_ack_entry *right_entry =
+            &right->entries.entries[i];
+
+        if (!member_key_equal(&left_entry->member_key, &right_entry->member_key) ||
+            !endpoint_equal(&left_entry->endpoint, &right_entry->endpoint) ||
+            left_entry->role_type != right_entry->role_type ||
+            !route_snapshot_key_equal(&left_entry->expected_snapshot_key,
+                                      &right_entry->expected_snapshot_key)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int route_snapshot_matches_transaction(
+    const struct wvm_route_snapshot_record *snapshot,
+    const struct wvm_route_transaction_record *transaction)
+{
+    return snapshot && transaction &&
+           route_snapshot_key_equal(&snapshot->route_snapshot_key,
+                                    &transaction->route_snapshot_key) &&
+           snapshot->has_predecessor_snapshot_key ==
+               transaction->has_predecessor_snapshot_key &&
+           (!snapshot->has_predecessor_snapshot_key ||
+            route_snapshot_key_equal(&snapshot->predecessor_snapshot_key,
+                                     &transaction->predecessor_snapshot_key)) &&
+           snapshot->operation_retention_horizon_ms ==
+               transaction->operation_retention_horizon_ms &&
+           required_ack_sets_equal(&snapshot->required_ack_set,
+                                   &transaction->required_ack_set);
+}
+
+static int route_entry_has_matching_snapshot(
+    const struct wvm_control_plane_route_entry *entry,
+    const struct wvm_route_snapshot_key *snapshot_key, char *error,
+    size_t error_len)
+{
+    struct decoded_route_snapshot decoded;
+    int result = -1;
+
+    if (!entry || !snapshot_key || !entry->snapshot_bytes ||
+        entry->snapshot_byte_count == 0) {
+        set_error(error, error_len, "durable route snapshot body was not found");
+        return -1;
+    }
+    memset(&decoded, 0, sizeof(decoded));
+    if (decode_route_snapshot_alloc(entry->snapshot_bytes,
+                                    entry->snapshot_byte_count, &decoded,
+                                    error, error_len) == 0 &&
+        route_snapshot_key_equal(&decoded.record.route_snapshot_key,
+                                 snapshot_key)) {
+        result = 0;
+    } else if (error && error[0] == '\0') {
+        set_error(error, error_len, "durable route snapshot body is invalid");
+    }
+    decoded_route_snapshot_destroy(&decoded);
+    return result;
+}
+
 /*
  * Route operations are keyed by operation ID in the journal, while admission
  * binds a VM to the immutable route snapshot key published by its candidate.
@@ -595,6 +824,11 @@ static int durable_route_snapshot_has_state(
                 decoded_route_transaction_destroy(&decoded);
                 set_error(error, error_len,
                           "route snapshot is not in the required state");
+                return -1;
+            }
+            if (route_entry_has_matching_snapshot(entry, snapshot_key, error,
+                                                  error_len) != 0) {
+                decoded_route_transaction_destroy(&decoded);
                 return -1;
             }
         }
@@ -801,6 +1035,142 @@ static int apply_route_transaction_record(
     return 0;
 }
 
+static struct wvm_control_plane_route_entry *
+find_mutable_route_transaction_for_snapshot(
+    struct wvm_control_plane *plane,
+    const struct wvm_route_snapshot_key *snapshot_key, char *error,
+    size_t error_len)
+{
+    struct wvm_control_plane_route_entry *match = NULL;
+    size_t i;
+
+    if (!plane || !snapshot_key) {
+        set_error(error, error_len, "route snapshot binding input is invalid");
+        return NULL;
+    }
+    for (i = 0; i < plane->route_entry_count; i++) {
+        struct decoded_route_transaction decoded;
+
+        memset(&decoded, 0, sizeof(decoded));
+        if (!plane->route_entries[i].record_bytes ||
+            decode_route_transaction_alloc(
+                plane->route_entries[i].record_bytes,
+                plane->route_entries[i].record_byte_count, &decoded, error,
+                error_len) != 0) {
+            decoded_route_transaction_destroy(&decoded);
+            set_error(error, error_len,
+                      "durable route transaction record is invalid");
+            return NULL;
+        }
+        if (route_snapshot_key_equal(&decoded.record.route_snapshot_key,
+                                     snapshot_key)) {
+            if (match) {
+                decoded_route_transaction_destroy(&decoded);
+                set_error(error, error_len,
+                          "route snapshot maps to multiple operations");
+                return NULL;
+            }
+            match = &plane->route_entries[i];
+        }
+        decoded_route_transaction_destroy(&decoded);
+    }
+    if (!match) {
+        set_error(error, error_len,
+                  "route snapshot has no durable route operation");
+    }
+    return match;
+}
+
+static int validate_route_snapshot_binding(
+    const struct wvm_control_plane_route_entry *entry,
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
+{
+    struct decoded_route_transaction decoded;
+    int result = -1;
+
+    if (!entry || !snapshot) {
+        set_error(error, error_len, "route snapshot binding input is invalid");
+        return -1;
+    }
+    memset(&decoded, 0, sizeof(decoded));
+    if (decode_route_transaction_alloc(entry->record_bytes,
+                                       entry->record_byte_count, &decoded,
+                                       error, error_len) != 0) {
+        set_error(error, error_len,
+                  "route snapshot has an invalid durable route operation");
+        goto out;
+    }
+    if (!route_snapshot_matches_transaction(snapshot, &decoded.record)) {
+        set_error(error, error_len,
+                  "route snapshot does not match durable route operation");
+        goto out;
+    }
+    result = 0;
+
+out:
+    decoded_route_transaction_destroy(&decoded);
+    return result;
+}
+
+static int install_route_snapshot_record(
+    struct wvm_control_plane_route_entry *entry, uint8_t *snapshot_bytes,
+    size_t snapshot_byte_count, char *error, size_t error_len)
+{
+    if (!entry || !snapshot_bytes || snapshot_byte_count == 0) {
+        set_error(error, error_len, "route snapshot retention input is invalid");
+        return -1;
+    }
+    if (entry->snapshot_bytes) {
+        if (entry->snapshot_byte_count != snapshot_byte_count ||
+            memcmp(entry->snapshot_bytes, snapshot_bytes,
+                   snapshot_byte_count) != 0) {
+            set_error(error, error_len,
+                      "route operation has conflicting snapshot body");
+            return -1;
+        }
+        free(snapshot_bytes);
+        return 0;
+    }
+    entry->snapshot_bytes = snapshot_bytes;
+    entry->snapshot_byte_count = snapshot_byte_count;
+    return 0;
+}
+
+static int apply_route_snapshot_record(struct wvm_control_plane *plane,
+                                       const uint8_t *bytes,
+                                       size_t byte_count, char *error,
+                                       size_t error_len)
+{
+    struct decoded_route_snapshot decoded;
+    struct wvm_control_plane_route_entry *entry;
+    uint8_t *copy;
+    int result;
+
+    memset(&decoded, 0, sizeof(decoded));
+    if (decode_route_snapshot_alloc(bytes, byte_count, &decoded, error,
+                                    error_len) != 0 ||
+        !(entry = find_mutable_route_transaction_for_snapshot(
+              plane, &decoded.record.route_snapshot_key, error, error_len)) ||
+        validate_route_snapshot_binding(entry, &decoded.record, error,
+                                        error_len) != 0) {
+        decoded_route_snapshot_destroy(&decoded);
+        return -1;
+    }
+    copy = malloc(byte_count);
+    if (!copy) {
+        decoded_route_snapshot_destroy(&decoded);
+        set_error(error, error_len,
+                  "cannot retain route snapshot recovery record");
+        return -1;
+    }
+    memcpy(copy, bytes, byte_count);
+    result = install_route_snapshot_record(entry, copy, byte_count, error,
+                                           error_len);
+    decoded_route_snapshot_destroy(&decoded);
+    return result;
+}
+
 static int runtime_manifest_identity_from_record(
     const uint8_t *bytes, size_t byte_count,
     struct runtime_manifest_identity *identity)
@@ -991,6 +1361,9 @@ static int replay_journal_frame(struct wvm_control_plane *plane,
     case WVM_CONTROL_JOURNAL_RUNTIME_MANIFEST:
         record_type = WVM_RECORD_NODE_RUNTIME_MANIFEST;
         break;
+    case WVM_CONTROL_JOURNAL_ROUTE_SNAPSHOT:
+        record_type = WVM_RECORD_ROUTE_SNAPSHOT;
+        break;
     default:
         set_error(error, error_len, "journal has unknown frame kind %u", kind);
         return -1;
@@ -1012,6 +1385,11 @@ static int replay_journal_frame(struct wvm_control_plane *plane,
                apply_route_transaction_record(plane, payload, payload_bytes,
                                               error, error_len) != 0) {
         set_error(error, error_len, "journal route transaction frame is invalid");
+        return -1;
+    } else if (kind == WVM_CONTROL_JOURNAL_ROUTE_SNAPSHOT &&
+               apply_route_snapshot_record(plane, payload, payload_bytes,
+                                           error, error_len) != 0) {
+        set_error(error, error_len, "journal route snapshot frame is invalid");
         return -1;
     } else if (kind == WVM_CONTROL_JOURNAL_RUNTIME_MANIFEST &&
                apply_runtime_manifest_record(plane, payload, payload_bytes,
@@ -1096,6 +1474,34 @@ static int encode_request_alloc(const struct wvm_vm_request *request,
     }
     set_error(error, error_len, "canonical request exceeds control-plane limit");
     return -1;
+}
+
+int wvm_control_plane_classify_request(
+    const struct wvm_control_plane *plane, const struct wvm_vm_request *request,
+    enum wvm_control_plane_request_disposition *disposition, char *error,
+    size_t error_len)
+{
+    const struct wvm_control_plane_entry *entry;
+    uint8_t *request_bytes = NULL;
+    uint8_t request_digest[WVM_SHA256_DIGEST_BYTES];
+    size_t request_byte_count = 0;
+
+    if (!plane || !request || !disposition ||
+        encode_request_alloc(request, &request_bytes, &request_byte_count,
+                             request_digest, error, error_len) != 0) {
+        return -1;
+    }
+    entry = wvm_control_plane_find_request(plane, request->request_id);
+    if (!entry) {
+        *disposition = WVM_CONTROL_PLANE_REQUEST_ABSENT;
+    } else if (memcmp(entry->transaction.request_digest, request_digest,
+                      sizeof(request_digest)) == 0) {
+        *disposition = WVM_CONTROL_PLANE_REQUEST_REPLAY;
+    } else {
+        *disposition = WVM_CONTROL_PLANE_REQUEST_CONFLICT;
+    }
+    free(request_bytes);
+    return 0;
 }
 
 static int encode_candidate_alloc(
@@ -1267,6 +1673,45 @@ static int encode_route_transaction_alloc(
     return -1;
 }
 
+static int encode_route_snapshot_alloc(
+    const struct wvm_route_snapshot_record *snapshot, uint8_t **bytes_out,
+    size_t *byte_count_out, char *error, size_t error_len)
+{
+    size_t capacity = 4096;
+
+    if (!snapshot || !bytes_out || !byte_count_out ||
+        wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0) {
+        set_error(error, error_len, "route snapshot encoding input is invalid");
+        return -1;
+    }
+    while (capacity <= WVM_CONTROL_PLANE_MAX_RECORD_BYTES) {
+        uint8_t *bytes = malloc(capacity);
+        size_t byte_count = 0;
+
+        if (!bytes) {
+            set_error(error, error_len, "cannot allocate route snapshot record");
+            return -1;
+        }
+        if (wvm_route_snapshot_record_encode(snapshot, bytes, capacity,
+                                             &byte_count, NULL, error,
+                                             error_len) == 0) {
+            *bytes_out = bytes;
+            *byte_count_out = byte_count;
+            return 0;
+        }
+        free(bytes);
+        if (capacity == WVM_CONTROL_PLANE_MAX_RECORD_BYTES) {
+            break;
+        }
+        capacity *= 2U;
+        if (capacity > WVM_CONTROL_PLANE_MAX_RECORD_BYTES) {
+            capacity = WVM_CONTROL_PLANE_MAX_RECORD_BYTES;
+        }
+    }
+    set_error(error, error_len, "route snapshot exceeds control-plane limit");
+    return -1;
+}
+
 static void transaction_from_coordinator(
     struct wvm_admission_transaction_record *record,
     const struct wvm_coordinator_transaction *transaction,
@@ -1379,6 +1824,90 @@ out:
     return result;
 }
 
+int wvm_control_plane_record_route_snapshot(
+    struct wvm_control_plane *plane,
+    const uint8_t operation_id[WVM_IDENTITY_ID_BYTES],
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
+{
+    struct wvm_control_plane_route_entry *entry;
+    struct decoded_route_snapshot decoded;
+    uint8_t *encoded_bytes = NULL;
+    uint8_t *retained_bytes = NULL;
+    size_t encoded_byte_count = 0;
+    uint64_t ignored_sequence;
+    int result = -1;
+
+    memset(&decoded, 0, sizeof(decoded));
+    if (!plane || plane->journal_fd < 0 || !operation_id || !snapshot ||
+        !(entry = find_mutable_route_transaction(plane, operation_id)) ||
+        encode_route_snapshot_alloc(snapshot, &encoded_bytes,
+                                    &encoded_byte_count, error, error_len) != 0 ||
+        decode_route_snapshot_alloc(encoded_bytes, encoded_byte_count, &decoded,
+                                    error, error_len) != 0 ||
+        validate_route_snapshot_binding(entry, &decoded.record, error,
+                                        error_len) != 0) {
+        if (error && error[0] == '\0') {
+            set_error(error, error_len,
+                      "route snapshot has no matching durable operation");
+        }
+        goto out;
+    }
+    if (entry->snapshot_bytes) {
+        if (entry->snapshot_byte_count == encoded_byte_count &&
+            memcmp(entry->snapshot_bytes, encoded_bytes,
+                   encoded_byte_count) == 0) {
+            result = 0;
+        } else {
+            set_error(error, error_len,
+                      "route operation has conflicting snapshot body");
+        }
+        goto out;
+    }
+    retained_bytes = malloc(encoded_byte_count);
+    if (!retained_bytes) {
+        set_error(error, error_len, "cannot allocate durable route snapshot");
+        goto out;
+    }
+    memcpy(retained_bytes, encoded_bytes, encoded_byte_count);
+    if (append_journal_frame(plane, WVM_CONTROL_JOURNAL_ROUTE_SNAPSHOT,
+                             encoded_bytes, encoded_byte_count,
+                             &ignored_sequence, error, error_len) != 0) {
+        goto out;
+    }
+    entry->snapshot_bytes = retained_bytes;
+    entry->snapshot_byte_count = encoded_byte_count;
+    retained_bytes = NULL;
+    result = 0;
+
+out:
+    free(retained_bytes);
+    free(encoded_bytes);
+    decoded_route_snapshot_destroy(&decoded);
+    return result;
+}
+
+int wvm_control_plane_read_route_snapshot(
+    const struct wvm_control_plane *plane,
+    const uint8_t operation_id[WVM_IDENTITY_ID_BYTES], uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len)
+{
+    const struct wvm_control_plane_route_entry *entry;
+
+    if (!plane || !operation_id || !bytes || !encoded_bytes ||
+        !(entry = wvm_control_plane_find_route_transaction(plane,
+                                                            operation_id)) ||
+        !entry->snapshot_bytes || entry->snapshot_byte_count == 0 ||
+        entry->snapshot_byte_count > capacity) {
+        set_error(error, error_len,
+                  "route snapshot recovery does not match durable operation");
+        return -1;
+    }
+    memcpy(bytes, entry->snapshot_bytes, entry->snapshot_byte_count);
+    *encoded_bytes = entry->snapshot_byte_count;
+    return 0;
+}
+
 static int restore_namespace(
     struct wvm_vm_namespace_allocator *namespace_allocator,
     const struct wvm_admission_transaction_record *transaction, char *error,
@@ -1409,6 +1938,7 @@ static void clear_route_transaction_entries(struct wvm_control_plane *plane)
     }
     for (i = 0; i < plane->route_entry_count; i++) {
         free(plane->route_entries[i].record_bytes);
+        free(plane->route_entries[i].snapshot_bytes);
         memset(&plane->route_entries[i], 0, sizeof(plane->route_entries[i]));
     }
     plane->route_entry_count = 0;

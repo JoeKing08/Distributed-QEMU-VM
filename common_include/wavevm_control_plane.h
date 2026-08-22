@@ -16,20 +16,30 @@ enum wvm_control_plane_submit_result {
     WVM_CONTROL_PLANE_SUBMIT_REPLAY = 2,
 };
 
+enum wvm_control_plane_request_disposition {
+    WVM_CONTROL_PLANE_REQUEST_ABSENT = 1,
+    WVM_CONTROL_PLANE_REQUEST_REPLAY = 2,
+    WVM_CONTROL_PLANE_REQUEST_CONFLICT = 3,
+};
+
 struct wvm_control_plane_entry {
     struct wvm_admission_transaction_record transaction;
 };
 
 /*
- * The control plane owns record_bytes after accepting a transaction update.
- * The caller supplies the entry table so route-transaction capacity remains
- * an explicit deployment limit rather than a hidden process-global cache.
+ * The control plane owns both canonical records after accepting a route
+ * operation.  A transaction state is not sufficient to recover routing: the
+ * immutable snapshot body is retained with the operation that published it.
+ * The caller supplies the entry table so capacity remains an explicit
+ * deployment limit rather than a hidden process-global cache.
  */
 struct wvm_control_plane_route_entry {
     uint8_t operation_id[WVM_IDENTITY_ID_BYTES];
     uint16_t state;
     uint8_t *record_bytes;
     size_t record_byte_count;
+    uint8_t *snapshot_bytes;
+    size_t snapshot_byte_count;
 };
 
 /*
@@ -161,6 +171,16 @@ const struct wvm_control_plane_entry *wvm_control_plane_find_request(
     const struct wvm_control_plane *plane,
     const uint8_t request_id[WVM_IDENTITY_ID_BYTES]);
 
+/*
+ * Classify one canonical request ID without allocating an identity.  Callers
+ * use this before admission to reject semantic request-ID reuse distinctly
+ * from a replay of the original durable operation.
+ */
+int wvm_control_plane_classify_request(
+    const struct wvm_control_plane *plane, const struct wvm_vm_request *request,
+    enum wvm_control_plane_request_disposition *disposition, char *error,
+    size_t error_len);
+
 const struct wvm_control_plane_route_entry *
 wvm_control_plane_find_route_transaction(
     const struct wvm_control_plane *plane,
@@ -181,6 +201,28 @@ int wvm_control_plane_record_route_transaction(
     struct wvm_control_plane *plane,
     const struct wvm_route_transaction_record *transaction, char *error,
     size_t error_len);
+
+/*
+ * Bind and persist the complete immutable route snapshot for an existing
+ * PREPARING route operation.  The operation, snapshot key, predecessor,
+ * retention horizon, and required ACK participants must agree exactly.
+ * Replaying identical canonical bytes is idempotent; a second body for the
+ * same operation is rejected.
+ */
+int wvm_control_plane_record_route_snapshot(
+    struct wvm_control_plane *plane,
+    const uint8_t operation_id[WVM_IDENTITY_ID_BYTES],
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len);
+
+/*
+ * Recover the exact snapshot body bound to one route operation.  No key-only
+ * reconstruction is permitted after a restart.
+ */
+int wvm_control_plane_read_route_snapshot(
+    const struct wvm_control_plane *plane,
+    const uint8_t operation_id[WVM_IDENTITY_ID_BYTES], uint8_t *bytes,
+    size_t capacity, size_t *encoded_bytes, char *error, size_t error_len);
 
 /*
  * Persist a new request/identity transaction or replay the original result

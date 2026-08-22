@@ -16,11 +16,14 @@
 
 #include "../common_include/wavevm_control_plane.h"
 #include "../common_include/wavevm_control_service.h"
+#include "../common_include/wavevm_admission_orchestrator.h"
 
 struct control_context {
     struct wvm_control_plane *plane;
     struct wvm_vm_namespace_allocator *namespace_allocator;
     size_t request_list_capacity;
+    wvm_admission_input_prepare_fn admission_input_builder;
+    void *admission_input_builder_context;
     pthread_mutex_t lock;
     int lock_initialized;
 };
@@ -199,17 +202,22 @@ static int apply_create_vm(void *opaque, const struct wvm_envelope *request,
     struct wvm_storage_assignment *storage_assignments = NULL;
     struct wvm_vm_request vm_request;
     struct wvm_coordinator_transaction transaction;
+    struct wvm_admission_orchestrator_input admission_input;
     struct wvm_coordinator_id_provider id_provider;
     enum wvm_control_plane_submit_result submit_result;
     const struct wvm_control_plane_entry *entry;
     size_t list_capacity;
-    int begin_result;
-    int request_exists;
+    enum wvm_control_plane_request_disposition request_disposition;
+    int admission_result;
 
+    if (!result) {
+        snprintf(error, error_len, "CREATE_VM result storage is missing");
+        return -EINVAL;
+    }
     initialize_control_result(request, WVM_CONTROL_RESULT_INTERNAL_FAILURE,
                               result);
     if (!context || !context->plane || !context->namespace_allocator ||
-        !request || !authenticated_actor || !result ||
+        !request || !authenticated_actor ||
         authenticated_actor->role_type != WVM_MANIFEST_ROLE_EXECUTOR ||
         wvm_member_key_validate(authenticated_actor, error, error_len) != 0) {
         result->status_code = WVM_CONTROL_RESULT_UNAUTHORIZED_ROLE;
@@ -253,35 +261,59 @@ static int apply_create_vm(void *opaque, const struct wvm_envelope *request,
     id_provider.context = context;
     id_provider.allocate_id16 = allocate_random_id16;
     id_provider.allocate_route_scope_id = allocate_random_route_scope_id;
+    memset(&admission_input, 0, sizeof(admission_input));
+    admission_input.control_plane = context->plane;
+    admission_input.namespace_allocator = context->namespace_allocator;
+    admission_input.id_provider = &id_provider;
+    admission_input.request = &vm_request;
+    admission_input.prepare_input = context->admission_input_builder;
+    admission_input.prepare_input_context =
+        context->admission_input_builder_context;
+    admission_input.transaction_out = &transaction;
+    admission_input.submit_result_out = &submit_result;
     pthread_mutex_lock(&context->lock);
-    begin_result = wvm_control_plane_begin(
-        context->plane, &vm_request, context->namespace_allocator, &id_provider,
-        &submit_result, &transaction, error, error_len);
-    entry = begin_result == 0
-                ? wvm_control_plane_find_request(context->plane,
-                                                 vm_request.request_id)
-                : NULL;
-    request_exists = begin_result != 0 &&
-                     wvm_control_plane_find_request(context->plane,
-                                                    vm_request.request_id) !=
-                         NULL;
-    pthread_mutex_unlock(&context->lock);
-    if (begin_result != 0) {
-        result->status_code =
-            request_exists ? WVM_CONTROL_RESULT_OPERATION_ID_CONFLICT
-                  : (context->plane->entry_count == context->plane->entry_capacity
-                         ? WVM_CONTROL_RESULT_BACKPRESSURE
-                         : WVM_CONTROL_RESULT_INTERNAL_FAILURE);
+    if (wvm_control_plane_classify_request(
+            context->plane, &vm_request, &request_disposition, error,
+            error_len) != 0) {
+        pthread_mutex_unlock(&context->lock);
+        free(storage_assignments);
+        free(constraints);
+        return -EIO;
+    }
+    if (request_disposition == WVM_CONTROL_PLANE_REQUEST_CONFLICT) {
+        pthread_mutex_unlock(&context->lock);
+        result->status_code = WVM_CONTROL_RESULT_OPERATION_ID_CONFLICT;
+        free(storage_assignments);
+        free(constraints);
+        return 0;
+    }
+    admission_result =
+        wvm_admission_orchestrator_run(&admission_input, error, error_len);
+    entry =
+        wvm_control_plane_find_request(context->plane, vm_request.request_id);
+    if (!entry && context->plane->entry_count == context->plane->entry_capacity) {
+        pthread_mutex_unlock(&context->lock);
+        result->status_code = WVM_CONTROL_RESULT_BACKPRESSURE;
         free(storage_assignments);
         free(constraints);
         return 0;
     }
     if (!entry) {
+        pthread_mutex_unlock(&context->lock);
         snprintf(error, error_len, "durable VM transaction disappeared");
         free(storage_assignments);
         free(constraints);
         return -EIO;
     }
+    if (admission_result != 0 ||
+        entry->transaction.state != WVM_LIFECYCLE_RUNNING) {
+        pthread_mutex_unlock(&context->lock);
+        result->status_code = WVM_CONTROL_RESULT_PRECONDITION_FAILED;
+        free(storage_assignments);
+        free(constraints);
+        return 0;
+    }
+    pthread_mutex_unlock(&context->lock);
     result->status_code = WVM_CONTROL_RESULT_SUCCESS;
     result->recorded_state = (uint16_t)entry->transaction.state;
     result->applied_revision = entry->transaction.transaction_sequence;

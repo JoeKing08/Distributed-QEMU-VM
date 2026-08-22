@@ -1,6 +1,7 @@
 [完成] 移除兼容优先约束，按 manifest/typed runtime 作为唯一生产路径收口纲领与入口
 [进行中] 把 manifest-driven typed dispatch 接入统一 node_runtime/executor 边界；入口 context 已统一，旧数据面投影仍待移除
-[进行中] 接入基础 membership join/cordon/drain/gateway replacement 控制面入口；已完成可靠有序 typed control stream、认证 actor 边界、CTRL_RESULT 回传及 replay/拒绝回归，并补齐不复制 membership 状态的正式 control-owner Unix listener 生命周期与并发/EOF/stop 回归；`ctl_tool serve` 已接入同一 durable admission/membership/control plane，使用 Unix peer UID 到 typed principal 的显式映射并通过 daemon 重启 replay 回归；仍待将 coordinator/topology planner 与真实 manifest admission 事务接入该 service
+[进行中] 接入基础 membership join/cordon/drain/gateway replacement 控制面入口；已完成可靠有序 typed control stream、认证 actor 边界、CTRL_RESULT 回传及 replay/拒绝回归，并补齐不复制 membership 状态的正式 control-owner Unix listener 生命周期与并发/EOF/stop 回归；`ctl_tool serve` 已接入同一 durable admission/membership/control plane，使用 Unix peer UID 到 typed principal 的显式映射；真实 CREATE_VM durable identity begin/replay/conflict 已通过 service 验收，仍待将 coordinator/topology planner 与完整 manifest prepare/activate/commit 事务接入该 service
 [待办] 完成 Mode B 多 VM 隔离与生命周期验证
 [待办] 实现 per-VM Mode A kernel context 并验证双 VM 隔离
 [待办] 按 flat/fractal 与 TCG/KVM 合同执行分层验证
+[证据 2026-08-22] `make -C ctl_tool -B` 通过；`test_control_transport.sh`、`test_control_owner.sh`、`test_control_service.sh`、`test_ctl_service.sh`、`test_control_plane.sh`、`test_executor_session.sh`、`test_control_plane_membership.sh` 通过；新增 `test_ctl_create_vm.sh` 通过首次 durable identity、相同 request-id 字节级 replay、语义冲突拒绝和 daemon 重启 replay。
