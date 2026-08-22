@@ -51,6 +51,25 @@ The long-term goal is not only to boot a demo guest. The goal is a maintainable 
 
 WaveVM should be treated as a distributed QEMU, not as a collection of test-specific forwarding hacks.
 
+The project has two acceptance horizons:
+
+**Minimum usable system:** a manifest-bound VM can run with isolated local
+resources and identity, use either TCG or KVM, use flat or fractal routing, and
+share a physical host with other Mode B VMs. Mode A is usable for multiple VMs
+only after explicit per-VM kernel contexts and teardown isolation pass. The
+minimum system also includes basic node/gateway join, compute cordon, safe
+drain, and gateway replacement through acknowledged route snapshots.
+
+**Extended hardening:** coordinator high availability, automatic migration or
+resharding, transparent recovery after loss of required compute state, full
+fault-engine plugin coverage, and exhaustive network/lifecycle fault injection.
+These are later operational improvements, not prerequisites for proving that
+the distributed VM path works.
+
+The two horizons do not define two products or two semantic paths. Extended
+features must preserve the same manifest, identity, routing, memory, and vCPU
+contracts established by the minimum system.
+
 ## 2. Non-Goals
 
 The following are not acceptable long-term directions:
@@ -175,12 +194,12 @@ Non-responsibilities:
 The user-space node runtime is the canonical authority for one logical VM
 instance on one participating physical node. `master_core` is the current
 implementation of its master-role portion; that source-tree name is a
-compatibility detail, not the target component boundary.
+implementation detail, not a supported deployment boundary.
 
 Responsibilities:
 
-- Consume the admitted per-node manifest and compatibility configuration during
-  migration.
+- Consume only the admitted per-node manifest, route snapshot, dispatch
+  projection, and capability profile.
 - Hold the VM and node identity assigned by the control plane.
 - Own CPU route table and memory placement table for that VM.
 - Own page directory and version state in Mode B baseline.
@@ -251,10 +270,9 @@ process boundary:
   information to satisfy the memory and vCPU contracts. It must be specified
   by the memory, vCPU, and local IPC specifications before it replaces current
   master-to-slave messages.
-- The current `master_core` to `slave_daemon` IPC is a compatibility adapter
-  during migration. Code must first converge on the node-runtime/executor
-  interface; it must not delete or merge processes in a broad mechanical
-  rewrite.
+  - The current `master_core` to `slave_daemon` IPC is implementation debt.
+    It is not a supported ABI and must be replaced by the typed
+    node-runtime/executor interface.
 - Removing a process hop is permitted only after the same role boundary,
   concurrency model, backpressure behavior, and fault behavior have regression
   coverage. It is not permission to bypass the node runtime or to serialize the
@@ -929,6 +947,11 @@ Until explicit contexts exist, Mode A must be treated as
 single-VM-per-physical-node. Admission must reject a second concurrent Mode A
 VM rather than allowing global state to be overwritten.
 
+This is a migration gate, not the desired product limit. Per-VM contexts,
+context-bound IOCTL/mmap operations, and independent teardown are required
+before the minimum usable system may advertise multiple Mode A VMs on one
+physical node.
+
 ## 15. Invariants
 
 The following invariants should guide future code changes:
@@ -989,11 +1012,13 @@ ABIs without choosing contradictory alternatives.
   reported as running, and every resource created before failure has a named
   cleanup owner.
 - The node accepting a V1 create request acts as lifecycle coordinator for that
-  operation. It may select a different `host_node` for QEMU. Coordinator crash
-  high availability is not provided in V1, but the coordinator must persist the
-  transaction/activation decision for restart recovery. Prepared reservations
-  use bounded leases only before activation; activated reservations remain held
-  until lifecycle teardown.
+  operation. It may select a different `host_node` for QEMU. The minimum
+  deployment uses one active coordinator and has no coordinator high
+  availability or transparent failover. It must persist enough of the
+  transaction/activation decision to reconcile a restart deterministically or
+  fail closed without leaking a reservation or reporting a false `RUNNING`
+  state. Prepared reservations use bounded leases only before activation;
+  activated reservations remain held until lifecycle teardown.
 - Nonzero VM route namespaces use strict composite keys at every flat or
   fractal gateway level. Raw-ID fallback is legacy behavior for `vm_id=0` only.
 - A flat route domain has bounded local vnode fan-out. The control plane selects

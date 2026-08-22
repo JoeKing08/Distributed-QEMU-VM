@@ -33,6 +33,8 @@ typedef struct WaveVMAccelState {
     bool sync_thread_running;
     QemuThread net_thread;
     int master_sock;
+    int executor_session_fd;
+    QemuThread executor_session_thread;
 
     /* [FIX-F1] Block IO 持久连接：避免每次 IO 都 connect()+pthread_create() 导致线程爆炸 */
     int block_io_sock;               /* 持久 IPC 连接，-1 = 未初始化 */

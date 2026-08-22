@@ -193,6 +193,25 @@ static int recording_vcpu_result_dispatch(
     return 0;
 }
 
+static int recording_control_dispatch(
+    void *opaque, const struct wvm_envelope *envelope,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len)
+{
+    int *count = opaque;
+
+    if (!count || !envelope || !authenticated_actor ||
+        envelope->message_type != WVM_ENVELOPE_MSG_CORDON ||
+        authenticated_actor->role_type != WVM_MANIFEST_ROLE_EXECUTOR) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len, "control actor or message is invalid");
+        }
+        return -EINVAL;
+    }
+    (*count)++;
+    return 0;
+}
+
 static int unsupported_dispatch(void *opaque,
                                 const struct wvm_envelope *envelope,
                                 char *error, size_t error_len)
@@ -259,6 +278,7 @@ int main(void)
     int dispatched = 0;
     int vcpu_dispatched = 0;
     int vcpu_result_dispatched = 0;
+    int control_dispatched = 0;
     int fragmented_ack_accepted = 1;
     char error[256] = {0};
     size_t i;
@@ -310,6 +330,8 @@ int main(void)
     config.vcpu_dispatch_opaque = &vcpu_dispatched;
     config.vcpu_result_dispatch = recording_vcpu_result_dispatch;
     config.vcpu_result_dispatch_opaque = &vcpu_result_dispatched;
+    config.control_dispatch = recording_control_dispatch;
+    config.control_dispatch_opaque = &control_dispatched;
     if (expect(wvm_ingress_init(&ingress, &config, error, sizeof(error)) ==
                    0 &&
                    wvm_envelope_reassembler_init(&reassembler) == 0,
@@ -562,6 +584,44 @@ int main(void)
         return 1;
     }
 
+    {
+        struct wvm_member_key authenticated_actor;
+        uint8_t control_payload[] = {0xa1, 0xb2, 0xc3};
+
+        memset(&authenticated_actor, 0, sizeof(authenticated_actor));
+        authenticated_actor.role_type = WVM_MANIFEST_ROLE_EXECUTOR;
+        authenticated_actor.role_id = 99;
+        authenticated_actor.instance_id = 1001;
+        memset(&envelope, 0, sizeof(envelope));
+        envelope.message_type = WVM_ENVELOPE_MSG_CORDON;
+        envelope.origin_physical_node_id = 17;
+        envelope.origin_runtime_instance_id = 303;
+        envelope.operation_id[15] = 6;
+        envelope.delivery_attempt_id = 1;
+        envelope.payload = control_payload;
+        envelope.payload_bytes = sizeof(control_payload);
+        wvm_envelope_semantic_digest(
+            control_payload, sizeof(control_payload),
+            envelope.semantic_payload_digest);
+        if (expect(wvm_envelope_encode(
+                       &envelope, WVM_ENVELOPE_TRANSPORT_NETWORK, frame,
+                       sizeof(frame), &frame_bytes, error, sizeof(error)) == 0 &&
+                       wvm_ingress_accept(
+                           &ingress, &reassembler, frame, frame_bytes, 107,
+                           error, sizeof(error)) == WVM_INGRESS_REJECTED &&
+                       control_dispatched == 0,
+                   "reject control traffic without authenticated actor") ||
+            expect(wvm_ingress_accept_authenticated(
+                       &ingress, &reassembler, frame, frame_bytes, 108,
+                       &authenticated_actor, error, sizeof(error)) ==
+                       WVM_INGRESS_ACCEPTED &&
+                       control_dispatched == 1,
+                   "dispatch control traffic only through authenticated entry")) {
+            wvm_envelope_reassembler_destroy(&reassembler);
+            return 1;
+        }
+    }
+
     config.memory_dispatch = unsupported_dispatch;
     config.memory_dispatch_opaque = NULL;
     if (expect(wvm_ingress_init(&ingress, &config, error, sizeof(error)) ==
@@ -570,11 +630,9 @@ int main(void)
         wvm_envelope_reassembler_destroy(&reassembler);
         return 1;
     }
-    envelope.flags = 0;
+    fill_envelope(&manifest, &envelope, payload, sizeof(payload));
     envelope.message_type = WVM_ENVELOPE_MSG_MEM_READ;
     envelope.operation_id[15] = 3;
-    envelope.payload = payload;
-    envelope.payload_bytes = sizeof(payload);
     if (expect(wvm_envelope_encode(&envelope,
                                       WVM_ENVELOPE_TRANSPORT_NETWORK, frame,
                                       sizeof(frame), &frame_bytes, error,

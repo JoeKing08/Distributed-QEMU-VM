@@ -43,8 +43,14 @@
 #include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_ioctl.h"
 #include "../common_include/wavevm_runtime_gate.h"
+#include "../common_include/wavevm_executor_abi.h"
+#include "../common_include/wavevm_executor_session.h"
+#include "../common_include/wavevm_vcpu_handoff.h"
+#include "../common_include/wavevm_x86_context.h"
+#include "../node_runtime/executor_runtime.h"
 #include "../node_runtime/kvm_page_cache.h"
 #include "../node_runtime/memory_service.h"
+#include "../node_runtime/runtime_context.h"
 
 /* The unified node runtime owns this flag.  The weak definition keeps the
  * standalone executor linkable while the strong runtime definition is used
@@ -58,10 +64,11 @@ volatile sig_atomic_t g_shutdown_requested = 0;
 static int g_service_port = 9000;
 static int g_nonblock_recv = 0;
 static long g_num_cores = 0;
+static int *g_tcg_session_fds;
 static int g_ram_mb = 1024;
 static uint64_t g_slave_ram_size = 1024UL * 1024 * 1024;
 static int g_base_id = 0;
-static uint8_t g_slave_vm_id = 0;
+static uint32_t g_slave_vm_id = 0;
 #define VCPU_EXIT_CACHE_SIZE 4096
 #define VCPU_EXIT_CACHE_MAX_PACKET (sizeof(struct wvm_header) + sizeof(struct wvm_ipc_cpu_run_ack))
 
@@ -100,105 +107,119 @@ static int g_master_ready = 0;
 static struct sockaddr_in g_master_addr;
 static char *g_vfio_config_path = NULL; 
 static int g_executor_ctrl_port = 9001;
-static struct wvm_runtime_manifest_storage g_executor_manifest_storage;
-static struct wvm_runtime_gate g_executor_runtime_gate;
+static const struct wvm_runtime_manifest_storage *
+    g_executor_manifest_storage_ptr;
+static struct wvm_runtime_gate *g_executor_runtime_gate_ptr;
 static uint64_t g_executor_connection_id;
 static int g_wvm_dev_fd = -1;
 static int g_kernel_context_bind_failed = 0;
 static int g_executor_local_only = 0;
+static volatile sig_atomic_t g_executor_runtime_ready;
+static pthread_mutex_t g_executor_handoff_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_executor_handoff_id;
+static uint64_t g_executor_completed_fence_id;
+
+/*
+ * The local typed executor session reuses the execution core below without
+ * making it know about sockets. Network workers leave this unset and retain
+ * their existing reply path; typed sessions capture the completed ACK here.
+ */
+struct local_executor_capture {
+    struct wvm_ipc_cpu_run_ack *ack;
+    int completed;
+};
+
+static __thread struct local_executor_capture *t_local_executor_capture;
+
+static int capture_local_executor_ack(
+    const struct wvm_ipc_cpu_run_ack *ack)
+{
+    if (!t_local_executor_capture || !t_local_executor_capture->ack ||
+        !ack) {
+        return 0;
+    }
+    *t_local_executor_capture->ack = *ack;
+    t_local_executor_capture->completed = 1;
+    return 1;
+}
+
+void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client,
+                              struct wvm_header *hdr, void *payload,
+                              int vcpu_id);
+
+enum executor_startup_state {
+    EXECUTOR_STARTING = 0,
+    EXECUTOR_READY = 1,
+    EXECUTOR_FAILED = 2,
+};
+
+static pthread_mutex_t g_executor_startup_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_executor_startup_changed = PTHREAD_COND_INITIALIZER;
+static enum executor_startup_state g_executor_startup_state = EXECUTOR_FAILED;
+
+#define g_executor_manifest_storage (*g_executor_manifest_storage_ptr)
+#define g_executor_runtime_gate (*g_executor_runtime_gate_ptr)
+
+static void executor_publish_startup_state(enum executor_startup_state state)
+{
+    pthread_mutex_lock(&g_executor_startup_lock);
+    g_executor_startup_state = state;
+    g_executor_runtime_ready = state == EXECUTOR_READY;
+    pthread_cond_broadcast(&g_executor_startup_changed);
+    pthread_mutex_unlock(&g_executor_startup_lock);
+}
+
+int wvm_executor_runtime_wait_ready(void)
+{
+    pthread_mutex_lock(&g_executor_startup_lock);
+    while (g_executor_startup_state == EXECUTOR_STARTING) {
+        pthread_cond_wait(&g_executor_startup_changed,
+                          &g_executor_startup_lock);
+    }
+    if (g_executor_startup_state == EXECUTOR_READY) {
+        pthread_mutex_unlock(&g_executor_startup_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_executor_startup_lock);
+    return -EIO;
+}
 
 // --- KVM_RUN slice preemption (thread-directed) ---
 static __thread struct kvm_run *t_kvm_run = NULL;
 static __thread volatile sig_atomic_t t_kvm_alarm_fired = 0;
 static int g_kvm_immediate_exit = 0;
 
-static int executor_parse_u64(const char *text, uint64_t *value)
+static int executor_runtime_gate_init(
+    const struct wvm_node_runtime_context *runtime)
 {
-    char *end = NULL;
-    unsigned long long parsed;
-
-    if (!text || !*text || !value) {
-        return -1;
-    }
-    errno = 0;
-    parsed = strtoull(text, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
-        return -1;
-    }
-    *value = (uint64_t)parsed;
-    return 0;
-}
-
-static int executor_parse_legacy_vm_id(const char *text, uint8_t *value)
-{
-    char *end = NULL;
-    unsigned long parsed;
-
-    if (!text || !*text || !value) {
-        return -1;
-    }
-    errno = 0;
-    parsed = strtoul(text, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || parsed > UINT8_MAX) {
-        return -1;
-    }
-    *value = (uint8_t)parsed;
-    return 0;
-}
-
-static int executor_runtime_gate_init(void)
-{
-    const char *active = getenv("WVM_RUNTIME_GATE_ACTIVE");
-    const char *manifest_path = getenv("WVM_RUNTIME_MANIFEST_PATH");
-    const char *node_instance_text = getenv("WVM_NODE_INSTANCE_ID");
-    const char *physical_id_text =
-        getenv("WVM_RUNTIME_PHYSICAL_NODE_ID");
-    uint64_t node_instance_id;
-    uint64_t physical_node_id;
     struct wvm_runtime_registration registration;
     uint8_t profile_digest[WVM_SHA256_DIGEST_BYTES];
     char error[256] = {0};
 
-    if (!active || active[0] == '\0' || strcmp(active, "0") == 0) {
-        return 0;
+    if (!runtime || !runtime->manifest_storage ||
+        !runtime->manifest || !runtime->runtime_gate ||
+        runtime->manifest != &runtime->manifest_storage->manifest ||
+        runtime->manifest->vm_id == 0 ||
+        runtime->manifest->vm_id != g_slave_vm_id ||
+        runtime->runtime_gate->manifest != runtime->manifest ||
+        runtime->runtime_gate->state != WVM_RUNTIME_GATE_ACTIVE) {
+        fprintf(stderr, "[RuntimeGate] executor context is not admitted\n");
+        return -1;
     }
     /*
      * An admitted executor is reached through its local node-runtime bridge.
      * It must not expose the legacy UDP service as a cross-node endpoint.
      */
     g_executor_local_only = 1;
-    if (!manifest_path ||
-        executor_parse_u64(node_instance_text, &node_instance_id) != 0) {
-        fprintf(stderr,
-                "[RuntimeGate] executor missing manifest path/node instance\n");
-        return -1;
-    }
-    if (executor_parse_u64(physical_id_text, &physical_node_id) != 0 ||
-        physical_node_id > UINT32_MAX) {
-        fprintf(stderr,
-                "[RuntimeGate] executor physical node identity is missing\n");
-        return -1;
-    }
-    wvm_runtime_manifest_storage_init(&g_executor_manifest_storage);
-    wvm_runtime_gate_init(&g_executor_runtime_gate);
-    if (wvm_runtime_manifest_load_file(
-            manifest_path, &g_executor_manifest_storage, error,
-            sizeof(error)) != 0 ||
-        g_executor_manifest_storage.manifest.vm_id != g_slave_vm_id ||
-        wvm_runtime_gate_prepare(
-            &g_executor_runtime_gate, &g_executor_manifest_storage.manifest,
-            (uint32_t)physical_node_id, node_instance_id, error,
-            sizeof(error)) != 0 ||
-        wvm_runtime_gate_activate(
-            &g_executor_runtime_gate,
-            g_executor_manifest_storage.manifest.activation_fence, error,
-            sizeof(error)) != 0 ||
-        wvm_runtime_manifest_profile_digest(
+    g_executor_manifest_storage_ptr = runtime->manifest_storage;
+    g_executor_runtime_gate_ptr = runtime->runtime_gate;
+    if (wvm_runtime_manifest_profile_digest(
             &g_executor_manifest_storage.manifest, profile_digest, error,
             sizeof(error)) != 0) {
         fprintf(stderr, "[RuntimeGate] executor rejected manifest: %s\n",
-                error[0] ? error : "manifest identity mismatch");
-        wvm_runtime_manifest_storage_free(&g_executor_manifest_storage);
+                error[0] ? error : "invalid capability profile");
+        g_executor_manifest_storage_ptr = NULL;
+        g_executor_runtime_gate_ptr = NULL;
         return -1;
     }
 
@@ -212,7 +233,7 @@ static int executor_runtime_gate_init(void)
     memcpy(registration.candidate_manifest_digest,
            g_executor_manifest_storage.manifest.candidate_manifest_digest,
            sizeof(registration.candidate_manifest_digest));
-    registration.local_runtime_instance_id = node_instance_id;
+    registration.local_runtime_instance_id = runtime->node_instance_id;
     registration.caller_process_instance_id = (uint64_t)getpid();
     memcpy(registration.capability_profile_digest, profile_digest,
            sizeof(registration.capability_profile_digest));
@@ -224,7 +245,8 @@ static int executor_runtime_gate_init(void)
                                   sizeof(error)) != 0) {
         fprintf(stderr, "[RuntimeGate] executor registration rejected: %s\n",
                 error[0] ? error : "registration mismatch");
-        wvm_runtime_manifest_storage_free(&g_executor_manifest_storage);
+        g_executor_manifest_storage_ptr = NULL;
+        g_executor_runtime_gate_ptr = NULL;
         return -1;
     }
     fprintf(stderr,
@@ -238,9 +260,8 @@ static int executor_bind_kernel_context(void)
     struct wvm_ioctl_context_bind request;
     uint8_t profile_digest[WVM_KERNEL_DIGEST_BYTES];
     char error[256] = {0};
-    const char *gate_active = getenv("WVM_RUNTIME_GATE_ACTIVE");
-
-    if (g_wvm_dev_fd < 0 || !gate_active || strcmp(gate_active, "0") == 0) {
+    if (g_wvm_dev_fd < 0 || !g_executor_manifest_storage_ptr ||
+        !g_executor_runtime_gate_ptr) {
         return 0;
     }
     if (!g_executor_manifest_storage.manifest.has_activation_fence ||
@@ -1201,6 +1222,429 @@ void* dirty_sync_sender_thread(void* arg) {
     return NULL;
 }
 
+static void typed_handoff_result_from_request(
+    const struct wvm_vcpu_handoff_request *request, uint16_t status,
+    struct wvm_vcpu_handoff_result *result)
+{
+    memset(result, 0, sizeof(*result));
+    result->protocol_version = WVM_VCPU_HANDOFF_RESULT_VERSION;
+    result->status = status;
+    result->exit_class =
+        status == WVM_VCPU_HANDOFF_RESULT_MEMORY_FAILURE
+            ? WVM_VCPU_EXIT_MEMORY_ERROR
+            : status == WVM_VCPU_HANDOFF_RESULT_EXECUTOR_FAILURE
+                  ? WVM_VCPU_EXIT_EXECUTOR_ERROR
+                  : WVM_VCPU_EXIT_NONE;
+    result->backend = request->backend;
+    result->vm_id = request->vm_id;
+    result->vm_incarnation = request->vm_incarnation;
+    result->manifest_generation = request->manifest_generation;
+    result->origin_physical_node_id = request->origin_physical_node_id;
+    result->origin_runtime_instance_id = request->origin_runtime_instance_id;
+    result->vcpu_index = request->vcpu_index;
+    result->handoff_sequence = request->handoff_sequence;
+    memcpy(result->operation_id, request->operation_id,
+           sizeof(result->operation_id));
+    result->context_schema_version = request->context_schema_version;
+}
+
+static uint16_t typed_exit_class_from_legacy_ack(
+    const struct wvm_vcpu_handoff_request *request,
+    const struct wvm_ipc_cpu_run_ack *ack)
+{
+    if (request->backend == WVM_VCPU_BACKEND_TCG) {
+        if (ack->ctx.tcg.halted) {
+            return WVM_VCPU_EXIT_HALTED;
+        }
+        if (ack->ctx.tcg.interrupt_request != 0) {
+            return WVM_VCPU_EXIT_INTERRUPT;
+        }
+        return WVM_VCPU_EXIT_BUDGET;
+    }
+    if (ack->ctx.kvm.exit_reason == KVM_EXIT_HLT) {
+        return WVM_VCPU_EXIT_HALTED;
+    }
+    if (ack->ctx.kvm.exit_reason == KVM_EXIT_IO) {
+        return WVM_VCPU_EXIT_PIO;
+    }
+    if (ack->ctx.kvm.exit_reason == KVM_EXIT_MMIO) {
+        return WVM_VCPU_EXIT_MMIO;
+    }
+    return WVM_VCPU_EXIT_BUDGET;
+}
+
+static void typed_handoff_ids(uint64_t *request_id, uint64_t *fence_id)
+{
+    pthread_mutex_lock(&g_executor_handoff_id_lock);
+    if (++g_executor_handoff_id == 0) {
+        ++g_executor_handoff_id;
+    }
+    if (++g_executor_completed_fence_id == 0) {
+        ++g_executor_completed_fence_id;
+    }
+    *request_id = g_executor_handoff_id;
+    *fence_id = g_executor_completed_fence_id;
+    pthread_mutex_unlock(&g_executor_handoff_id_lock);
+}
+
+static int execute_tcg_executor_session(
+    const struct wvm_vcpu_handoff_request *request,
+    struct wvm_vcpu_handoff_result *result, uint8_t *result_context,
+    size_t result_context_capacity, char *error, size_t error_len)
+{
+    uint8_t request_payload[WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES];
+    uint8_t frame[WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES];
+    uint8_t response[WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES];
+    const uint8_t *payload = NULL;
+    size_t request_payload_bytes = 0;
+    size_t frame_bytes = 0;
+    size_t response_bytes;
+    size_t payload_bytes = 0;
+    uint16_t message_type = 0;
+    struct wvm_vcpu_handoff_result decoded_result;
+    int fd;
+    ssize_t sent;
+
+    if (!request || !result || !result_context ||
+        result_context_capacity < WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES ||
+        !g_tcg_session_fds || request->vcpu_index >= (uint32_t)g_num_cores ||
+        g_tcg_session_fds[request->vcpu_index] < 0) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len,
+                     "TCG executor session is not available for vCPU");
+        }
+        return -EAGAIN;
+    }
+    fd = g_tcg_session_fds[request->vcpu_index];
+    if (wvm_vcpu_handoff_request_encode(
+            request, request_payload, sizeof(request_payload),
+            &request_payload_bytes, error, error_len) != 0 ||
+        wvm_executor_session_encode(
+            WVM_EXECUTOR_SESSION_VCPU_RUN, request_payload,
+            request_payload_bytes, frame, sizeof(frame), &frame_bytes, error,
+            error_len) != 0) {
+        return -EPROTO;
+    }
+    sent = send(fd, frame, frame_bytes, MSG_NOSIGNAL);
+    if (sent != (ssize_t)frame_bytes) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len, "cannot submit TCG executor session");
+        }
+        return sent < 0 ? -errno : -EIO;
+    }
+
+    for (;;) {
+        struct pollfd descriptor = {.fd = fd, .events = POLLIN};
+        int poll_result = poll(&descriptor, 1, 100);
+
+        if (g_shutdown_requested) {
+            return -ESHUTDOWN;
+        }
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -errno;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            if (error && error_len != 0) {
+                snprintf(error, error_len,
+                         "TCG executor session closed before its result");
+            }
+            return -EPIPE;
+        }
+        response_bytes = recv(fd, response, sizeof(response), 0);
+        if (response_bytes < 0 && errno == EINTR) {
+            continue;
+        }
+        if (response_bytes <= 0) {
+            return response_bytes == 0 ? -EPIPE : -errno;
+        }
+        break;
+    }
+
+    if (wvm_executor_session_decode(
+            response, response_bytes, &message_type, &payload, &payload_bytes,
+            error, error_len) != 0 ||
+        message_type != WVM_EXECUTOR_SESSION_VCPU_EXIT ||
+        wvm_vcpu_handoff_result_decode(
+            payload, payload_bytes, &decoded_result, error, error_len) != 0 ||
+        wvm_vcpu_handoff_result_validate_request(
+            request, &decoded_result, error, error_len) != 0) {
+        if (error && error_len != 0 && error[0] == '\0') {
+            snprintf(error, error_len,
+                     "TCG executor session result is invalid");
+        }
+        return -EPROTO;
+    }
+    if (decoded_result.context_bytes > result_context_capacity) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len,
+                     "TCG executor session result context is too large");
+        }
+        return -EOVERFLOW;
+    }
+    *result = decoded_result;
+    if (decoded_result.context_bytes != 0) {
+        memcpy(result_context, decoded_result.context,
+               decoded_result.context_bytes);
+        result->context = result_context;
+    } else {
+        result->context = NULL;
+    }
+    return 0;
+}
+
+/*
+ * This is the sole node-runtime to executor entry point. The executor may
+ * temporarily retain its loopback worker transport while KVM and TCG
+ * mechanics converge, but neither the bridge nor the fabric sees a legacy
+ * header or a composite raw identifier.
+ */
+int wvm_executor_runtime_execute_handoff(
+    void *opaque, const struct wvm_vcpu_handoff_request *request,
+    struct wvm_vcpu_handoff_result *result, uint8_t *result_context,
+    size_t result_context_capacity, char *error, size_t error_len)
+{
+    struct wvm_ipc_cpu_run_req local_request;
+    struct wvm_ipc_cpu_run_ack local_ack;
+    struct wvm_header header;
+    struct sockaddr_in executor_address;
+    struct pollfd pollfd;
+    uint8_t packet[sizeof(header) + sizeof(local_request)];
+    uint8_t response[sizeof(struct wvm_header) + sizeof(local_ack)];
+    void *decoded_context;
+    const void *legacy_context;
+    size_t legacy_bytes;
+    size_t encoded_context_bytes = 0;
+    uint64_t context_fields = 0;
+    uint64_t request_id;
+    uint64_t fence_id;
+    ssize_t sent;
+    int fd;
+    struct sockaddr_in local_client;
+    struct wvm_header local_header;
+    struct local_executor_capture local_capture;
+    uint8_t local_payload[sizeof(local_ack)];
+
+    (void)opaque;
+    if (!request || !result || !result_context ||
+        result_context_capacity < WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES ||
+        !g_executor_runtime_ready ||
+        !g_executor_manifest_storage_ptr || !g_executor_runtime_gate_ptr ||
+        g_service_port <= 0 || request->vm_id != g_slave_vm_id ||
+        request->vm_incarnation !=
+            g_executor_manifest_storage.manifest.vm_incarnation ||
+        request->manifest_generation !=
+            g_executor_manifest_storage.manifest.manifest_generation ||
+        (request->backend != WVM_VCPU_BACKEND_TCG &&
+         request->backend != WVM_VCPU_BACKEND_KVM)) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len,
+                     "typed executor is not ready for this admitted handoff");
+        }
+        return -EAGAIN;
+    }
+
+    memset(&local_request, 0, sizeof(local_request));
+    local_request.mode_tcg = request->backend == WVM_VCPU_BACKEND_TCG;
+    local_request.slave_id = WVM_NODE_AUTO_ROUTE;
+    local_request.vcpu_index = request->vcpu_index;
+    legacy_bytes = wvm_x86_context_legacy_bytes(request->backend);
+    decoded_context = request->backend == WVM_VCPU_BACKEND_TCG
+                          ? (void *)&local_request.ctx.tcg
+                          : (void *)&local_request.ctx.kvm;
+    if (legacy_bytes == 0 ||
+        wvm_x86_context_decode(
+            request->backend, request->context, request->context_bytes,
+            &context_fields, decoded_context, legacy_bytes, error,
+            error_len) != 0 ||
+        context_fields != request->context_valid_fields) {
+        if (error && error_len != 0 && error[0] == '\0') {
+            snprintf(error, error_len,
+                     "typed executor handoff context does not match schema");
+        }
+        return -EPROTO;
+    }
+
+    typed_handoff_ids(&request_id, &fence_id);
+
+    if (request->backend == WVM_VCPU_BACKEND_TCG) {
+        if (execute_tcg_executor_session(
+                request, result, result_context, result_context_capacity,
+                error, error_len) != 0) {
+            return -EIO;
+        }
+        if (result->status == WVM_VCPU_HANDOFF_RESULT_SUCCESS) {
+            result->produced_memory_fence_id = fence_id;
+        }
+        return 0;
+    }
+
+    /*
+     * KVM is already an in-process executor on this node. Keep its
+     * asynchronous bridge worker, but invoke the execution core directly so
+     * the admitted typed handoff never becomes a legacy UDP frame.
+     */
+    if (request->backend == WVM_VCPU_BACKEND_KVM && g_kvm_available) {
+        memset(&local_header, 0, sizeof(local_header));
+        local_header.magic = WVM_MAGIC;
+        local_header.msg_type = MSG_VCPU_RUN;
+        local_header.payload_len = sizeof(local_request);
+        local_header.slave_id = g_base_id;
+        local_header.target_id = g_base_id;
+        local_header.req_id = request_id;
+        local_header.mode_tcg = 0;
+        memset(&local_client, 0, sizeof(local_client));
+        local_client.sin_family = AF_INET;
+        local_client.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        local_client.sin_port = htons((uint16_t)g_service_port);
+        memset(&local_capture, 0, sizeof(local_capture));
+        local_capture.ack = &local_ack;
+        memset(local_payload, 0, sizeof(local_payload));
+        memcpy(local_payload, &local_request, sizeof(local_request));
+        t_local_executor_capture = &local_capture;
+        handle_kvm_run_stateless(-1, &local_client, &local_header,
+                                  local_payload, (int)request->vcpu_index);
+        t_local_executor_capture = NULL;
+        if (!local_capture.completed) {
+            if (error && error_len != 0) {
+                snprintf(error, error_len,
+                         "typed KVM executor returned without a completion");
+            }
+            return -EIO;
+        }
+        goto typed_ack_ready;
+    }
+
+    memset(&header, 0, sizeof(header));
+    header.magic = htonl(WVM_MAGIC);
+    header.msg_type = htons(MSG_VCPU_RUN);
+    header.payload_len = htons(sizeof(local_request));
+    /* The internal loopback worker needs a local correlation endpoint only. */
+    header.slave_id = htonl((uint32_t)g_base_id);
+    header.target_id = htonl((uint32_t)g_base_id);
+    header.req_id = WVM_HTONLL(request_id);
+    header.mode_tcg = (uint8_t)local_request.mode_tcg;
+    memcpy(packet, &header, sizeof(header));
+    memcpy(packet + sizeof(header), &local_request, sizeof(local_request));
+
+    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len, "cannot open local executor transport");
+        }
+        return -errno;
+    }
+    memset(&executor_address, 0, sizeof(executor_address));
+    executor_address.sin_family = AF_INET;
+    executor_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    executor_address.sin_port = htons((uint16_t)g_service_port);
+    if (connect(fd, (const struct sockaddr *)&executor_address,
+                sizeof(executor_address)) != 0) {
+        int connection_error = errno;
+
+        close(fd);
+        if (error && error_len != 0) {
+            snprintf(error, error_len, "cannot connect local executor transport");
+        }
+        return -connection_error;
+    }
+    sent = send(fd, packet, sizeof(packet), MSG_NOSIGNAL);
+    if (sent != (ssize_t)sizeof(packet)) {
+        int send_error = sent < 0 ? errno : EIO;
+
+        close(fd);
+        if (error && error_len != 0) {
+            snprintf(error, error_len, "cannot submit typed executor handoff");
+        }
+        return -send_error;
+    }
+
+    pollfd.fd = fd;
+    pollfd.events = POLLIN;
+    for (;;) {
+        ssize_t received;
+        const struct wvm_header *response_header;
+
+        if (g_shutdown_requested) {
+            close(fd);
+            return -ESHUTDOWN;
+        }
+        if (poll(&pollfd, 1, 100) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            {
+                int poll_error = errno;
+
+                close(fd);
+                return -poll_error;
+            }
+        }
+        if ((pollfd.revents & POLLIN) == 0) {
+            continue;
+        }
+        received = recv(fd, response, sizeof(response), 0);
+        if (received != (ssize_t)sizeof(response)) {
+            continue;
+        }
+        response_header = (const struct wvm_header *)response;
+        if (ntohl(response_header->magic) != WVM_MAGIC ||
+            ntohs(response_header->msg_type) != MSG_VCPU_EXIT ||
+            ntohs(response_header->payload_len) != sizeof(local_ack) ||
+            WVM_NTOHLL(response_header->req_id) != request_id) {
+            continue;
+        }
+        memcpy(&local_ack, response + sizeof(*response_header),
+               sizeof(local_ack));
+        close(fd);
+        break;
+    }
+
+typed_ack_ready:
+    if (local_ack.mode_tcg != local_request.mode_tcg) {
+        if (error && error_len != 0) {
+            snprintf(error, error_len,
+                     "local executor replied with a different backend");
+        }
+        return -EPROTO;
+    }
+    if (local_ack.status == WVM_CPU_RUN_STATUS_MEMORY_FAILURE) {
+        typed_handoff_result_from_request(
+            request, WVM_VCPU_HANDOFF_RESULT_MEMORY_FAILURE, result);
+        result->error_gpa = local_ack.error_gpa;
+        return 0;
+    }
+    if (local_ack.status != 0) {
+        typed_handoff_result_from_request(
+            request, WVM_VCPU_HANDOFF_RESULT_EXECUTOR_FAILURE, result);
+        return 0;
+    }
+
+    legacy_context = request->backend == WVM_VCPU_BACKEND_TCG
+                         ? (const void *)&local_ack.ctx.tcg
+                         : (const void *)&local_ack.ctx.kvm;
+    if (wvm_x86_context_encode(
+            request->backend, request->context_valid_fields, legacy_context,
+            wvm_x86_context_legacy_bytes(request->backend), result_context,
+            result_context_capacity, &encoded_context_bytes, error,
+            error_len) != 0) {
+        return -EPROTO;
+    }
+    typed_handoff_result_from_request(request, WVM_VCPU_HANDOFF_RESULT_SUCCESS,
+                                      result);
+    result->exit_class = typed_exit_class_from_legacy_ack(request, &local_ack);
+    result->produced_memory_fence_id = fence_id;
+    result->context_valid_fields = request->context_valid_fields;
+    result->context = result_context;
+    result->context_bytes = encoded_context_bytes;
+    return 0;
+}
+
 /* 
  * [物理意图] 在 Slave 硬件上“瞬间复活”来自 Master 的 CPU 寄存器上下文并执行。
  * [关键逻辑] 1. 注入寄存器状态；2. 启动硬件 KVM_RUN；3. 拦截 MMIO 退出；4. 导出最新状态并回传。
@@ -1219,7 +1663,8 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
                             : vcpu_id;
     uint64_t run_req_id = hdr->req_id;
     uint32_t requester = hdr->slave_id;
-    if (vcpu_exit_cache_begin(sockfd, client, run_req_id, requester)) {
+    if (!t_local_executor_capture &&
+        vcpu_exit_cache_begin(sockfd, client, run_req_id, requester)) {
         return;
     }
     { static int __run=0;
@@ -1261,6 +1706,9 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         uint8_t tx[sizeof(ack_hdr) + sizeof(ack)];
         memcpy(tx, &ack_hdr, sizeof(ack_hdr));
         memcpy(tx + sizeof(ack_hdr), &ack, sizeof(ack));
+        if (capture_local_executor_ack(&ack)) {
+            return;
+        }
         struct wvm_header *tx_hdr = (struct wvm_header *)tx;
         tx_hdr->crc32 = 0;
         tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
@@ -1299,6 +1747,9 @@ void handle_kvm_run_stateless(int sockfd, struct sockaddr_in *client, struct wvm
         uint8_t tx[sizeof(ack_hdr) + sizeof(ack)];
         memcpy(tx, &ack_hdr, sizeof(ack_hdr));
         memcpy(tx + sizeof(ack_hdr), &ack, sizeof(ack));
+        if (capture_local_executor_ack(&ack)) {
+            return;
+        }
         struct wvm_header *tx_hdr = (struct wvm_header *)tx;
         tx_hdr->crc32 = 0;
         tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
@@ -2004,6 +2455,9 @@ kvm_run_done:
     uint8_t tx[sizeof(ack_hdr) + sizeof(*ack)];
     memcpy(tx, &ack_hdr, sizeof(ack_hdr));
     memcpy(tx+sizeof(ack_hdr), ack, sizeof(*ack));
+    if (capture_local_executor_ack(ack)) {
+        return;
+    }
     struct wvm_header *tx_hdr = (struct wvm_header *)tx;
     tx_hdr->crc32 = 0;
     tx_hdr->crc32 = htonl(calculate_crc32(tx, sizeof(tx)));
@@ -2635,8 +3089,15 @@ void* kvm_worker_thread(void *arg) {
             htonl(g_executor_local_only ? INADDR_LOOPBACK : INADDR_ANY),
         .sin_port = htons(g_service_port)
     };
-    if (bind(s, (struct sockaddr*)&a, sizeof(a)) != 0) {
+    if (s < 0 || bind(s, (struct sockaddr*)&a, sizeof(a)) != 0) {
         fprintf(stderr, "[SLAVE-BIND] port=%d failed errno=%d\n", g_service_port, errno);
+        if (core == 0) {
+            executor_publish_startup_state(EXECUTOR_FAILED);
+        }
+        if (s >= 0) {
+            close(s);
+        }
+        return NULL;
     } else if (core == 0) {
         fprintf(stderr, "[SLAVE-BIND] port=%d ok\n", g_service_port);
     }
@@ -2652,10 +3113,16 @@ void* kvm_worker_thread(void *arg) {
     uint8_t *rx_pool = calloc(BATCH_SIZE, WVM_MAX_PACKET_SIZE);
     if (!rx_pool) {
         perror("[SLAVE-RX] alloc rx_pool");
+        if (core == 0) {
+            executor_publish_startup_state(EXECUTOR_FAILED);
+        }
         close(s);
         return NULL;
     }
     for(int i=0;i<BATCH_SIZE;i++) { iov[i].iov_base=rx_pool + (size_t)i * WVM_MAX_PACKET_SIZE; iov[i].iov_len=WVM_MAX_PACKET_SIZE; msgs[i].msg_hdr.msg_iov=&iov[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&c[i]; msgs[i].msg_hdr.msg_namelen=sizeof(c[i]); }
+    if (core == 0) {
+        executor_publish_startup_state(EXECUTOR_READY);
+    }
 
     while(!g_shutdown_requested) {
         for (int i = 0; i < BATCH_SIZE; i++) {
@@ -2756,6 +3223,7 @@ void* kvm_worker_thread(void *arg) {
             else handle_kvm_mem(s, &c[i], h, pkt+sizeof(*h));
         }
     }
+    return NULL;
 }
 
 // ==========================================
@@ -2801,6 +3269,11 @@ void spawn_tcg_processes(int base_id) {
     
     tcg_endpoints = malloc(sizeof(slave_endpoint_t) * g_num_cores);
     if (!tcg_endpoints) { perror("malloc endpoints"); exit(1); }
+    g_tcg_session_fds = malloc(sizeof(*g_tcg_session_fds) * g_num_cores);
+    if (!g_tcg_session_fds) { perror("malloc executor sessions"); exit(1); }
+    for (long i = 0; i < g_num_cores; i++) {
+        g_tcg_session_fds[i] = -1;
+    }
     
     /*
      * Keep inherited TCG endpoint ports inside the 16-bit TCP/UDP range.
@@ -2843,8 +3316,18 @@ void spawn_tcg_processes(int base_id) {
 
         {
             pid_t parent_pid = getpid();
+            int session_pair[2];
+            pid_t child_pid;
 
-            if (fork() == 0) {
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+                           session_pair) != 0) {
+                perror("[Hybrid] create executor session");
+                continue;
+            }
+
+            child_pid = fork();
+            if (child_pid == 0) {
+            close(session_pair[0]);
             if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 ||
                 getppid() != parent_pid) {
                 _exit(127);
@@ -2880,6 +3363,7 @@ void spawn_tcg_processes(int base_id) {
             f=fcntl(sock_cmd, F_GETFD); f&=~FD_CLOEXEC; fcntl(sock_cmd, F_SETFD, f);
             f=fcntl(sock_req, F_GETFD); f&=~FD_CLOEXEC; fcntl(sock_req, F_SETFD, f);
             f=fcntl(sock_push, F_GETFD); f&=~FD_CLOEXEC; fcntl(sock_push, F_SETFD, f);
+            f=fcntl(session_pair[1], F_GETFD); f&=~FD_CLOEXEC; fcntl(session_pair[1], F_SETFD, f);
             
             snprintf(fd_c, 16, "%d", sock_cmd);
             snprintf(fd_r, 16, "%d", sock_req);
@@ -2889,6 +3373,16 @@ void spawn_tcg_processes(int base_id) {
             setenv("WVM_SOCK_REQ", fd_r, 1);  
             setenv("WVM_SOCK_PUSH", fd_p, 1); 
             setenv("WVM_ROLE", "SLAVE", 1);
+            char session_fd_str[16];
+            snprintf(session_fd_str, sizeof(session_fd_str), "%d",
+                     session_pair[1]);
+            setenv("WVM_EXECUTOR_SESSION_FD", session_fd_str, 1);
+            char executor_id_str[32];
+            snprintf(executor_id_str, sizeof(executor_id_str), "%d", base_id);
+            setenv("WVM_EXECUTOR_ID", executor_id_str, 1);
+            char vcpu_index_str[32];
+            snprintf(vcpu_index_str, sizeof(vcpu_index_str), "%ld", i);
+            setenv("WVM_EXECUTOR_VCPU_INDEX", vcpu_index_str, 1);
             char id_str[32];
             snprintf(id_str, sizeof(id_str), "%u", WVM_ENCODE_ID(g_slave_vm_id, base_id + i));
             setenv("WVM_SLAVE_ID", id_str, 1);
@@ -2921,6 +3415,14 @@ void spawn_tcg_processes(int base_id) {
             perror("[Hybrid] execlp qemu");
             _exit(127);
             }
+            if (child_pid < 0) {
+                perror("[Hybrid] fork qemu");
+                close(session_pair[0]);
+                close(session_pair[1]);
+                continue;
+            }
+            close(session_pair[1]);
+            g_tcg_session_fds[i] = session_pair[0];
         }
         // parent: sockets are only created in child branch
     }
@@ -2940,8 +3442,13 @@ void* tcg_proxy_thread(void *arg) {
             htonl(g_executor_local_only ? INADDR_LOOPBACK : INADDR_ANY),
         .sin_port = htons(g_service_port)
     };
-    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    if (sockfd < 0 || bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
         fprintf(stderr, "[SLAVE-BIND] port=%d failed errno=%d\n", g_service_port, errno);
+        executor_publish_startup_state(EXECUTOR_FAILED);
+        if (sockfd >= 0) {
+            close(sockfd);
+        }
+        return NULL;
     } else {
         fprintf(stderr, "[SLAVE-BIND] port=%d ok\n", g_service_port);
     }
@@ -2952,10 +3459,12 @@ void* tcg_proxy_thread(void *arg) {
     uint8_t *rx_pool = calloc(BATCH_SIZE, WVM_MAX_PACKET_SIZE);
     if (!rx_pool) {
         perror("[Proxy] alloc rx_pool");
+        executor_publish_startup_state(EXECUTOR_FAILED);
         close(sockfd);
         return NULL;
     }
     for(int i=0;i<BATCH_SIZE;i++) { iovecs[i].iov_base=rx_pool + (size_t)i * WVM_MAX_PACKET_SIZE; iovecs[i].iov_len=WVM_MAX_PACKET_SIZE; msgs[i].msg_hdr.msg_iov=&iovecs[i]; msgs[i].msg_hdr.msg_iovlen=1; msgs[i].msg_hdr.msg_name=&src_addrs[i]; msgs[i].msg_hdr.msg_namelen=sizeof(src_addrs[i]); }
+    executor_publish_startup_state(EXECUTOR_READY);
 
     printf("[Proxy] Tri-Channel NAT Active (CMD/REQ/PUSH) + MESI Support.\n");
 
@@ -3083,8 +3592,22 @@ void* tcg_proxy_thread(void *arg) {
     return NULL;
 }
 
-int main(int argc, char **argv) {
+int wavevm_executor_runtime_main(
+    const struct wvm_node_runtime_context *runtime) {
     char error[256] = {0};
+
+    /* Publish the transitional state before the node runtime can wait on it. */
+    executor_publish_startup_state(EXECUTOR_STARTING);
+
+    if (!runtime || !runtime->manifest || !runtime->dispatch ||
+        runtime->physical_node_id == 0 || runtime->manifest->vm_id == 0 ||
+        runtime->local_memory_bytes == 0 ||
+        runtime->local_memory_bytes % (1024ULL * 1024ULL) != 0 ||
+        runtime->executor_worker_count == 0) {
+        fprintf(stderr, "[Runtime] admitted executor context is invalid\n");
+        executor_publish_startup_state(EXECUTOR_FAILED);
+        return 1;
+    }
 
     g_nonblock_recv = (getenv("WVM_NONBLOCK_RECV") != NULL);
 
@@ -3096,26 +3619,15 @@ int main(int argc, char **argv) {
     if (stat("/var/lib/wavevm/chunks", &st) == -1) {
         mkdir("/var/lib/wavevm/chunks", 0755);
     }
-    g_num_cores = get_allowed_cores();
-    if (argc >= 2) g_service_port = atoi(argv[1]);
-    if (argc >= 3) {
-        g_num_cores = atoi(argv[2]);
-        if (g_num_cores <= 0) g_num_cores = 1;
-    }
-    if (argc >= 4) { g_ram_mb = atoi(argv[3]); if(g_ram_mb<=0) g_ram_mb=1024; g_slave_ram_size = (uint64_t)g_ram_mb * 1024 * 1024; }
-    if (argc >= 5) {
-        g_base_id = atoi(argv[4]);
-    }
-    if (argc >= 6) g_executor_ctrl_port = atoi(argv[5]);
-    if (argc >= 7 &&
-        executor_parse_legacy_vm_id(argv[6], &g_slave_vm_id) != 0) {
-        fprintf(stderr,
-                "[VM-ID] legacy executor header supports VM IDs only in "
-                "[0, %u]; U32 dispatch is not implemented here\n",
-                UINT8_MAX);
-        return 1;
-    }
-    if (executor_runtime_gate_init() != 0) {
+    g_service_port = runtime->executor_service_port;
+    g_num_cores = (long)runtime->executor_worker_count;
+    g_ram_mb = (int)(runtime->local_memory_bytes / (1024ULL * 1024ULL));
+    g_slave_ram_size = runtime->local_memory_bytes;
+    g_base_id = (int)runtime->local_primary_vnode;
+    g_executor_ctrl_port = runtime->executor_control_port;
+    g_slave_vm_id = runtime->manifest->vm_id;
+    if (executor_runtime_gate_init(runtime) != 0) {
+        executor_publish_startup_state(EXECUTOR_FAILED);
         return 1;
     }
 
@@ -3123,17 +3635,12 @@ int main(int argc, char **argv) {
     printf("[Init] Config: Port=%d, Cores=%ld, RAM=%d MB, BaseID=%d, VM=%u\n",
            g_service_port, g_num_cores, g_ram_mb, g_base_id, (unsigned)g_slave_vm_id);
     
-    // 解析 -vfio 参数
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-vfio") == 0 && i + 1 < argc) {
-            g_vfio_config_path = argv[i+1];
-        }
-    }
     init_kvm_global();
     if (g_kernel_context_bind_failed) {
         fprintf(stderr,
                 "[KernelContext] refusing executor startup after a "
                 "manifest/context mismatch\n");
+        executor_publish_startup_state(EXECUTOR_FAILED);
         return 1;
     }
 
@@ -3159,6 +3666,7 @@ int main(int argc, char **argv) {
                     &cache_config, error, sizeof(error)) != 0) {
                 fprintf(stderr, "[RuntimeGate] cannot install KVM page cache: %s\n",
                         error[0] ? error : "invalid cache configuration");
+                executor_publish_startup_state(EXECUTOR_FAILED);
                 return 1;
             }
         }
@@ -3168,6 +3676,7 @@ int main(int argc, char **argv) {
         pthread_t sender_thread_id;
         if (pthread_create(&sender_thread_id, NULL, dirty_sync_sender_thread, NULL) != 0) {
             perror("Failed to create dirty page sender thread");
+            executor_publish_startup_state(EXECUTOR_FAILED);
             return 1;
         }
         pthread_detach(sender_thread_id); // 设为分离模式，不需 join
@@ -3179,20 +3688,60 @@ int main(int argc, char **argv) {
         /* Keep a single KVM worker to avoid vCPU create races on shared VM fd. */
         int total_threads = 1;
         pthread_t *threads = malloc(sizeof(pthread_t) * total_threads);
-        
-        for(long i=0; i<total_threads; i++) pthread_create(&threads[i], NULL, kvm_worker_thread, (void*)i);
+        if (!threads) {
+            executor_publish_startup_state(EXECUTOR_FAILED);
+            return 1;
+        }
+        for (long i = 0; i < total_threads; i++) {
+            if (pthread_create(&threads[i], NULL, kvm_worker_thread,
+                               (void *)i) != 0) {
+                executor_publish_startup_state(EXECUTOR_FAILED);
+                free(threads);
+                return 1;
+            }
+        }
+        if (wvm_executor_runtime_wait_ready() != 0) {
+            g_shutdown_requested = 1;
+        }
         for(long i=0; i<total_threads; i++) pthread_join(threads[i], NULL);
+        free(threads);
     } else {
         printf("[Hybrid] Mode: TCG PROXY (Tri-Channel). Listening on %s:%d\n",
                g_executor_local_only ? "127.0.0.1" : "0.0.0.0",
                g_service_port);
-        spawn_tcg_processes(g_base_id);
-        sleep(1);
         int proxy_threads = g_num_cores / 2; 
         if (proxy_threads < 1) proxy_threads = 1;
         pthread_t *threads = malloc(sizeof(pthread_t) * proxy_threads);
-        for(long i=0; i<proxy_threads; i++) pthread_create(&threads[i], NULL, tcg_proxy_thread, NULL);
+        if (!threads) {
+            executor_publish_startup_state(EXECUTOR_FAILED);
+            return 1;
+        }
+        for (long i = 0; i < proxy_threads; i++) {
+            if (pthread_create(&threads[i], NULL, tcg_proxy_thread, NULL) != 0) {
+                executor_publish_startup_state(EXECUTOR_FAILED);
+                g_shutdown_requested = 1;
+                free(threads);
+                return 1;
+            }
+        }
+        /* Create the per-vCPU typed sessions before publishing executor
+         * readiness, so the bridge cannot accept a TCG handoff without a
+         * corresponding helper endpoint. */
+        spawn_tcg_processes(g_base_id);
+        if (wvm_executor_runtime_wait_ready() != 0) {
+            g_shutdown_requested = 1;
+            for (long i = 0; i < proxy_threads; i++) {
+                pthread_join(threads[i], NULL);
+            }
+            free(threads);
+            return 1;
+        }
         while (wait(NULL) > 0);
+        g_shutdown_requested = 1;
+        for (long i = 0; i < proxy_threads; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        free(threads);
     }
     return 0;
 }

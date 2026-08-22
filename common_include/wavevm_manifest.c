@@ -3653,6 +3653,7 @@ int wvm_vm_request_decode(const uint8_t *bytes, size_t encoded_bytes,
     struct wvm_canonical_field fields[14];
     unsigned char present[14] = {0};
     struct wvm_host_constraint_list constraints;
+    struct wvm_storage_assignment_list storage_assignments;
     struct wvm_canonical_field field;
     size_t offset = 0;
     int next;
@@ -3687,8 +3688,10 @@ int wvm_vm_request_decode(const uint8_t *bytes, size_t encoded_bytes,
     }
 
     constraints = request->host_constraints;
+    storage_assignments = request->storage_device_plan.assignments;
     memset(request, 0, sizeof(*request));
     request->host_constraints = constraints;
+    request->storage_device_plan.assignments = storage_assignments;
     request->api_version = read_be16(fields[1].value);
     memcpy(request->request_id, fields[2].value, sizeof(request->request_id));
     request->has_display_name = present[3];

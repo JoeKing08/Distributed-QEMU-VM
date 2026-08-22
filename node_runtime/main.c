@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +15,10 @@
 #include <unistd.h>
 
 #include "executor_bridge.h"
+#include "executor_runtime.h"
 #include "ingress.h"
 #include "memory_service.h"
+#include "runtime_context.h"
 #include "vcpu_coordinator.h"
 #include "vcpu_service.h"
 #include "../common_include/wavevm_executor_abi.h"
@@ -26,30 +29,14 @@
 #include "../common_include/wavevm_runtime_gate.h"
 #include "../master_core/logic_core.h"
 
-int wavevm_master_main(int argc, char **argv);
-int wavevm_slave_main(int argc, char **argv);
+int wavevm_master_runtime_main(
+    const struct wvm_node_runtime_context *runtime);
+int wavevm_executor_runtime_main(
+    const struct wvm_node_runtime_context *runtime);
+extern volatile sig_atomic_t g_shutdown_requested;
 
 struct role_launch {
-    int argc;
-    char **argv;
-};
-
-struct legacy_role_arguments {
-    char local_memory_mb[32];
-    char guest_memory_mb[32];
-    char node_runtime_port[16];
-    char node_control_port[16];
-    char executor_service_port[16];
-    char executor_control_port[16];
-    char executor_worker_count[16];
-    char sync_batch_size[16];
-    char physical_node_id[16];
-    char local_vnode[16];
-    char vm_id[16];
-    char *master_argv[10];
-    char *executor_argv[8];
-    int master_argc;
-    int executor_argc;
+    const struct wvm_node_runtime_context *runtime;
 };
 
 struct memory_network_context {
@@ -151,7 +138,15 @@ static int derive_runtime_profile_digest(
 static void *run_master_role(void *opaque)
 {
     struct role_launch *launch = opaque;
-    int result = wavevm_master_main(launch->argc, launch->argv);
+    int result = wavevm_master_runtime_main(launch->runtime);
+
+    return (void *)(intptr_t)result;
+}
+
+static void *run_executor_role(void *opaque)
+{
+    struct role_launch *launch = opaque;
+    int result = wavevm_executor_runtime_main(launch->runtime);
 
     return (void *)(intptr_t)result;
 }
@@ -192,106 +187,6 @@ static int sum_local_memory_bytes(
         total += bytes;
     }
     *total_out = total;
-    return 0;
-}
-
-static int format_u64(char *buffer, size_t buffer_bytes, uint64_t value)
-{
-    int written;
-
-    if (!buffer || buffer_bytes == 0) {
-        return -1;
-    }
-    written = snprintf(buffer, buffer_bytes, "%" PRIu64, value);
-    return written < 0 || (size_t)written >= buffer_bytes ? -1 : 0;
-}
-
-static int derive_legacy_role_arguments(
-    const char *manifest_path,
-    const struct wvm_node_runtime_manifest *manifest,
-    const struct wvm_runtime_dispatch_projection *dispatch,
-    struct legacy_role_arguments *arguments)
-{
-    const struct wvm_node_runtime_launch_plan *launch_plan;
-    uint64_t local_memory_bytes;
-    uint64_t local_memory_mb;
-    uint64_t guest_memory_mb;
-
-    if (!manifest_path || !manifest || !dispatch || !arguments ||
-        manifest->vm_id > UINT8_MAX ||
-        manifest->physical_node_id > INT_MAX ||
-        dispatch->local_primary.destination_vnode > INT_MAX ||
-        sum_local_memory_bytes(manifest, &local_memory_bytes) != 0 ||
-        local_memory_bytes == 0 ||
-        local_memory_bytes % (1024ULL * 1024ULL) != 0 ||
-        manifest->launch_plan.guest_total_memory_bytes %
-                (1024ULL * 1024ULL) !=
-            0) {
-        fprintf(stderr,
-                "[node-runtime] legacy role adapter cannot derive an admitted "
-                "local launch\n");
-        return -1;
-    }
-    launch_plan = &manifest->launch_plan;
-    local_memory_mb = local_memory_bytes / (1024ULL * 1024ULL);
-    guest_memory_mb =
-        launch_plan->guest_total_memory_bytes / (1024ULL * 1024ULL);
-    memset(arguments, 0, sizeof(*arguments));
-    if (format_u64(arguments->local_memory_mb,
-                   sizeof(arguments->local_memory_mb),
-                   local_memory_mb) != 0 ||
-        format_u64(arguments->guest_memory_mb,
-                   sizeof(arguments->guest_memory_mb),
-                   guest_memory_mb) != 0 ||
-        format_u64(arguments->node_runtime_port,
-                   sizeof(arguments->node_runtime_port),
-                   launch_plan->node_runtime_data_port) != 0 ||
-        format_u64(arguments->node_control_port,
-                   sizeof(arguments->node_control_port),
-                   launch_plan->node_runtime_control_port) != 0 ||
-        format_u64(arguments->executor_service_port,
-                   sizeof(arguments->executor_service_port),
-                   launch_plan->local_executor_service_port) != 0 ||
-        format_u64(arguments->executor_control_port,
-                   sizeof(arguments->executor_control_port),
-                   launch_plan->local_executor_control_port) != 0 ||
-        format_u64(arguments->executor_worker_count,
-                   sizeof(arguments->executor_worker_count),
-                   launch_plan->executor_worker_count) != 0 ||
-        format_u64(arguments->sync_batch_size,
-                   sizeof(arguments->sync_batch_size),
-                   launch_plan->sync_batch_size) != 0 ||
-        format_u64(arguments->physical_node_id,
-                   sizeof(arguments->physical_node_id),
-                   manifest->physical_node_id) != 0 ||
-        format_u64(arguments->local_vnode, sizeof(arguments->local_vnode),
-                   dispatch->local_primary.destination_vnode) != 0 ||
-        format_u64(arguments->vm_id, sizeof(arguments->vm_id),
-                   manifest->vm_id) != 0) {
-        return -1;
-    }
-
-    arguments->master_argv[0] = "wavevm_node_runtime";
-    arguments->master_argv[1] = arguments->local_memory_mb;
-    arguments->master_argv[2] = arguments->node_runtime_port;
-    arguments->master_argv[3] = (char *)manifest_path;
-    arguments->master_argv[4] = arguments->physical_node_id;
-    arguments->master_argv[5] = arguments->node_control_port;
-    arguments->master_argv[6] = arguments->executor_service_port;
-    arguments->master_argv[7] = arguments->sync_batch_size;
-    arguments->master_argv[8] = arguments->vm_id;
-    arguments->master_argv[9] = NULL;
-    arguments->master_argc = 9;
-
-    arguments->executor_argv[0] = "wavevm_node_runtime";
-    arguments->executor_argv[1] = arguments->executor_service_port;
-    arguments->executor_argv[2] = arguments->executor_worker_count;
-    arguments->executor_argv[3] = arguments->local_memory_mb;
-    arguments->executor_argv[4] = arguments->local_vnode;
-    arguments->executor_argv[5] = arguments->executor_control_port;
-    arguments->executor_argv[6] = arguments->vm_id;
-    arguments->executor_argv[7] = NULL;
-    arguments->executor_argc = 7;
     return 0;
 }
 
@@ -753,9 +648,11 @@ int main(int argc, char **argv)
     uint64_t node_instance_id = 0;
     int print_launch_env = 0;
     int physical_node_id;
-    struct legacy_role_arguments legacy_arguments;
     pthread_t master_thread;
+    pthread_t executor_thread;
     struct role_launch master_launch;
+    struct role_launch executor_launch;
+    struct wvm_node_runtime_context runtime_context;
     struct wvm_runtime_manifest_storage storage;
     struct wvm_runtime_gate gate;
     char route_snapshot_path[WVM_ROUTE_DELIVERY_PATH_MAX];
@@ -770,8 +667,10 @@ int main(int argc, char **argv)
     uint64_t completion_timeout_ms = 0;
     uint64_t runtime_connection_id = 0;
     void *master_result = NULL;
+    void *executor_result = NULL;
     void *executor_dispatch_opaque = NULL;
     char instance_text[32];
+    char guest_memory_mb_text[32];
 
     if (parse_required_options(argc, argv, &manifest_path,
                                &node_instance_id, &print_launch_env) != 0) {
@@ -795,20 +694,72 @@ int main(int argc, char **argv)
         return 1;
     }
     physical_node_id = (int)storage.manifest.physical_node_id;
-    if (derive_legacy_role_arguments(
-            manifest_path, &storage.manifest, &dispatch_storage.projection,
-            &legacy_arguments) != 0) {
-        /* The projection command must also work for manifests that no longer
-         * fit the old master/slave argument ABI. */
-        if (!print_launch_env ||
+    {
+        uint64_t local_memory_bytes;
+        char name_error[256] = {0};
+
+        if (physical_node_id <= 0 ||
+            sum_local_memory_bytes(&storage.manifest, &local_memory_bytes) !=
+                0 ||
+            local_memory_bytes == 0 ||
+            storage.manifest.launch_plan.guest_total_memory_bytes == 0 ||
             storage.manifest.launch_plan.guest_total_memory_bytes %
                     (1024ULL * 1024ULL) !=
-                0 ||
-            format_u64(
-                legacy_arguments.guest_memory_mb,
-                sizeof(legacy_arguments.guest_memory_mb),
-                storage.manifest.launch_plan.guest_total_memory_bytes /
-                    (1024ULL * 1024ULL)) != 0) {
+                0) {
+            fprintf(stderr,
+                    "[node-runtime] admitted manifest has no usable local "
+                    "resource context\n");
+            wvm_runtime_manifest_storage_free(&storage);
+            wvm_runtime_dispatch_storage_free(&dispatch_storage);
+            wvm_route_runtime_destroy(&route_runtime);
+            return 1;
+        }
+        memset(&runtime_context, 0, sizeof(runtime_context));
+        runtime_context.manifest_path = manifest_path;
+        runtime_context.route_snapshot_path = route_snapshot_path;
+        runtime_context.dispatch_path = dispatch_path;
+        runtime_context.manifest_storage = &storage;
+        runtime_context.dispatch_storage = &dispatch_storage;
+        if (wvm_runtime_name_set_derive(
+                &storage.manifest.local_names, &runtime_context.names,
+                name_error, sizeof(name_error)) != 0) {
+            fprintf(stderr,
+                    "[node-runtime] cannot derive runtime names: %s\n",
+                    name_error[0] ? name_error : "invalid local namespace");
+            wvm_runtime_manifest_storage_free(&storage);
+            wvm_runtime_dispatch_storage_free(&dispatch_storage);
+            wvm_route_runtime_destroy(&route_runtime);
+            return 1;
+        }
+        runtime_context.manifest = &storage.manifest;
+        runtime_context.dispatch = &dispatch_storage.projection;
+        runtime_context.runtime_gate = &gate;
+        runtime_context.route_runtime = &route_runtime;
+        runtime_context.node_instance_id = node_instance_id;
+        runtime_context.physical_node_id = (uint32_t)physical_node_id;
+        runtime_context.local_primary_vnode =
+            dispatch_storage.projection.local_primary.destination_vnode;
+        runtime_context.local_vcpu_count =
+            (uint32_t)storage.manifest.local_vcpu_assignments.count;
+        runtime_context.local_memory_bytes = local_memory_bytes;
+        runtime_context.guest_memory_bytes =
+            storage.manifest.launch_plan.guest_total_memory_bytes;
+        runtime_context.node_runtime_data_port =
+            storage.manifest.launch_plan.node_runtime_data_port;
+        runtime_context.node_runtime_control_port =
+            storage.manifest.launch_plan.node_runtime_control_port;
+        runtime_context.executor_service_port =
+            storage.manifest.launch_plan.local_executor_service_port;
+        runtime_context.executor_control_port =
+            storage.manifest.launch_plan.local_executor_control_port;
+        runtime_context.executor_worker_count =
+            storage.manifest.launch_plan.executor_worker_count;
+        runtime_context.sync_batch_size =
+            storage.manifest.launch_plan.sync_batch_size;
+        if (snprintf(guest_memory_mb_text, sizeof(guest_memory_mb_text),
+                     "%" PRIu64,
+                     (uint64_t)(runtime_context.guest_memory_bytes /
+                                (1024ULL * 1024ULL))) < 0) {
             wvm_runtime_manifest_storage_free(&storage);
             wvm_runtime_dispatch_storage_free(&dispatch_storage);
             wvm_route_runtime_destroy(&route_runtime);
@@ -907,29 +858,16 @@ int main(int argc, char **argv)
             storage.manifest.manifest_generation, physical_node_id);
 
     {
-        uint16_t executor_service_port;
-        uint16_t node_runtime_port;
-        char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
         struct wvm_executor_bridge_config bridge_config;
         struct wvm_vcpu_handoff_coordinator_config vcpu_config;
         struct wvm_memory_service_config memory_config;
         struct wvm_ingress_config ingress_config;
         char error[256] = {0};
 
-        executor_service_port =
+        uint16_t executor_service_port =
             storage.manifest.launch_plan.local_executor_service_port;
-        node_runtime_port =
+        uint16_t node_runtime_port =
             storage.manifest.launch_plan.node_runtime_data_port;
-        if (snprintf(socket_path, sizeof(socket_path), "%s",
-                     getenv("WVM_LOCAL_EXECUTOR_SOCKET") ?: "") >=
-                (int)sizeof(socket_path) || socket_path[0] == '\0') {
-            fprintf(stderr, "[node-runtime] cannot derive executor ABI endpoint\n");
-            wvm_runtime_manifest_storage_free(&storage);
-            wvm_runtime_dispatch_storage_free(&dispatch_storage);
-            wvm_route_runtime_destroy(&route_runtime);
-            return 1;
-        }
-        setenv("WVM_LOCAL_EXECUTOR_SOCKET", socket_path, 1);
         snprintf(instance_text, sizeof(instance_text), "%u",
                  (unsigned)executor_service_port);
         setenv("WVM_EXECUTOR_SERVICE_PORT", instance_text, 1);
@@ -938,7 +876,7 @@ int main(int argc, char **argv)
         setenv("WVM_RUNTIME_LOCAL_PORT", instance_text, 1);
         setenv("WVM_TCG_QEMU_MACHINE",
                storage.manifest.launch_plan.guest_machine.machine_type, 1);
-        setenv("WVM_TCG_QEMU_MEM_MB", legacy_arguments.guest_memory_mb, 1);
+        setenv("WVM_TCG_QEMU_MEM_MB", guest_memory_mb_text, 1);
         if (print_launch_env) {
             print_launch_environment();
             wvm_runtime_manifest_storage_free(&storage);
@@ -966,14 +904,16 @@ int main(int argc, char **argv)
         bridge_config.local_runtime_instance_id = node_instance_id;
         bridge_config.runtime_connection_id = runtime_connection_id;
         bridge_config.operation_retention_horizon_ms = completion_timeout_ms;
-        bridge_config.socket_path = socket_path;
-        bridge_config.executor_service_port = executor_service_port;
-        bridge_config.node_runtime_port = node_runtime_port;
+        bridge_config.execute_handoff =
+            wvm_executor_runtime_execute_handoff;
+        bridge_config.execute_handoff_opaque = &runtime_context;
         bridge_config.send_envelope = send_runtime_envelope;
         bridge_config.send_envelope_opaque = &memory_network;
-        if (wvm_executor_bridge_start(&bridge_config,
-                                      &executor_dispatch_opaque, NULL) != 0) {
-            fprintf(stderr, "[node-runtime] cannot start executor ABI bridge\n");
+        if (wvm_executor_bridge_dispatch_init(
+                &bridge_config, &executor_dispatch_opaque, error,
+                sizeof(error)) != 0) {
+            fprintf(stderr, "[node-runtime] cannot initialize executor bridge: %s\n",
+                    error[0] ? error : "invalid typed executor boundary");
             destroy_memory_network_context(&memory_network);
             wvm_runtime_manifest_storage_free(&storage);
             wvm_runtime_dispatch_storage_free(&dispatch_storage);
@@ -1093,11 +1033,10 @@ int main(int argc, char **argv)
         }
     }
 
-    master_launch.argc = legacy_arguments.master_argc;
-    master_launch.argv = legacy_arguments.master_argv;
-    if (pthread_create(&master_thread, NULL, run_master_role,
-                       &master_launch) != 0) {
-        perror("[node-runtime] cannot start node-runtime coordinator role");
+    executor_launch.runtime = &runtime_context;
+    if (pthread_create(&executor_thread, NULL, run_executor_role,
+                       &executor_launch) != 0) {
+        perror("[node-runtime] cannot start local executor role");
         wvm_vcpu_service_global_uninstall(&vcpu_service);
         wvm_vcpu_service_destroy(&vcpu_service);
         wvm_memory_service_global_uninstall(&memory_service);
@@ -1112,13 +1051,50 @@ int main(int argc, char **argv)
     }
 
     /*
-     * The executor role runs in this thread because its existing main owns
-     * the KVM/TCG worker lifecycle. The master thread remains independent and
-     * continues to service QEMU/fabric traffic concurrently.
+     * The executor must publish a usable local listener before the semantic
+     * coordinator can accept a vCPU handoff. This is a lifecycle gate, not a
+     * timing workaround: failure is reported by the executor startup state.
      */
-    (void)wavevm_slave_main(legacy_arguments.executor_argc,
-                            legacy_arguments.executor_argv);
+    if (wvm_executor_runtime_wait_ready() != 0) {
+        fprintf(stderr,
+                "[node-runtime] local executor did not reach ready state\n");
+        g_shutdown_requested = 1;
+        pthread_join(executor_thread, &executor_result);
+        wvm_vcpu_service_global_uninstall(&vcpu_service);
+        wvm_vcpu_service_destroy(&vcpu_service);
+        wvm_memory_service_global_uninstall(&memory_service);
+        wvm_memory_service_destroy(&memory_service);
+        wvm_vcpu_handoff_coordinator_destroy(&vcpu_coordinator);
+        wvm_executor_bridge_dispatch_destroy(executor_dispatch_opaque);
+        destroy_memory_network_context(&memory_network);
+        wvm_runtime_manifest_storage_free(&storage);
+        wvm_runtime_dispatch_storage_free(&dispatch_storage);
+        wvm_route_runtime_destroy(&route_runtime);
+        return 1;
+    }
+
+    master_launch.runtime = &runtime_context;
+    if (pthread_create(&master_thread, NULL, run_master_role,
+                       &master_launch) != 0) {
+        perror("[node-runtime] cannot start node-runtime coordinator role");
+        g_shutdown_requested = 1;
+        pthread_join(executor_thread, &executor_result);
+        wvm_vcpu_service_global_uninstall(&vcpu_service);
+        wvm_vcpu_service_destroy(&vcpu_service);
+        wvm_memory_service_global_uninstall(&memory_service);
+        wvm_memory_service_destroy(&memory_service);
+        wvm_vcpu_handoff_coordinator_destroy(&vcpu_coordinator);
+        wvm_executor_bridge_dispatch_destroy(executor_dispatch_opaque);
+        destroy_memory_network_context(&memory_network);
+        wvm_runtime_manifest_storage_free(&storage);
+        wvm_runtime_dispatch_storage_free(&dispatch_storage);
+        wvm_route_runtime_destroy(&route_runtime);
+        return 1;
+    }
+
     pthread_join(master_thread, &master_result);
+    g_shutdown_requested = 1;
+    pthread_join(executor_thread, &executor_result);
     wvm_vcpu_service_global_uninstall(&vcpu_service);
     wvm_vcpu_service_destroy(&vcpu_service);
     wvm_memory_service_global_uninstall(&memory_service);

@@ -19,6 +19,49 @@ Mode A = Mode B baseline + optional kernel data-plane acceleration.
 
 This eliminates the long-term maintenance cost of two semantic paths while preserving the performance upside of kernel help.
 
+## 1.1 Delivery Profiles
+
+The roadmap has two delivery profiles. They share the same semantic contracts;
+the second profile adds operational hardening rather than changing what a VM
+means.
+
+### Minimum usable system
+
+The first usable release must provide:
+
+- a manifest-bound distributed VM with isolated VM identity, routes, sockets,
+  shared memory, ports, logs, and temporary files;
+- flat and fractal routing with the same VM namespace rules;
+- correct TCG and KVM execution against the same memory and vCPU contracts;
+- multiple Mode B VMs on one physical host;
+- explicit per-VM kernel accelerator contexts, including two-VM isolation tests
+  before Mode A is advertised for multi-VM hosts;
+- basic membership operations: node/gateway join, compute cordon, safe drain,
+  and gateway replacement through an acknowledged route snapshot;
+- create, activate, start, stop, and partial-start cleanup with bounded
+  failure reporting;
+- guest readiness plus evidence of remote vCPU and remote memory activity in
+  the end-to-end smoke tests.
+
+The minimum usable system does not provide live migration, automatic resource
+replanning, coordinator high availability, transparent recovery of lost
+compute state, or automatic repair without a verified replacement path.
+
+### Extended hardening
+
+After the minimum usable system is stable, the project may add coordinator
+recovery matrices, automatic migration or resharding, UFFD and other pluggable
+fault engines, deterministic network/lifecycle fault injection, and broad
+failure/recovery CI. These improve operational resilience but are not required
+to establish that the distributed VM itself works.
+
+The minimum profile deliberately assumes one active coordinator and bounded
+single-scope control operations. It must fail closed when that coordinator or a
+required member disappears; it does not need transparent recovery, aggregate
+multi-VM host transactions, or live reconfiguration of a running VM. Those
+limits are operational boundaries, not permission to skip identity validation,
+resource cleanup, route acknowledgements, or VM isolation.
+
 ## 2. Current Pain Points
 
 ### 2.1 Duplicated Semantic State
@@ -82,7 +125,9 @@ limit. A route update is therefore not yet a cluster membership operation.
 
 ## 3. Refactor Principles
 
-- Preserve working behavior before deleting old paths.
+- Preserve semantic behavior while replacing old paths; no old deployment or
+  wire path is retained solely for compatibility because there is no in-flight
+  business deployment to protect.
 - Keep Mode B as the correctness baseline.
 - Never make a performance optimization define correctness.
 - Treat current master and slave names as logical roles, not a mandatory
@@ -95,7 +140,9 @@ limit. A route update is therefore not yet a cluster membership operation.
   explicitly specified as backpressure or failure handling, and cannot change
   the success semantics of the normal path.
 - Introduce capability probing before behavior switching.
-- Add compatibility shims while migrating.
+- Replace legacy launch, route-injection, and local IPC paths with the typed
+  manifest/runtime path; a temporary source adapter is acceptable only inside
+  the same binary while its deletion is part of the current phase.
 - Avoid broad rewrites of KVM and TCG at the same time.
 - Keep every phase testable with small smoke tests.
 - Do not hide failures behind test-only production parameters.
@@ -137,12 +184,12 @@ Actions:
 - Adopt `docs/wavevm-architecture-baseline.md` as the guiding design document.
 - Mark Mode B as canonical in contributor notes.
 - Mark Mode A as optional accelerator, not separate semantic mode.
-- Mark the node runtime as the per-VM local semantic and cross-node endpoint;
-  mark the current master/slave process split as a compatibility implementation
-  rather than a permanent architecture requirement.
-- Freeze `NODE`/`ROUTE` files and gateway route-add packets as compatibility
-  bootstrap mechanisms. New membership or topology behavior must wait for the
-  accepted membership and route-snapshot specifications.
+- Make the node runtime the per-VM local semantic and cross-node endpoint;
+  remove the current master/slave process split rather than preserving it as a
+  deployment compatibility layer.
+- Remove `NODE`/`ROUTE` files, gateway route-add packets, legacy launch flags,
+  and field-by-field IOCTL injection from production inputs. Test fixtures may
+  render topology records, but they must not become a second runtime authority.
 - Stop adding new topology, VM lifecycle, or resource planning truth to `kernel_backend.c`.
 - Stop adding hardcoded test workarounds to production code.
 
@@ -206,8 +253,8 @@ The memory, vCPU, and local IPC specifications must jointly define the
 node-runtime to local-executor ABI: identity/incarnation, manifest and route
 generation, request and completion identity, handoff ordering, cancellation,
 backpressure, error mapping, and process-failure behavior. The current
-master-to-slave messages remain compatibility traffic until that ABI is
-accepted.
+  master-to-slave messages are implementation debt to be replaced by the typed
+  node-runtime/executor ABI; they are not a supported deployment interface.
 
 The storage/device specification must define QEMU-host device authority,
 MMIO/PIO return paths, block request ordering, flush/FUA semantics, write
@@ -364,9 +411,9 @@ Acceptance criteria:
   required route-snapshot acknowledgements complete.
 - A requested removal is rejected if it would withdraw active VM resources or
   a gateway's sole route without an accepted migration or replacement policy.
-- A coordinator crash at every create/activation/abort boundary converges to
+- **Extended:** A coordinator crash at every create/activation/abort boundary converges to
   one committed VM or full cleanup; no candidate is orphaned.
-- A cordon, gateway drain, health exclusion, capability change, or node-instance
+- **Extended:** A cordon, gateway drain, health exclusion, capability change, or node-instance
   change cannot activate a candidate captured before that change.
 
 Risk:
@@ -390,13 +437,14 @@ Actions:
   CPU/memory dispatch.
 - Require the node runtime to consume and validate its admitted identity and plan; it
   must not independently re-plan the VM or allocate another identity.
-- Introduce the specified local executor interface beneath the node runtime.
-  Keep `slave_daemon` behind a compatibility adapter until KVM and TCG have
-  equivalent contract tests; do not merge or delete processes as part of this
-  phase.
+- Move KVM and TCG execution behind the typed local executor interface and
+  delete the independent `slave_daemon` process entry point. The executor may
+  remain as an internal implementation module or helper QEMU process, but it
+  has no direct cross-node or legacy IPC endpoint.
 - Make kernel and gateway state derived, versioned cache/configuration.
-- Keep existing ioctls as compatibility shims where practical, but define them
-  as accelerator cache refreshes rather than truth injection.
+- Replace field-by-field IOCTL and environment injection with one
+  manifest-bound accelerator context. Unsupported legacy setters must fail or
+  be removed; they are not a second configuration authority.
 - Reject missing, stale, or incompatible derived state explicitly.
 - Route each semantic operation through the contract from Phase 2 regardless
   of KVM/TCG or kernel acceleration.
@@ -454,8 +502,9 @@ Actions:
 - Pass one consistent identity and runtime object to QEMU, node runtime, local
   executor, and gateway on each participating node.
 - Derive all exclusive names from the manifest.
-- Keep compatibility readers for current NODE/VM configuration during a
-  bounded migration period.
+- Do not add compatibility readers for current NODE/VM configuration. Launch
+  requires the admitted manifest, route snapshot, dispatch projection, and
+  capability profile.
 
 Acceptance criteria:
 
@@ -466,8 +515,8 @@ Acceptance criteria:
 
 Risk:
 
-- Existing launch scripts may bypass the runtime object unless compatibility
-  entry points fail closed when required identity is absent.
+- Any launch entry point that lacks the runtime object must fail closed or be
+  deleted; it must not synthesize identity from positional arguments.
 
 ## 11. Phase 7: Implement Placement, Admission, and Member Lifecycle
 
@@ -500,25 +549,30 @@ Actions:
   alternative exists.
 - Persist the exact survivor RequiredAckSet for every route transaction. A
   departing or failed gateway is optional drain evidence, never a required ACK.
-- Treat co-located compute/gateway roles as one host-removal/failure-domain
+- **Extended:** Treat co-located compute/gateway roles as one host-removal/failure-domain
   transaction while retaining role-local state for independent process faults.
 
 Acceptance criteria:
 
-- Four concurrent VM creations cannot double-allocate CPU, memory, ports, SHM,
+- **Minimum usable:** Four concurrent VM creations cannot double-allocate CPU, memory, ports, SHM,
   or host overhead.
-- Failure at every startup step releases exactly the resources created before
+- **Minimum usable:** Failure during each normal startup step releases exactly the resources created before
   that step.
-- The request origin does not implicitly become QEMU host.
-- A node loss follows the documented V1 stop/pause policy and never leaves the
+- **Minimum usable:** The request origin does not implicitly become QEMU host.
+- **Minimum usable:** A node loss follows the documented stop/pause policy and never leaves the
   VM falsely reported as running.
-- Adding a member does not alter an existing VM manifest or placement.
-- Draining a busy compute member and removing a sole gateway both fail without
+- **Minimum usable:** Adding a member does not alter an existing VM manifest or placement.
+- **Minimum usable:** Draining a busy compute member and removing a sole gateway both fail without
   producing a route black hole.
-- A route snapshot can be replaced while traffic is active without a packet
+- **Minimum usable:** A route snapshot can be replaced while traffic is active without a packet
   observing a partial route table or crossing VM namespaces.
-- Lost vCPU/block/memory results during G -> G+1 preserve one semantic
+- **Minimum usable:** Lost vCPU/block/memory results during a route-generation change preserve one semantic
   operation identity across result query/reroute.
+
+Extended acceptance adds coordinator restart at every lifecycle boundary,
+multi-scope host-role transactions, automatic degraded-state recovery, and
+full failure-injection coverage. Those tests must not block the first usable
+release once the minimum usable criteria above pass.
 
 Risk:
 
@@ -528,6 +582,10 @@ Risk:
 ## 12. Phase 8: Refactor Kernel Accelerator Contexts
 
 Purpose: make Mode A multi-VM-safe without restoring a second control plane.
+
+This phase is a minimum usable release gate, not optional hardening. Mode A may
+remain disabled on hosts that lack the capability, but a host that advertises
+Mode A for multiple VMs must provide independent contexts and teardown.
 
 Short-term gate:
 
@@ -563,6 +621,11 @@ Risk:
 Purpose: improve fault handling without making UFFD, root, or a custom kernel a
 baseline dependency.
 
+This phase is extended hardening after the minimum usable system. The first
+usable release still requires one correct no-root fallback and one correct KVM
+dirty/resync path, but does not require every fault mechanism to be a fully
+pluggable production engine.
+
 Actions:
 
 - Implement the `fault_engine_ops` contract from Phase 4 for
@@ -591,40 +654,40 @@ Purpose: make tests exercise architecture rather than handcrafted scripts.
 
 Actions:
 
-- Generate test manifests for:
-  - flat TCG Mode B/B
-  - fractal TCG Mode B/B
-  - flat KVM Mode B/B
-  - fractal KVM Mode B/B
-  - KVM with kernel accelerator on one node only
-  - mixed accelerator/no-accelerator cluster
-  - multi-VM same physical node Mode B
-- Use bounded logs.
-- Record capability matrix at test start.
-- Validate resource plan against actual QEMU args.
-- Validate remote vCPU and remote memory evidence.
-- Add deterministic network fault injection for loss, duplication, reordering,
-  delay, and route-generation replacement.
-- Add lifecycle fault injection for QEMU, node runtime, local executor, and
-  gateway failure at startup and at runtime.
-- Test compute-node join, cordon, drain, busy-node removal rejection, gateway
-  join, gateway drain with an alternate path, sole-gateway removal rejection,
-  gateway failure, and route-snapshot rollback/retirement.
-- Verify duplicate `VCPU_RUN`, dirty version gaps, force sync, block flush/error
-  propagation, VM ID reuse protection, and same-host multi-VM isolation.
-- Record the manifest, protocol version, capability matrix, process list, bounded
-  tail logs, and cleanup result for every run.
+- **Minimum usable smoke matrix:** generate bounded manifests for flat and
+  fractal TCG, flat and fractal KVM, one-node kernel acceleration, and two
+  Mode B VMs on one physical host; after Phase 8, include two Mode A VMs on
+  one physical host to prove context isolation.
+- **Minimum usable evidence:** record the capability report, manifest digest,
+  actual QEMU resource arguments, guest readiness, remote vCPU/memory evidence,
+  and cleanup result.
+- **Extended matrix:**
+  - mixed accelerator/no-accelerator clusters;
+  - deterministic network fault injection for loss, duplication, reordering,
+    delay, and route-generation replacement;
+  - lifecycle fault injection for QEMU, node runtime, local executor, and
+    gateway failure at startup and at runtime;
+  - coordinator restart, route rollback/retirement races, and broad engine
+    equivalence tests;
+  - duplicate `VCPU_RUN`, dirty version gaps, force sync, block flush/error
+    propagation, VM ID reuse protection, and same-host multi-VM isolation;
+  - bounded process lists, protocol records, tail logs, and cleanup evidence
+    for every extended run.
 
 Acceptance criteria:
 
-- CI can tell whether a failure is capability, launch, routing, memory, CPU state, or guest boot.
-- Logs do not fill disk.
-- Tests do not require hidden production workarounds.
-- Success requires guest login or SSH plus evidence that remote vCPU and remote
+- **Minimum usable:** CI can tell whether a failure is capability, launch,
+  routing, memory, CPU state, or guest boot.
+- **Minimum usable:** Logs do not fill disk.
+- **Minimum usable:** Tests do not require hidden production workarounds.
+- **Minimum usable:** Success requires guest login or SSH plus evidence that remote vCPU and remote
   memory paths were exercised. Process survival or a listening port alone is
   not a success oracle.
-- Every test has a fixed timeout and leaves no process, SHM object, route, or
+- **Minimum usable:** Every smoke test has a fixed timeout and leaves no process, SHM object, route, or
   unbounded artifact behind.
+- **Extended:** Network and lifecycle fault injection, exhaustive crash
+  matrices, rollback/retirement races, and broad engine-equivalence coverage
+  are required before claiming operational hardening.
 
 Risk:
 
@@ -643,9 +706,11 @@ Use one dependency order:
 5. Establish the control-plane and per-VM node-runtime user-space authorities,
    including the local executor ABI.
 6. Implement Mode B multi-instance isolation and explicit placement/lifecycle.
-7. Regress KVM and finish TCG against the same semantic contracts.
-8. Refactor kernel accelerator contexts and implement fault engines.
-9. Expand CI into deterministic contract and failure testing.
+7. Implement the minimum usable node/gateway membership operations.
+8. Refactor kernel accelerator contexts and prove two-VM Mode A isolation.
+9. Regress KVM and finish TCG against the same semantic contracts, then run the
+   minimum usable flat/fractal smoke matrix.
+10. Add fault-engine plugins and extended deterministic failure testing.
 ```
 
 During specification phases, narrowly scoped fixes may continue when they
@@ -716,6 +781,8 @@ Converge on Mode B canonical semantics and make Mode A an accelerator.
 
 This keeps the project useful in restricted environments while preserving a path to high-performance KVM deployments.
 
-The immediate work is documentation and inventory through Phase 4. Large
-runtime changes begin with Phase 5 only after the semantic and ABI dependencies
-they rely on have passed the specification gate.
+The immediate implementation target is the minimum usable profile: complete
+the user-space authorities, Mode B isolation, basic membership lifecycle, and
+per-VM Mode A contexts before treating the project as usable. Extended
+fault-engine and failure-injection work follows that gate and must not be used
+to postpone the basic distributed VM path.

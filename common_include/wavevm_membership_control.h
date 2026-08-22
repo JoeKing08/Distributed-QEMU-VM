@@ -54,6 +54,22 @@ struct wvm_membership_control_operation {
     struct wvm_membership_control_result result;
 };
 
+typedef int (*wvm_membership_control_result_sink_fn)(
+    void *context, const struct wvm_envelope *request,
+    const struct wvm_membership_control_result *result, char *error,
+    size_t error_len);
+
+/*
+ * Adapter state for the authenticated ingress boundary. The sink owns the
+ * transport-specific response path; this layer only applies the durable
+ * operation and hands it the typed result.
+ */
+struct wvm_membership_control_dispatch_context {
+    struct wvm_membership_control *control;
+    wvm_membership_control_result_sink_fn result_sink;
+    void *result_sink_context;
+};
+
 enum wvm_membership_control_membership_action {
     WVM_MEMBERSHIP_CONTROL_MEMBERSHIP_ACTION_CORDON = 1,
 };
@@ -149,6 +165,12 @@ int wvm_membership_control_apply(
     const struct wvm_envelope *request,
     const struct wvm_member_key *authenticated_actor,
     struct wvm_membership_control_result *result_out, char *error,
+    size_t error_len);
+
+/* Signature-compatible with wvm_ingress_control_dispatch_fn. */
+int wvm_membership_control_dispatch(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor, char *error,
     size_t error_len);
 
 #endif /* WAVEVM_MEMBERSHIP_CONTROL_H */

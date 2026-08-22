@@ -2,23 +2,15 @@
 
 #include "executor_bridge.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "../common_include/wavevm_executor_abi.h"
 #include "kvm_page_cache.h"
-#include "../common_include/wavevm_protocol.h"
 #include "../common_include/wavevm_vcpu_handoff_cache.h"
 #include "../common_include/wavevm_vcpu_handoff.h"
 #include "../common_include/wavevm_x86_context.h"
@@ -26,21 +18,15 @@
 struct bridge_state {
     struct wvm_executor_bridge_config config;
     struct wvm_vcpu_handoff_cache handoff_cache;
-    char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     pthread_mutex_t task_lock;
     pthread_cond_t task_available;
     pthread_t task_worker;
-    pthread_t server_thread;
     struct bridge_task *tasks;
     size_t task_capacity;
     size_t task_head;
     size_t task_count;
-    uint64_t next_legacy_request_id;
-    uint64_t next_completed_memory_fence_id;
-    int server_fd;
     int stopping;
     int task_worker_started;
-    int server_thread_started;
 };
 
 struct bridge_task {
@@ -107,7 +93,7 @@ static int config_is_admitted(const struct wvm_executor_bridge_config *config,
 {
     if (!config || !config->manifest || !config->runtime_gate ||
         !config->dispatch || !config->route_runtime ||
-        !config->send_envelope ||
+        !config->execute_handoff || !config->send_envelope ||
         config->operation_retention_horizon_ms == 0 ||
         config->runtime_gate->state != WVM_RUNTIME_GATE_ACTIVE ||
         config->runtime_gate->manifest != config->manifest ||
@@ -266,247 +252,14 @@ static int cache_terminal_and_send(
                              error_len);
 }
 
-static int bridge_stopping(struct bridge_state *state)
-{
-    int stopping;
-
-    pthread_mutex_lock(&state->task_lock);
-    stopping = state->stopping;
-    pthread_mutex_unlock(&state->task_lock);
-    return stopping;
-}
-
-static uint64_t next_nonzero_id(uint64_t *counter)
-{
-    uint64_t value;
-
-    value = ++*counter;
-    if (value == 0) {
-        value = ++*counter;
-    }
-    return value;
-}
-
-static int legacy_executor_id(const struct bridge_state *state,
-                              uint32_t *identifier)
-{
-    const struct wvm_node_runtime_manifest *manifest;
-    uint32_t vnode;
-
-    if (!state || !identifier) {
-        return -EINVAL;
-    }
-    manifest = state->config.manifest;
-    vnode = state->config.dispatch->local_primary.destination_vnode;
-    if (manifest->vm_id > UINT8_MAX || vnode > WVM_NODEID_MASK) {
-        return -ERANGE;
-    }
-    *identifier = WVM_ENCODE_ID(manifest->vm_id, vnode);
-    return 0;
-}
-
-static uint16_t exit_class_from_tcg_ack(const wvm_tcg_context_t *context)
-{
-    if (context->halted) {
-        return WVM_VCPU_EXIT_HALTED;
-    }
-    if (context->interrupt_request != 0) {
-        return WVM_VCPU_EXIT_INTERRUPT;
-    }
-    /*
-     * The TCG helper ends a remote slice with its host-side preemption kick
-     * unless the guest reports a more specific terminal condition above.
-     */
-    return WVM_VCPU_EXIT_BUDGET;
-}
-
-static int build_legacy_cpu_run(
-    struct bridge_state *state,
-    const struct wvm_vcpu_handoff_request *request,
-    struct wvm_header *header, struct wvm_ipc_cpu_run_req *legacy,
-    uint64_t *request_id, char *error, size_t error_len)
-{
-    uint32_t local_id;
-    size_t legacy_bytes;
-    void *legacy_context;
-    uint64_t context_fields = 0;
-
-    if (!state || !request || !header || !legacy || !request_id ||
-        (request->backend != WVM_VCPU_BACKEND_TCG &&
-         request->backend != WVM_VCPU_BACKEND_KVM) ||
-        legacy_executor_id(state, &local_id) != 0) {
-        set_error(error, error_len,
-                  "typed vCPU handoff cannot address the legacy executor");
-        return -EINVAL;
-    }
-    memset(legacy, 0, sizeof(*legacy));
-    legacy->mode_tcg = request->backend == WVM_VCPU_BACKEND_TCG;
-    legacy->slave_id = WVM_NODE_AUTO_ROUTE;
-    legacy->vcpu_index = request->vcpu_index;
-    legacy_bytes = wvm_x86_context_legacy_bytes(request->backend);
-    legacy_context = request->backend == WVM_VCPU_BACKEND_TCG
-                         ? (void *)&legacy->ctx.tcg
-                         : (void *)&legacy->ctx.kvm;
-    if (legacy_bytes == 0 ||
-        wvm_x86_context_decode(
-            request->backend, request->context, request->context_bytes,
-            &context_fields, legacy_context, legacy_bytes, error,
-            error_len) != 0 ||
-        context_fields != request->context_valid_fields) {
-        if (!error || error[0] == '\0') {
-            set_error(error, error_len,
-                      "typed vCPU context cannot populate legacy executor ABI");
-        }
-        return -EPROTO;
-    }
-
-    *request_id = next_nonzero_id(&state->next_legacy_request_id);
-    memset(header, 0, sizeof(*header));
-    header->magic = htonl(WVM_MAGIC);
-    header->msg_type = htons(MSG_VCPU_RUN);
-    header->payload_len = htons(sizeof(*legacy));
-    header->slave_id = htonl(local_id);
-    header->target_id = htonl(local_id);
-    header->req_id = WVM_HTONLL(*request_id);
-    header->mode_tcg = 1;
-    return 0;
-}
-
-static int receive_legacy_cpu_exit(
-    struct bridge_state *state, const struct wvm_header *request_header,
-    const struct wvm_ipc_cpu_run_req *legacy_request,
-    struct wvm_ipc_cpu_run_ack *ack, char *error, size_t error_len)
-{
-    struct sockaddr_in executor_address;
-    struct pollfd pollfd;
-    uint8_t request_packet[sizeof(*request_header) + sizeof(*legacy_request)];
-    uint8_t response[sizeof(struct wvm_header) +
-                     sizeof(struct wvm_ipc_cpu_run_ack)];
-    ssize_t sent;
-    int fd;
-
-    if (!state || !request_header || !legacy_request || !ack ||
-        state->config.executor_service_port == 0) {
-        set_error(error, error_len, "legacy executor endpoint is unavailable");
-        return -ENOTCONN;
-    }
-    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
-        set_error(error, error_len, "cannot open local executor socket: %s",
-                  strerror(errno));
-        return -errno;
-    }
-    memset(&executor_address, 0, sizeof(executor_address));
-    executor_address.sin_family = AF_INET;
-    executor_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    executor_address.sin_port = htons(state->config.executor_service_port);
-    if (connect(fd, (const struct sockaddr *)&executor_address,
-                sizeof(executor_address)) != 0) {
-        int result = -errno;
-
-        close(fd);
-        set_error(error, error_len, "cannot connect local executor socket");
-        return result;
-    }
-    memcpy(request_packet, request_header, sizeof(*request_header));
-    memcpy(request_packet + sizeof(*request_header), legacy_request,
-           sizeof(*legacy_request));
-    sent = send(fd, request_packet, sizeof(request_packet), MSG_NOSIGNAL);
-    if (sent != (ssize_t)sizeof(request_packet)) {
-        int result = sent < 0 ? -errno : -EIO;
-
-        close(fd);
-        set_error(error, error_len, "cannot submit local executor request");
-        return result;
-    }
-
-    /*
-     * This is intentionally not an execution timeout. It only gives shutdown
-     * a chance to stop the worker; the executor itself owns slice duration.
-     */
-    pollfd.fd = fd;
-    pollfd.events = POLLIN;
-    for (;;) {
-        ssize_t received;
-        const struct wvm_header *response_header;
-
-        if (bridge_stopping(state)) {
-            close(fd);
-            return -ESHUTDOWN;
-        }
-        if (poll(&pollfd, 1, 100) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            close(fd);
-            return -errno;
-        }
-        if ((pollfd.revents & POLLIN) == 0) {
-            continue;
-        }
-        received = recv(fd, response, sizeof(response), 0);
-        if (received != (ssize_t)sizeof(response)) {
-            continue;
-        }
-        response_header = (const struct wvm_header *)response;
-        if (ntohl(response_header->magic) != WVM_MAGIC ||
-            ntohs(response_header->msg_type) != MSG_VCPU_EXIT ||
-            ntohs(response_header->payload_len) != sizeof(*ack) ||
-            WVM_NTOHLL(response_header->req_id) !=
-                WVM_NTOHLL(request_header->req_id) ||
-            response_header->slave_id != request_header->target_id ||
-            response_header->target_id != request_header->slave_id) {
-            continue;
-        }
-        memcpy(ack, response + sizeof(*response_header), sizeof(*ack));
-        close(fd);
-        if (ack->mode_tcg != legacy_request->mode_tcg) {
-            set_error(error, error_len,
-                      "legacy executor exit returned another backend");
-            return -EPROTO;
-        }
-        return 0;
-    }
-}
-
-static uint16_t exit_class_from_legacy_ack(
-    const struct wvm_vcpu_handoff_request *request,
-    const struct wvm_ipc_cpu_run_ack *ack)
-{
-    uint32_t exit_reason;
-
-    if (request->backend == WVM_VCPU_BACKEND_TCG) {
-        return exit_class_from_tcg_ack(&ack->ctx.tcg);
-    }
-    exit_reason = ack->ctx.kvm.exit_reason;
-    if (exit_reason == KVM_EXIT_HLT) {
-        return WVM_VCPU_EXIT_HALTED;
-    }
-    if (exit_reason == KVM_EXIT_IO) {
-        return WVM_VCPU_EXIT_PIO;
-    }
-    if (exit_reason == KVM_EXIT_MMIO) {
-        return WVM_VCPU_EXIT_MMIO;
-    }
-    if (exit_reason == WVM_EXIT_PREEMPT) {
-        return WVM_VCPU_EXIT_BUDGET;
-    }
-    return WVM_VCPU_EXIT_BUDGET;
-}
-
 static int execute_typed_task(struct bridge_state *state,
                               const struct bridge_task *task, char *error,
                               size_t error_len)
 {
     struct wvm_vcpu_handoff_request request;
     struct wvm_vcpu_handoff_result result;
-    struct wvm_header legacy_header;
-    struct wvm_ipc_cpu_run_req legacy_request;
-    struct wvm_ipc_cpu_run_ack legacy_ack;
-    uint8_t encoded_context[WVM_X86_CONTEXT_WIRE_HEADER_BYTES +
-                            sizeof(wvm_tcg_context_t)];
-    uint64_t request_id;
-    size_t encoded_context_bytes = 0;
+    uint8_t result_context[WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES];
+    int execute_result;
 
     if (!state || !task ||
         wvm_vcpu_handoff_request_decode(
@@ -523,44 +276,18 @@ static int execute_typed_task(struct bridge_state *state,
                                        &result, error, error_len);
     }
 
-    if (build_legacy_cpu_run(state, &request, &legacy_header, &legacy_request,
-                             &request_id, error, error_len) != 0 ||
-        receive_legacy_cpu_exit(state, &legacy_header, &legacy_request,
-                                 &legacy_ack, error, error_len) != 0) {
+    memset(&result, 0, sizeof(result));
+    execute_result = state->config.execute_handoff(
+        state->config.execute_handoff_opaque, &request, &result,
+        result_context, sizeof(result_context), error, error_len);
+    if (execute_result != 0 ||
+        wvm_vcpu_handoff_result_validate_request(&request, &result, error,
+                                                  error_len) != 0) {
         handoff_result_from_request(
             &request, WVM_VCPU_HANDOFF_RESULT_EXECUTOR_FAILURE, &result);
         return cache_terminal_and_send(state, &task->envelope, &request,
                                        &result, error, error_len);
     }
-    if (legacy_ack.status == WVM_CPU_RUN_STATUS_MEMORY_FAILURE) {
-        handoff_result_from_request(
-            &request, WVM_VCPU_HANDOFF_RESULT_MEMORY_FAILURE, &result);
-        return cache_terminal_and_send(state, &task->envelope, &request,
-                                       &result, error, error_len);
-    }
-    if (legacy_ack.status != 0 ||
-        wvm_x86_context_encode(
-            request.backend, request.context_valid_fields,
-            request.backend == WVM_VCPU_BACKEND_TCG
-                ? (const void *)&legacy_ack.ctx.tcg
-                : (const void *)&legacy_ack.ctx.kvm,
-            wvm_x86_context_legacy_bytes(request.backend), encoded_context,
-            sizeof(encoded_context), &encoded_context_bytes, error,
-            error_len) != 0) {
-        handoff_result_from_request(
-            &request, WVM_VCPU_HANDOFF_RESULT_EXECUTOR_FAILURE, &result);
-        return cache_terminal_and_send(state, &task->envelope, &request,
-                                       &result, error, error_len);
-    }
-
-    handoff_result_from_request(&request, WVM_VCPU_HANDOFF_RESULT_SUCCESS,
-                                &result);
-    result.exit_class = exit_class_from_legacy_ack(&request, &legacy_ack);
-    result.produced_memory_fence_id =
-        next_nonzero_id(&state->next_completed_memory_fence_id);
-    result.context_valid_fields = request.context_valid_fields;
-    result.context = encoded_context;
-    result.context_bytes = encoded_context_bytes;
     return cache_terminal_and_send(state, &task->envelope, &request, &result,
                                    error, error_len);
 }
@@ -815,21 +542,8 @@ int wvm_executor_bridge_dispatch_init(
         return -ENOMEM;
     }
     state->config = *config;
-    state->server_fd = -1;
     state->task_capacity =
         config->manifest->launch_plan.vcpu_handoff_record_capacity;
-    state->next_legacy_request_id = monotonic_milliseconds();
-    state->next_completed_memory_fence_id = monotonic_milliseconds();
-    if (state->next_legacy_request_id == 0) {
-        state->next_legacy_request_id = 1;
-    }
-    if (state->next_completed_memory_fence_id == 0) {
-        state->next_completed_memory_fence_id = 1;
-    }
-    if (config->socket_path) {
-        snprintf(state->socket_path, sizeof(state->socket_path), "%s",
-                 config->socket_path);
-    }
     state->tasks = calloc(state->task_capacity, sizeof(*state->tasks));
     if (!state->tasks) {
         initialization_result = -ENOMEM;
@@ -888,7 +602,6 @@ fail:
 void wvm_executor_bridge_dispatch_destroy(void *dispatch_opaque)
 {
     struct bridge_state *state = dispatch_opaque;
-    int server_fd;
     size_t i;
 
     if (!state) {
@@ -896,16 +609,8 @@ void wvm_executor_bridge_dispatch_destroy(void *dispatch_opaque)
     }
     pthread_mutex_lock(&state->task_lock);
     state->stopping = 1;
-    server_fd = state->server_fd;
-    state->server_fd = -1;
     pthread_cond_broadcast(&state->task_available);
     pthread_mutex_unlock(&state->task_lock);
-    if (server_fd >= 0) {
-        close(server_fd);
-    }
-    if (state->server_thread_started) {
-        pthread_join(state->server_thread, NULL);
-    }
     if (state->task_worker_started) {
         pthread_join(state->task_worker, NULL);
     }
@@ -917,111 +622,6 @@ void wvm_executor_bridge_dispatch_destroy(void *dispatch_opaque)
     pthread_mutex_destroy(&state->task_lock);
     free(state->tasks);
     free(state);
-}
-
-static int send_result(int fd, const struct wvm_executor_abi_frame *request,
-                       uint16_t status)
-{
-    struct wvm_executor_abi_frame result;
-    uint8_t encoded[WVM_EXECUTOR_ABI_HEADER_BYTES];
-    size_t encoded_bytes;
-    char error[128] = {0};
-
-    memset(&result, 0, sizeof(result));
-    result.identity = request->identity;
-    result.message_type = WVM_EXECUTOR_ABI_RESULT;
-    result.status = status;
-    if (wvm_executor_abi_encode(&result, encoded, sizeof(encoded),
-                                &encoded_bytes, error, sizeof(error)) != 0) {
-        return -1;
-    }
-    return send(fd, encoded, encoded_bytes, MSG_NOSIGNAL) ==
-                   (ssize_t)encoded_bytes
-               ? 0
-               : -1;
-}
-
-static int forward_cpu_run(const struct bridge_state *state,
-                           const struct wvm_executor_abi_frame *request)
-{
-    const struct wvm_header *header;
-    struct sockaddr_in executor_addr;
-    struct sockaddr_in response_addr;
-    struct pollfd pollfd;
-    uint8_t response[WVM_MAX_PACKET_SIZE];
-    socklen_t response_len = sizeof(response_addr);
-    ssize_t sent;
-    ssize_t received;
-    int sock;
-
-    if (!state || !request || request->payload_bytes < sizeof(*header)) {
-        return -EINVAL;
-    }
-    header = (const struct wvm_header *)request->payload;
-    if (ntohl(header->magic) != WVM_MAGIC ||
-        ntohs(header->msg_type) != MSG_VCPU_RUN ||
-        ntohs(header->payload_len) !=
-            request->payload_bytes - sizeof(struct wvm_header)) {
-        return -EPROTO;
-    }
-
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        return -errno;
-    }
-    memset(&executor_addr, 0, sizeof(executor_addr));
-    executor_addr.sin_family = AF_INET;
-    executor_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    executor_addr.sin_port = htons(state->config.executor_service_port);
-    sent = sendto(sock, request->payload, request->payload_bytes, MSG_NOSIGNAL,
-                  (struct sockaddr *)&executor_addr, sizeof(executor_addr));
-    if (sent != (ssize_t)request->payload_bytes) {
-        int result = errno ? -errno : -EIO;
-        close(sock);
-        return result;
-    }
-
-    pollfd.fd = sock;
-    pollfd.events = POLLIN;
-    /*
-     * This is a transport bridge, not a vCPU semantic timeout.  The bridge
-     * waits for the executor result; the executor owns the execution
-     * interval and the caller owns any higher-level lifecycle deadline.
-     */
-    if (poll(&pollfd, 1, -1) <= 0) {
-        int result = errno ? -errno : -EIO;
-        close(sock);
-        return result;
-    }
-    received = recvfrom(sock, response, sizeof(response), 0,
-                        (struct sockaddr *)&response_addr, &response_len);
-    close(sock);
-    if (received < (ssize_t)sizeof(struct wvm_header)) {
-        return -EPROTO;
-    }
-    header = (const struct wvm_header *)response;
-    if (ntohl(header->magic) != WVM_MAGIC ||
-        ntohs(header->msg_type) != MSG_VCPU_EXIT ||
-        ntohs(header->payload_len) !=
-            (size_t)received - sizeof(struct wvm_header)) {
-        return -EPROTO;
-    }
-
-    memset(&response_addr, 0, sizeof(response_addr));
-    response_addr.sin_family = AF_INET;
-    response_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    response_addr.sin_port = htons(state->config.node_runtime_port);
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        return -errno;
-    }
-    sent = sendto(sock, response, (size_t)received, MSG_NOSIGNAL,
-                  (struct sockaddr *)&response_addr, sizeof(response_addr));
-    close(sock);
-    if (sent != received) {
-        return errno ? -errno : -EIO;
-    }
-    return 0;
 }
 
 static int authorize_cpu_run(const struct bridge_state *state,
@@ -1048,172 +648,4 @@ static int authorize_cpu_run(const struct bridge_state *state,
            sizeof(operation.operation_id));
     return wvm_runtime_gate_authorize(state->config.runtime_gate, &operation,
                                       error, error_len);
-}
-
-static int open_executor_abi_listener(struct bridge_state *state)
-{
-    struct sockaddr_un address;
-    int server_fd;
-
-    if (!state || state->socket_path[0] == '\0') {
-        return -EINVAL;
-    }
-    unlink(state->socket_path);
-    server_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (server_fd < 0) {
-        return -errno;
-    }
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    snprintf(address.sun_path, sizeof(address.sun_path), "%s",
-             state->socket_path);
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        chmod(state->socket_path, 0600) != 0 ||
-        listen(server_fd, 16) != 0) {
-        int result = -errno;
-
-        close(server_fd);
-        unlink(state->socket_path);
-        return result;
-    }
-    pthread_mutex_lock(&state->task_lock);
-    if (state->stopping) {
-        pthread_mutex_unlock(&state->task_lock);
-        close(server_fd);
-        unlink(state->socket_path);
-        return -ESHUTDOWN;
-    }
-    state->server_fd = server_fd;
-    pthread_mutex_unlock(&state->task_lock);
-    return 0;
-}
-
-static void *executor_bridge_thread(void *opaque)
-{
-    struct bridge_state *state = opaque;
-    int server_fd;
-
-    pthread_mutex_lock(&state->task_lock);
-    server_fd = state->server_fd;
-    pthread_mutex_unlock(&state->task_lock);
-    if (server_fd < 0) {
-        return NULL;
-    }
-    fprintf(stderr,
-            "[executor-abi] listening socket=%s executor_port=%u node_port=%u\n",
-            state->socket_path, (unsigned)state->config.executor_service_port,
-            (unsigned)state->config.node_runtime_port);
-
-    for (;;) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        uint8_t *frame_bytes;
-        struct wvm_executor_abi_frame request;
-        ssize_t received;
-        char error[256] = {0};
-        size_t capacity = WVM_EXECUTOR_ABI_HEADER_BYTES + WVM_MAX_PACKET_SIZE;
-        int decoded = 0;
-
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        frame_bytes = malloc(capacity);
-        if (!frame_bytes) {
-            close(client_fd);
-            continue;
-        }
-        received = recv(client_fd, frame_bytes, capacity, 0);
-        if (received > 0 &&
-            wvm_executor_abi_decode(frame_bytes, (size_t)received, &request,
-                                    error, sizeof(error)) == 0) {
-            decoded = 1;
-        }
-        if (!decoded ||
-            wvm_executor_abi_validate_identity(
-                &request, state->config.manifest,
-                state->config.local_runtime_instance_id, error,
-                sizeof(error)) != 0) {
-            if (decoded) {
-                (void)send_result(client_fd, &request,
-                                  WVM_EXECUTOR_ABI_STALE_IDENTITY);
-            }
-            free(frame_bytes);
-            close(client_fd);
-            continue;
-        }
-
-        if (request.message_type != WVM_EXECUTOR_ABI_CPU_RUN) {
-            (void)send_result(client_fd, &request,
-                              WVM_EXECUTOR_ABI_UNSUPPORTED);
-        } else if (authorize_cpu_run(state, &request, error,
-                                     sizeof(error)) != 0) {
-            (void)send_result(client_fd, &request,
-                              WVM_EXECUTOR_ABI_STALE_IDENTITY);
-        } else {
-            int result = forward_cpu_run(state, &request);
-            (void)send_result(
-                client_fd, &request,
-                result == 0 ? WVM_EXECUTOR_ABI_SUCCESS
-                            : WVM_EXECUTOR_ABI_INTERNAL_FAILURE);
-        }
-        free(frame_bytes);
-        close(client_fd);
-    }
-    pthread_mutex_lock(&state->task_lock);
-    if (state->server_fd == server_fd) {
-        state->server_fd = -1;
-        close(server_fd);
-    }
-    pthread_mutex_unlock(&state->task_lock);
-    unlink(state->socket_path);
-    return NULL;
-}
-
-int wvm_executor_bridge_start(
-    const struct wvm_executor_bridge_config *config, void **dispatch_opaque,
-    pthread_t *thread_out)
-{
-    struct bridge_state *state;
-    void *state_opaque = NULL;
-    pthread_t thread;
-    char error[256] = {0};
-    int start_result;
-
-    if (dispatch_opaque) {
-        *dispatch_opaque = NULL;
-    }
-    if (!config || !config->socket_path ||
-        config->socket_path[0] == '\0' ||
-        strlen(config->socket_path) >= sizeof(state->socket_path) ||
-        config->executor_service_port == 0 ||
-        config->node_runtime_port == 0 ||
-        config->local_runtime_instance_id == 0) {
-        return -EINVAL;
-    }
-    if (wvm_executor_bridge_dispatch_init(
-            config, &state_opaque, error, sizeof(error)) != 0) {
-        return -EINVAL;
-    }
-    state = state_opaque;
-    start_result = open_executor_abi_listener(state);
-    if (start_result != 0) {
-        wvm_executor_bridge_dispatch_destroy(state);
-        return start_result;
-    }
-    start_result = pthread_create(&thread, NULL, executor_bridge_thread, state);
-    if (start_result != 0) {
-        wvm_executor_bridge_dispatch_destroy(state);
-        return -start_result;
-    }
-    state->server_thread = thread;
-    state->server_thread_started = 1;
-    if (dispatch_opaque) {
-        *dispatch_opaque = state;
-    }
-    if (thread_out) {
-        *thread_out = thread;
-    }
-    return 0;
 }

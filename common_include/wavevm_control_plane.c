@@ -1478,6 +1478,165 @@ void wvm_control_plane_set_runtime_manifest_entries(
     }
 }
 
+static int copy_membership_journal_path(char destination[WVM_CONTROL_PLANE_PATH_MAX],
+                                        const char *source)
+{
+    size_t length;
+
+    if (!destination || !source || source[0] == '\0') {
+        return -1;
+    }
+    length = strlen(source);
+    if (length >= WVM_CONTROL_PLANE_PATH_MAX) {
+        return -1;
+    }
+    memcpy(destination, source, length + 1U);
+    return 0;
+}
+
+int wvm_control_plane_configure_membership(
+    struct wvm_control_plane *plane,
+    const struct wvm_control_plane_membership_config *config,
+    char *error, size_t error_len)
+{
+    int result;
+
+    if (!plane || !config || plane->journal_fd >= 0 ||
+        plane->membership_configured || !config->members ||
+        config->member_capacity == 0 || !config->routes ||
+        config->route_capacity == 0 || !config->dependencies ||
+        config->dependency_capacity == 0 || !config->operations ||
+        config->operation_capacity == 0 ||
+        copy_membership_journal_path(plane->membership_journal_path,
+                                     config->membership_journal_path) != 0 ||
+        copy_membership_journal_path(plane->membership_control_journal_path,
+                                     config->control_journal_path) != 0) {
+        set_error(error, error_len,
+                  "control-plane membership configuration is invalid");
+        return -EINVAL;
+    }
+
+    wvm_membership_controller_init(
+        &plane->membership_controller, config->members,
+        config->member_capacity, config->routes, config->route_capacity,
+        config->dependencies, config->dependency_capacity, config->authorize,
+        config->authorize_context);
+    plane->membership_initialized = 1;
+    wvm_membership_control_init(
+        &plane->membership_control, &plane->membership_controller,
+        config->operations, config->operation_capacity);
+    result = wvm_membership_control_set_management_authorizer(
+        &plane->membership_control, config->authorize_management,
+        config->authorize_management_context);
+    if (result == 0) {
+        result = wvm_membership_control_set_membership_authorizer(
+            &plane->membership_control, config->authorize_membership,
+            config->authorize_membership_context);
+    }
+    if (result != 0) {
+        wvm_membership_control_close(&plane->membership_control);
+        wvm_membership_controller_close(&plane->membership_controller);
+        plane->membership_initialized = 0;
+        plane->membership_journal_path[0] = '\0';
+        plane->membership_control_journal_path[0] = '\0';
+        set_error(error, error_len,
+                  "cannot configure membership authorization boundary");
+        return -EINVAL;
+    }
+    plane->membership_dispatch_context.control = &plane->membership_control;
+    plane->membership_dispatch_context.result_sink = config->result_sink;
+    plane->membership_dispatch_context.result_sink_context =
+        config->result_sink_context;
+    plane->membership_configured = 1;
+    return 0;
+}
+
+int wvm_control_plane_open_membership(struct wvm_control_plane *plane,
+                                      char *error, size_t error_len)
+{
+    if (!plane || !plane->membership_configured ||
+        !plane->membership_initialized || plane->membership_open ||
+        plane->membership_controller.journal_fd >= 0 ||
+        plane->membership_control.journal_fd >= 0) {
+        set_error(error, error_len,
+                  "control-plane membership open state is invalid");
+        return -EINVAL;
+    }
+    if (wvm_membership_controller_open(
+            &plane->membership_controller, plane->membership_journal_path,
+            error, error_len) != 0) {
+        plane->membership_initialized = 0;
+        return -1;
+    }
+    if (wvm_membership_control_open(
+            &plane->membership_control,
+            plane->membership_control_journal_path, error, error_len) != 0) {
+        wvm_membership_controller_close(&plane->membership_controller);
+        plane->membership_initialized = 0;
+        return -1;
+    }
+    plane->membership_open = 1;
+    return 0;
+}
+
+void wvm_control_plane_close_membership(struct wvm_control_plane *plane)
+{
+    if (!plane) {
+        return;
+    }
+    if (plane->membership_open) {
+        wvm_membership_control_close(&plane->membership_control);
+        wvm_membership_controller_close(&plane->membership_controller);
+        plane->membership_open = 0;
+        plane->membership_initialized = 0;
+    } else if (plane->membership_initialized) {
+        /* Configuration may be discarded before the membership journals open. */
+        wvm_membership_control_close(&plane->membership_control);
+        wvm_membership_controller_close(&plane->membership_controller);
+        plane->membership_initialized = 0;
+    }
+    plane->membership_configured = 0;
+    memset(&plane->membership_dispatch_context, 0,
+           sizeof(plane->membership_dispatch_context));
+    plane->membership_journal_path[0] = '\0';
+    plane->membership_control_journal_path[0] = '\0';
+}
+
+int wvm_control_plane_membership_dispatch(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len)
+{
+    struct wvm_control_plane *plane = opaque;
+
+    if (!plane || !plane->membership_open) {
+        set_error(error, error_len,
+                  "authoritative membership control plane is not open");
+        return -EAGAIN;
+    }
+    return wvm_membership_control_dispatch(
+        &plane->membership_dispatch_context, request, authenticated_actor,
+        error, error_len);
+}
+
+int wvm_control_plane_membership_apply(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor,
+    struct wvm_membership_control_result *result, char *error,
+    size_t error_len)
+{
+    struct wvm_control_plane *plane = opaque;
+
+    if (!plane || !plane->membership_open) {
+        set_error(error, error_len,
+                  "authoritative membership control plane is not open");
+        return -EAGAIN;
+    }
+    return wvm_membership_control_apply(
+        &plane->membership_control, request, authenticated_actor, result, error,
+        error_len);
+}
+
 int wvm_control_plane_open(
     struct wvm_control_plane *plane, const char *journal_path,
     struct wvm_vm_namespace_allocator *namespace_allocator, char *error,
@@ -1621,6 +1780,7 @@ void wvm_control_plane_close(struct wvm_control_plane *plane)
     if (!plane) {
         return;
     }
+    wvm_control_plane_close_membership(plane);
     clear_route_transaction_entries(plane);
     clear_runtime_manifest_entries(plane);
     if (plane->journal_fd >= 0) {

@@ -97,6 +97,7 @@ enum wvm_envelope_message_type {
     WVM_ENVELOPE_MSG_ROUTE_RETIRE = 0x0403U,
     WVM_ENVELOPE_MSG_REJOIN = 0x0501U,
     WVM_ENVELOPE_MSG_RECOVERY_REBIND = 0x0502U,
+    WVM_ENVELOPE_MSG_CREATE_VM = 0x0601U,
 };
 
 struct wvm_envelope {

@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "wavevm_identity.h"
 #include "wavevm_runtime_names.h"
 
 static int expect(int condition, const char *message)
@@ -22,15 +23,22 @@ static int expect(int condition, const char *message)
     return 0;
 }
 
-static void make_namespace(struct wvm_local_name_namespace *value,
-                           const char *suffix)
+static int make_namespace(struct wvm_local_name_namespace *value,
+                          uint32_t vm_id, uint8_t salt, char *error,
+                          size_t error_len)
 {
-    memset(value, 0, sizeof(*value));
-    snprintf(value->namespace_name, sizeof(value->namespace_name),
-             "wvm-isolation-%s-%ld", suffix, (long)getpid());
-    memset(value->derivation_salt_digest, suffix[0],
-           sizeof(value->derivation_salt_digest));
-    value->name_generation = 1;
+    struct wvm_local_name_identity identity;
+
+    memset(&identity, 0, sizeof(identity));
+    identity.vm_id = vm_id;
+    identity.vm_incarnation = 1;
+    identity.manifest_generation = 1;
+    identity.physical_node_id = 17;
+    memset(identity.manifest_id, salt, sizeof(identity.manifest_id));
+    memset(identity.admission_tx_id, (uint8_t)(salt + 1U),
+           sizeof(identity.admission_tx_id));
+    return wvm_local_name_namespace_derive(&identity, value, error,
+                                           error_len);
 }
 
 static int bind_unix_socket(const char *path)
@@ -141,9 +149,18 @@ int main(void)
     int shm_b = -1;
     char error[256] = {0};
 
-    make_namespace(&namespace_a, "a");
-    make_namespace(&namespace_b, "b");
-    if (expect(wvm_runtime_name_set_derive(&namespace_a, &names_a, error,
+    if (expect(make_namespace(&namespace_a, 256, 0x41, error,
+                              sizeof(error)) == 0,
+               "derive VM A admitted identity") ||
+        expect(make_namespace(&namespace_b, 257, 0x42, error,
+                              sizeof(error)) == 0,
+               "derive VM B admitted identity") ||
+        expect(wvm_local_name_namespace_validate_unique(
+                   (const struct wvm_local_name_namespace[]){namespace_a,
+                                                              namespace_b},
+                   2, error, sizeof(error)) == 0,
+               "same physical node has distinct VM namespaces") ||
+        expect(wvm_runtime_name_set_derive(&namespace_a, &names_a, error,
                                            sizeof(error)) == 0,
                "derive VM A names") ||
         expect(wvm_runtime_name_set_derive(&namespace_b, &names_b, error,

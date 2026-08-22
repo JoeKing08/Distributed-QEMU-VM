@@ -32,7 +32,19 @@ Mode A is therefore:
 Mode B canonical runtime + optional per-VM kernel acceleration
 ```
 
-### 1.1 Implemented Migration Boundary
+### 1.1 Release priority
+
+Per-VM context isolation is a minimum usable system gate. A host may decline
+Mode A when the module or kernel cannot provide it, but it must not advertise
+multi-VM Mode A while state, request IDs, mappings, route caches, or teardown
+remain singleton-owned.
+
+The full accelerator specification also describes later hardening such as
+complete fault-path migration and exhaustive worker-failure testing. Those
+items improve the accelerator but do not make the no-module Mode B baseline a
+second-class path.
+
+### 1.2 Implemented Migration Boundary
 
 The current tree implements the admission boundary and the first
 context-scoped data-plane state migration, but not the complete per-VM
@@ -56,11 +68,11 @@ kernel-context migration:
   invalidation, dirty commit, direct push, and kernel RPC batch lookup use the
   same context tree; RCU lookup and reorder-queue behavior remain unchanged.
 - Kernel `logic_core` VM namespace construction uses a context accessor.
-  `g_my_vm_id` remains only as a legacy compatibility mirror for old setters and
-  is not the kernel logic authority.
+  `g_my_vm_id` is not a production identity authority and must be removed
+  from the final context-bound path.
 - A different VM identity is rejected while the current module-global state is
-  still active. Legacy IOCTL setters remain available only as compatibility
-  adapters during migration.
+  still active. Field-by-field legacy IOCTL setters are not a supported
+  configuration path and must be removed as the typed context ABI is enabled.
 
 This boundary is still an admission guard, not proof that the old kernel
 `logic_core` semantic state, route tables, page metadata, request state,
@@ -184,8 +196,8 @@ be a hardcoded shared token or a raw global `vm_id` write.
 
 ## 4. IOCTL and mmap ABI
 
-The current numeric IOCTL definitions are compatibility values, not the stable
-ABI. A new ABI uses versioned typed envelopes from `wire-ipc-abi.md`; each
+The current numeric IOCTL definitions are not the production configuration ABI.
+The context ABI uses typed envelopes from `wire-ipc-abi.md`; each
 request includes context handle, manifest identity, operation ID, payload
 length, flags, and typed result status.
 

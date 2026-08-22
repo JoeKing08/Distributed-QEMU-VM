@@ -19,6 +19,14 @@ struct ingress_thread_state {
 static struct wvm_ingress g_ingress;
 static _Thread_local struct ingress_thread_state g_thread_ingress;
 
+static int control_message(uint16_t message_type)
+{
+    return message_type == WVM_ENVELOPE_MSG_REGISTER_MEMBER ||
+           message_type == WVM_ENVELOPE_MSG_CORDON ||
+           message_type == WVM_ENVELOPE_MSG_DRAIN ||
+           message_type == WVM_ENVELOPE_MSG_REJOIN;
+}
+
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
 {
     va_list ap;
@@ -90,81 +98,94 @@ static int authorize_envelope(const struct wvm_ingress *ingress,
 
 static int dispatch_complete_envelope(struct wvm_ingress *ingress,
                                       const struct wvm_envelope *envelope,
+                                      const struct wvm_member_key
+                                          *authenticated_actor,
                                       char *error, size_t error_len)
 {
     wvm_ingress_dispatch_fn dispatch;
+    wvm_ingress_control_dispatch_fn control_dispatch;
     void *dispatch_opaque;
     int dispatch_result;
 
-    if (wvm_envelope_validate_admitted(envelope,
-                                          &ingress->admitted_identity, error,
-                                          error_len) != 0 ||
-        authorize_envelope(ingress, envelope, error, error_len) != 0) {
-        return WVM_INGRESS_REJECTED;
-    }
-
-    switch (envelope->message_type) {
-    case WVM_ENVELOPE_MSG_MEM_READ:
-    case WVM_ENVELOPE_MSG_MEM_ACK:
-    case WVM_ENVELOPE_MSG_COMMIT_DIFF:
-    case WVM_ENVELOPE_MSG_MEM_COMMIT_ACK:
-        if (!ingress->config.memory_dispatch) {
+    if (control_message(envelope->message_type)) {
+        if (!authenticated_actor || !ingress->config.control_dispatch) {
             set_error(error, error_len,
-                      "memory operation has no local dispatcher");
-            return WVM_INGRESS_UNSUPPORTED;
-        }
-        if (wvm_memory_payload_validate(envelope->message_type,
-                                        envelope->payload,
-                                        envelope->payload_bytes, error,
-                                        error_len) != 0) {
+                      "control message requires an authenticated transport");
             return WVM_INGRESS_REJECTED;
         }
-        dispatch = ingress->config.memory_dispatch;
-        dispatch_opaque = ingress->config.memory_dispatch_opaque;
-        break;
-    case WVM_ENVELOPE_MSG_VCPU_RUN: {
-        struct wvm_vcpu_handoff_request request;
-
-        if (!ingress->config.vcpu_dispatch) {
-            set_error(error, error_len,
-                      "vCPU handoff has no local executor dispatcher");
-            return WVM_INGRESS_UNSUPPORTED;
-        }
-        if (wvm_vcpu_handoff_request_decode(
-                envelope->payload, envelope->payload_bytes, &request, error,
-                error_len) != 0 ||
-            wvm_vcpu_handoff_request_validate_envelope(
-                &request, envelope, error, error_len) != 0) {
+        control_dispatch = ingress->config.control_dispatch;
+        dispatch_result = control_dispatch(
+            ingress->config.control_dispatch_opaque, envelope,
+            authenticated_actor, error, error_len);
+    } else {
+        if (wvm_envelope_validate_admitted(
+                envelope, &ingress->admitted_identity, error, error_len) != 0 ||
+            authorize_envelope(ingress, envelope, error, error_len) != 0) {
             return WVM_INGRESS_REJECTED;
         }
-        dispatch = ingress->config.vcpu_dispatch;
-        dispatch_opaque = ingress->config.vcpu_dispatch_opaque;
-        break;
-    }
-    case WVM_ENVELOPE_MSG_VCPU_EXIT: {
-        struct wvm_vcpu_handoff_result result;
 
-        if (!ingress->config.vcpu_result_dispatch) {
+        switch (envelope->message_type) {
+        case WVM_ENVELOPE_MSG_MEM_READ:
+        case WVM_ENVELOPE_MSG_MEM_ACK:
+        case WVM_ENVELOPE_MSG_COMMIT_DIFF:
+        case WVM_ENVELOPE_MSG_MEM_COMMIT_ACK:
+            if (!ingress->config.memory_dispatch) {
+                set_error(error, error_len,
+                          "memory operation has no local dispatcher");
+                return WVM_INGRESS_UNSUPPORTED;
+            }
+            if (wvm_memory_payload_validate(envelope->message_type,
+                                            envelope->payload,
+                                            envelope->payload_bytes, error,
+                                            error_len) != 0) {
+                return WVM_INGRESS_REJECTED;
+            }
+            dispatch = ingress->config.memory_dispatch;
+            dispatch_opaque = ingress->config.memory_dispatch_opaque;
+            break;
+        case WVM_ENVELOPE_MSG_VCPU_RUN: {
+            struct wvm_vcpu_handoff_request request;
+
+            if (!ingress->config.vcpu_dispatch) {
+                set_error(error, error_len,
+                          "vCPU handoff has no local executor dispatcher");
+                return WVM_INGRESS_UNSUPPORTED;
+            }
+            if (wvm_vcpu_handoff_request_decode(
+                    envelope->payload, envelope->payload_bytes, &request,
+                    error, error_len) != 0 ||
+                wvm_vcpu_handoff_request_validate_envelope(
+                    &request, envelope, error, error_len) != 0) {
+                return WVM_INGRESS_REJECTED;
+            }
+            dispatch = ingress->config.vcpu_dispatch;
+            dispatch_opaque = ingress->config.vcpu_dispatch_opaque;
+            break;
+        }
+        case WVM_ENVELOPE_MSG_VCPU_EXIT: {
+            struct wvm_vcpu_handoff_result result;
+
+            if (!ingress->config.vcpu_result_dispatch) {
+                set_error(error, error_len,
+                          "vCPU exit has no local result coordinator");
+                return WVM_INGRESS_UNSUPPORTED;
+            }
+            if (wvm_vcpu_handoff_result_decode(
+                    envelope->payload, envelope->payload_bytes, &result,
+                    error, error_len) != 0) {
+                return WVM_INGRESS_REJECTED;
+            }
+            dispatch = ingress->config.vcpu_result_dispatch;
+            dispatch_opaque = ingress->config.vcpu_result_dispatch_opaque;
+            break;
+        }
+        default:
             set_error(error, error_len,
-                      "vCPU exit has no local result coordinator");
+                      "envelope operation has no admitted local dispatcher");
             return WVM_INGRESS_UNSUPPORTED;
         }
-        if (wvm_vcpu_handoff_result_decode(
-                envelope->payload, envelope->payload_bytes, &result, error,
-                error_len) != 0) {
-            return WVM_INGRESS_REJECTED;
-        }
-        dispatch = ingress->config.vcpu_result_dispatch;
-        dispatch_opaque = ingress->config.vcpu_result_dispatch_opaque;
-        break;
+        dispatch_result = dispatch(dispatch_opaque, envelope, error, error_len);
     }
-    default:
-        set_error(error, error_len,
-                  "envelope operation has no admitted local dispatcher");
-        return WVM_INGRESS_UNSUPPORTED;
-    }
-
-    dispatch_result = dispatch(dispatch_opaque, envelope, error, error_len);
     if (dispatch_result == 0) {
         return WVM_INGRESS_ACCEPTED;
     }
@@ -236,10 +257,12 @@ int wvm_ingress_init(struct wvm_ingress *ingress,
     return 0;
 }
 
-int wvm_ingress_accept(struct wvm_ingress *ingress,
-                          struct wvm_envelope_reassembler *reassembler,
-                          const uint8_t *frame, size_t frame_bytes,
-                          uint64_t now_ms, char *error, size_t error_len)
+int wvm_ingress_accept_authenticated(
+    struct wvm_ingress *ingress,
+    struct wvm_envelope_reassembler *reassembler, const uint8_t *frame,
+    size_t frame_bytes, uint64_t now_ms,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len)
 {
     struct wvm_envelope envelope;
 
@@ -257,13 +280,22 @@ int wvm_ingress_accept(struct wvm_ingress *ingress,
      * Check frame identity before retaining a fragmented payload. This keeps
      * stale VM/route traffic from consuming the bounded reassembly budget.
      */
-    if (wvm_envelope_validate_admitted(&envelope,
-                                          &ingress->admitted_identity, error,
-                                          error_len) != 0) {
+    if ((!control_message(envelope.message_type) &&
+         wvm_envelope_validate_admitted(
+             &envelope, &ingress->admitted_identity, error, error_len) != 0) ||
+        (control_message(envelope.message_type) &&
+         (!authenticated_actor || !ingress->config.control_dispatch))) {
+        if (control_message(envelope.message_type) &&
+            (!error || error[0] == '\0')) {
+            set_error(error, error_len,
+                      "control message requires an authenticated transport");
+        }
         return WVM_INGRESS_REJECTED;
     }
     if (!(envelope.flags & WVM_ENVELOPE_FLAG_FRAGMENTED)) {
-        return dispatch_complete_envelope(ingress, &envelope, error, error_len);
+        return dispatch_complete_envelope(ingress, &envelope,
+                                          authenticated_actor, error,
+                                          error_len);
     }
 
     {
@@ -280,10 +312,21 @@ int wvm_ingress_accept(struct wvm_ingress *ingress,
             return WVM_INGRESS_INCOMPLETE;
         }
         reassembly_result = dispatch_complete_envelope(
-            ingress, &reassembled.envelope, error, error_len);
+            ingress, &reassembled.envelope, authenticated_actor, error,
+            error_len);
         wvm_envelope_reassembled_release(&reassembled);
         return reassembly_result;
     }
+}
+
+int wvm_ingress_accept(struct wvm_ingress *ingress,
+                       struct wvm_envelope_reassembler *reassembler,
+                       const uint8_t *frame, size_t frame_bytes,
+                       uint64_t now_ms, char *error, size_t error_len)
+{
+    return wvm_ingress_accept_authenticated(
+        ingress, reassembler, frame, frame_bytes, now_ms, NULL, error,
+        error_len);
 }
 
 int wvm_ingress_global_init(const struct wvm_ingress_config *config,
@@ -304,6 +347,15 @@ int wvm_ingress_global_init(const struct wvm_ingress_config *config,
 int wvm_ingress_handle_datagram_ex(const uint8_t *frame, size_t frame_bytes,
                                    char *error, size_t error_len)
 {
+    return wvm_ingress_handle_authenticated_datagram_ex(
+        frame, frame_bytes, NULL, error, error_len);
+}
+
+int wvm_ingress_handle_authenticated_datagram_ex(
+    const uint8_t *frame, size_t frame_bytes,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len)
+{
     if (!g_ingress.initialized) {
         set_error(error, error_len, "ingress is not initialized");
         return WVM_INGRESS_REJECTED;
@@ -317,9 +369,9 @@ int wvm_ingress_handle_datagram_ex(const uint8_t *frame, size_t frame_bytes,
         }
         g_thread_ingress.initialized = 1;
     }
-    return wvm_ingress_accept(&g_ingress, &g_thread_ingress.reassembler,
-                                 frame, frame_bytes, monotonic_milliseconds(),
-                                 error, error_len);
+    return wvm_ingress_accept_authenticated(
+        &g_ingress, &g_thread_ingress.reassembler, frame, frame_bytes,
+        monotonic_milliseconds(), authenticated_actor, error, error_len);
 }
 
 int wvm_ingress_handle_datagram(const uint8_t *frame, size_t frame_bytes)

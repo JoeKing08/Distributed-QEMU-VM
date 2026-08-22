@@ -29,6 +29,15 @@ userfaultfd, or `wavevm.ko` may improve performance, but no one of them is the
 unconditional baseline. Mode B provides canonical user-space semantics; Mode A
 is an optional implementation of selected local data-plane operations.
 
+### 1.1 Release priority
+
+The minimum usable system requires one correct restricted-host fallback for TCG
+and one correct KVM dirty/resync path where KVM is available. The complete
+`fault_engine_ops` matrix, UFFD selection, and exhaustive cross-engine
+equivalence/failure testing are extended hardening work. They must not become a
+reason to delay a correct Mode B launch, and they must not introduce a second
+page-consistency authority.
+
 Non-goals for V1:
 
 - Claiming a capability from kernel version, container image name, or a bound

@@ -1,11 +1,37 @@
-CC = gcc
-CFLAGS = -Wall -O2 -I../common_include
+CC ?= gcc
+CFLAGS ?= -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L
+LDFLAGS ?= -pthread
+
 TARGET = wvm_ctl
+COMMON_DIR = ../common_include
+SRCS = main.c \
+	$(COMMON_DIR)/wavevm_sha256.c \
+	$(COMMON_DIR)/wavevm_canonical.c \
+	$(COMMON_DIR)/wavevm_identity.c \
+	$(COMMON_DIR)/wavevm_runtime_names.c \
+	$(COMMON_DIR)/wavevm_manifest.c \
+	$(COMMON_DIR)/wavevm_control.c \
+	$(COMMON_DIR)/wavevm_capability.c \
+	$(COMMON_DIR)/wavevm_lifecycle.c \
+	$(COMMON_DIR)/wavevm_admission.c \
+	$(COMMON_DIR)/wavevm_cluster.c \
+	$(COMMON_DIR)/wavevm_reservation_runtime.c \
+	$(COMMON_DIR)/wavevm_fault_engine.c \
+	$(COMMON_DIR)/wavevm_coordinator.c \
+	$(COMMON_DIR)/wavevm_control_plane.c \
+	$(COMMON_DIR)/wavevm_envelope.c \
+	$(COMMON_DIR)/wavevm_membership_controller.c \
+	$(COMMON_DIR)/wavevm_membership_control.c \
+	$(COMMON_DIR)/wavevm_control_transport.c \
+	$(COMMON_DIR)/wavevm_control_owner.c \
+	$(COMMON_DIR)/wavevm_control_service.c
 
 all: $(TARGET)
 
-$(TARGET): main.c ../common_include/wavevm_resources.c
-	$(CC) $(CFLAGS) -o $@ $^
+$(TARGET): $(SRCS)
+	$(CC) $(CFLAGS) -I$(COMMON_DIR) $(SRCS) $(LDFLAGS) -o $@
 
 clean:
 	rm -f $(TARGET)
+
+.PHONY: all clean

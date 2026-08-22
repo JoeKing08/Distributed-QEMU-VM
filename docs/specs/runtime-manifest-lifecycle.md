@@ -9,9 +9,10 @@ stop, rollback, and recovery boundaries. Resource selection belongs to
 `cluster-membership-topology-lifecycle.md`; wire identity belongs to
 `identity-routing.md` and `wire-ipc-abi.md`.
 
-This specification is normative for new VM lifecycle work. Existing launch
-scripts, environment variables, `NODE`/`ROUTE` files, and process order are
-compatibility/bootstrap mechanisms, not an admitted manifest implementation.
+This specification is normative for all VM lifecycle work. Existing launch
+scripts, environment variables, `NODE`/`ROUTE` files, and positional process
+arguments are not production inputs; they are test history to be removed or
+rewritten as manifest renderers.
 
 ## 1. Goal and Non-Goals
 
@@ -618,8 +619,8 @@ queries the recorded result before creating a new action.
 1. Inventory every environment variable, route file, port, SHM name, and
    launch-script field consumed by QEMU, node runtimes, executors, sidecars,
    gateways, and the kernel module.
-2. Introduce a canonical manifest parser and digest validator in user space.
-   Existing scripts may render legacy configuration from it during migration.
+2. Use the canonical manifest parser and digest validator in user space. No
+   production path renders legacy configuration from it.
 3. Make all local names derived from the manifest namespace before accepting a
    second VM on one physical node.
 4. Add candidate route-scope, prepared reservation/participant, activation
@@ -627,10 +628,17 @@ queries the recorded result before creating a new action.
    changing memory or vCPU packet semantics first.
 5. Gate QEMU/executor acceptance on manifest validation and expose structured
    lifecycle status to the control tool.
-6. Retire direct user-authored per-VM `NODE`/`ROUTE` injection only after the
-   generated manifest can reproduce existing flat and fractal CI deployments.
+6. Remove direct user-authored per-VM `NODE`/`ROUTE` injection. Generated
+   manifests and route snapshots are the only production inputs, and fixtures
+   must be regenerated from those records.
 
 ## 10. Acceptance Tests
+
+The first eight tests below and the final guest-readiness test form the
+minimum usable lifecycle gate. Coordinator crash matrices, pre-activation
+races, and independent host/process replacement are extended hardening; they
+remain required for an operationally hardened deployment but do not block the
+first correct distributed VM.
 
 - The same canonical request, member snapshot, and capability set produce the
   same manifest digest and placement plan.
@@ -648,18 +656,18 @@ queries the recorded result before creating a new action.
   route identities, logs, and runtime state.
 - A route-generation replacement for an active gateway path does not mutate
   the VM's placement or manifest digest.
-- Crash/restart the coordinator after every reservation, participant prepare,
+- **Extended:** Crash/restart the coordinator after every reservation, participant prepare,
   activation, commit, abort, and start message. The result is exactly one
   running/committed VM with all reservations held, or full compensating teardown
   with no leaked route scope, port, SHM name, context, or capacity.
-- Race every pre-activation stage with cordon, gateway drain, health exclusion,
+- **Extended:** Race every pre-activation stage with cordon, gateway drain, health exclusion,
   capability change, and node/gateway instance replacement. A stale eligibility
   fence cannot reach `RUNNING`.
-- Restart a noncritical local child, required executor, node agent, and physical
+- **Extended:** Restart a noncritical local child, required executor, node agent, and physical
   host independently. V1 permits only the documented local-child re-registration;
   required member identity changes visibly pause/fail rather than rebind.
-- VM A route-scope retirement while VM B shares a gateway leaves VM B's current
+- **Minimum usable:** VM A route-scope retirement while VM B shares a gateway leaves VM B's current
   and draining routes, local names, reservations, and subscriber state intact.
-- Success means a guest reaches its declared readiness condition, plus
+- **Minimum usable:** Success means a guest reaches its declared readiness condition, plus
   instrumentation proves the admitted remote vCPU and remote memory paths were
   exercised; it does not mean only that processes remained alive.

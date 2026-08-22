@@ -1432,3 +1432,26 @@ int wvm_membership_control_apply(
     pthread_mutex_unlock(&control->lock);
     return 0;
 }
+
+int wvm_membership_control_dispatch(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len)
+{
+    struct wvm_membership_control_dispatch_context *context = opaque;
+    struct wvm_membership_control_result result;
+
+    if (!context || !context->control || !context->result_sink || !request ||
+        !authenticated_actor) {
+        set_error(error, error_len,
+                  "membership control dispatch context is incomplete");
+        return -EINVAL;
+    }
+    if (wvm_membership_control_apply(
+            context->control, request, authenticated_actor, &result, error,
+            error_len) != 0) {
+        return -EIO;
+    }
+    return context->result_sink(context->result_sink_context, request, &result,
+                                error, error_len);
+}

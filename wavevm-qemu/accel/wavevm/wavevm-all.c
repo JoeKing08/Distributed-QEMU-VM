@@ -36,6 +36,9 @@
 #include <poll.h>
 #include "../../../common_include/wavevm_protocol.h"
 #include "../../../common_include/wavevm_ioctl.h"
+#include "../../../common_include/wavevm_executor_session.h"
+#include "../../../common_include/wavevm_vcpu_handoff.h"
+#include "../../../common_include/wavevm_x86_context.h"
 #include "wavevm-accel.h"
 #include "wavevm-runtime-registration.h"
 
@@ -789,6 +792,206 @@ int wavevm_slave_submit_cpu_run(const struct wvm_ipc_cpu_run_req *req,
     memcpy(ack, &g_slave_exec_ack, sizeof(*ack));
     qemu_mutex_unlock(&g_slave_exec_lock);
     return ack->status;
+}
+
+static int wavevm_session_parse_u64(const char *name, uint64_t *value)
+{
+    const char *text = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+
+    if (!text || !*text || !value) {
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) {
+        return -1;
+    }
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
+static int wavevm_session_authorize_request(
+    const struct wvm_vcpu_handoff_request *request)
+{
+    uint64_t vm_id;
+    uint64_t vm_incarnation;
+    uint64_t manifest_generation;
+    uint64_t executor_id;
+    uint64_t vcpu_index;
+
+    if (!request || request->backend != WVM_VCPU_BACKEND_TCG ||
+        wavevm_session_parse_u64("WVM_VM_ID", &vm_id) != 0 ||
+        wavevm_session_parse_u64("WVM_VM_INCARNATION", &vm_incarnation) != 0 ||
+        wavevm_session_parse_u64("WVM_MANIFEST_GENERATION",
+                                 &manifest_generation) != 0 ||
+        wavevm_session_parse_u64("WVM_EXECUTOR_ID", &executor_id) != 0 ||
+        wavevm_session_parse_u64("WVM_EXECUTOR_VCPU_INDEX", &vcpu_index) != 0 ||
+        request->vm_id != vm_id || request->vm_incarnation != vm_incarnation ||
+        request->manifest_generation != manifest_generation ||
+        request->destination_executor_id != executor_id ||
+        request->vcpu_index != vcpu_index) {
+        return -1;
+    }
+    return 0;
+}
+
+static int wavevm_session_request_to_legacy(
+    const struct wvm_vcpu_handoff_request *request,
+    struct wvm_ipc_cpu_run_req *legacy_request, char *error, size_t error_len)
+{
+    uint64_t context_fields = 0;
+
+    if (!request || !legacy_request ||
+        request->backend != WVM_VCPU_BACKEND_TCG) {
+        return -1;
+    }
+    memset(legacy_request, 0, sizeof(*legacy_request));
+    legacy_request->mode_tcg = 1;
+    legacy_request->slave_id = WVM_NODE_AUTO_ROUTE;
+    legacy_request->vcpu_index = request->vcpu_index;
+    if (wvm_x86_context_decode(
+            WVM_VCPU_BACKEND_TCG, request->context, request->context_bytes,
+            &context_fields, &legacy_request->ctx.tcg,
+            sizeof(legacy_request->ctx.tcg), error, error_len) != 0 ||
+        context_fields != request->context_valid_fields) {
+        return -1;
+    }
+    return 0;
+}
+
+static uint16_t wavevm_session_tcg_exit_class(
+    const struct wvm_ipc_cpu_run_ack *ack)
+{
+    if (ack->ctx.tcg.halted) {
+        return WVM_VCPU_EXIT_HALTED;
+    }
+    if (ack->ctx.tcg.interrupt_request != 0) {
+        return WVM_VCPU_EXIT_INTERRUPT;
+    }
+    return WVM_VCPU_EXIT_BUDGET;
+}
+
+static int wavevm_session_result_from_ack(
+    const struct wvm_vcpu_handoff_request *request,
+    const struct wvm_ipc_cpu_run_ack *ack, uint8_t *context,
+    size_t context_capacity, struct wvm_vcpu_handoff_result *result,
+    char *error, size_t error_len)
+{
+    size_t context_bytes = 0;
+
+    if (!request || !ack || !context || !result) {
+        return -1;
+    }
+    memset(result, 0, sizeof(*result));
+    result->protocol_version = WVM_VCPU_HANDOFF_RESULT_VERSION;
+    result->backend = WVM_VCPU_BACKEND_TCG;
+    result->vm_id = request->vm_id;
+    result->vm_incarnation = request->vm_incarnation;
+    result->manifest_generation = request->manifest_generation;
+    result->origin_physical_node_id = request->origin_physical_node_id;
+    result->origin_runtime_instance_id = request->origin_runtime_instance_id;
+    result->vcpu_index = request->vcpu_index;
+    result->handoff_sequence = request->handoff_sequence;
+    result->context_schema_version = request->context_schema_version;
+    result->context_valid_fields = 0;
+    memcpy(result->operation_id, request->operation_id,
+           sizeof(result->operation_id));
+
+    if (ack->status != 0) {
+        result->status = WVM_VCPU_HANDOFF_RESULT_EXECUTOR_FAILURE;
+        result->exit_class = WVM_VCPU_EXIT_EXECUTOR_ERROR;
+        return 0;
+    }
+    if (wvm_x86_context_encode(
+            WVM_VCPU_BACKEND_TCG, request->context_valid_fields,
+            &ack->ctx.tcg, sizeof(ack->ctx.tcg), context, context_capacity,
+            &context_bytes, error, error_len) != 0) {
+        return -1;
+    }
+    result->status = WVM_VCPU_HANDOFF_RESULT_SUCCESS;
+    result->exit_class = wavevm_session_tcg_exit_class(ack);
+    result->context_valid_fields = request->context_valid_fields;
+    result->context = context;
+    result->context_bytes = context_bytes;
+    return 0;
+}
+
+static void *wavevm_executor_session_thread(void *opaque)
+{
+    WaveVMAccelState *state = opaque;
+    uint8_t *frame = g_malloc(WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES);
+    uint8_t *context = g_malloc(WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES);
+    uint8_t *result_payload =
+        g_malloc(WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES +
+                 WVM_VCPU_HANDOFF_RESULT_HEADER_BYTES);
+
+    if (!frame || !context || !result_payload) {
+        g_free(frame);
+        g_free(context);
+        g_free(result_payload);
+        return NULL;
+    }
+
+    while (state->executor_session_fd >= 0) {
+        ssize_t received = recv(state->executor_session_fd, frame,
+                                WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES, 0);
+        uint16_t message_type = 0;
+        const uint8_t *payload = NULL;
+        size_t payload_bytes = 0;
+        struct wvm_vcpu_handoff_request request;
+        struct wvm_vcpu_handoff_result result;
+        struct wvm_ipc_cpu_run_req legacy_request;
+        struct wvm_ipc_cpu_run_ack legacy_ack;
+        char error[256] = {0};
+        size_t result_payload_bytes = 0;
+        uint8_t response[WVM_EXECUTOR_SESSION_MAX_FRAME_BYTES];
+        size_t response_bytes = 0;
+
+        if (received == 0 || (received < 0 && errno != EINTR)) {
+            break;
+        }
+        if (received < 0) {
+            continue;
+        }
+        if (wvm_executor_session_decode(
+                frame, (size_t)received, &message_type, &payload,
+                &payload_bytes, error, sizeof(error)) != 0 ||
+            message_type != WVM_EXECUTOR_SESSION_VCPU_RUN ||
+            wvm_vcpu_handoff_request_decode(
+                payload, payload_bytes, &request, error, sizeof(error)) != 0 ||
+            wavevm_session_authorize_request(&request) != 0 ||
+            wavevm_session_request_to_legacy(
+                &request, &legacy_request, error, sizeof(error)) != 0) {
+            break;
+        }
+
+        memset(&legacy_ack, 0, sizeof(legacy_ack));
+        wavevm_slave_submit_cpu_run(&legacy_request, &legacy_ack);
+        if (wavevm_session_result_from_ack(
+                &request, &legacy_ack, context,
+                WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES, &result, error,
+                sizeof(error)) != 0 ||
+            wvm_vcpu_handoff_result_encode(
+                &result, result_payload,
+                WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES +
+                    WVM_VCPU_HANDOFF_RESULT_HEADER_BYTES,
+                &result_payload_bytes, error, sizeof(error)) != 0 ||
+            wvm_executor_session_encode(
+                WVM_EXECUTOR_SESSION_VCPU_EXIT, result_payload,
+                result_payload_bytes, response, sizeof(response),
+                &response_bytes, error, sizeof(error)) != 0 ||
+            send(state->executor_session_fd, response, response_bytes,
+                 MSG_NOSIGNAL) != (ssize_t)response_bytes) {
+            break;
+        }
+    }
+
+    g_free(frame);
+    g_free(context);
+    g_free(result_payload);
+    return NULL;
 }
 
 void wavevm_slave_vcpu_loop(CPUState *cpu)
@@ -1651,6 +1854,18 @@ static int wavevm_init_machine_kernel(WaveVMAccelState *s, MachineState *ms) {
 static int wavevm_init_machine_user(WaveVMAccelState *s, MachineState *ms) {
     // Slave Mode Check (FD Inheritance)
     char *env_cmd = getenv("WVM_SOCK_CMD");
+    const char *env_session = getenv("WVM_EXECUTOR_SESSION_FD");
+
+    s->executor_session_fd = -1;
+    if (env_session && *env_session) {
+        char *end = NULL;
+        long parsed = strtol(env_session, &end, 10);
+
+        if (!end || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
+            return -EINVAL;
+        }
+        s->executor_session_fd = (int)parsed;
+    }
     
     if (env_cmd) {
         // [Slave Mode]
@@ -1924,6 +2139,12 @@ static int wavevm_init_machine(MachineState *ms) {
         // Now safe to run net thread in TCG mode because it uses a separate socket
         printf("[WaveVM] Starting Slave Net Thread on FD %d...\n", s->master_sock);
         qemu_thread_create(&s->net_thread, "wvm-slave-net", wavevm_slave_net_thread, s, QEMU_THREAD_DETACHED);
+        if (s->executor_session_fd >= 0) {
+            qemu_thread_create(&s->executor_session_thread,
+                               "wvm-executor-session",
+                               wavevm_executor_session_thread, s,
+                               QEMU_THREAD_DETACHED);
+        }
         // 暂停主 vCPU 线程，控制权移交给 net_thread 驱动
         if (current_cpu) { current_cpu->stop = true; current_cpu->halted = true; }
     }

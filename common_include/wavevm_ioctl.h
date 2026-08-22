@@ -48,7 +48,7 @@ struct wvm_ioctl_mem_layout {
 /* 1 GiB guest-memory chunk -> raw directory vnode placement table. */
 #define IOCTL_UPDATE_MEMORY_PLACEMENT _IOW('G', 21, struct wvm_ioctl_route_update)
 /* Keep the kernel Logic Core's composite-ID namespace aligned with the master. */
-#define IOCTL_SET_VM_ID _IOW('G', 22, uint8_t)
+#define IOCTL_SET_VM_ID _IOW('G', 22, uint32_t)
 
 /*
  * Context-bound Mode A admission.

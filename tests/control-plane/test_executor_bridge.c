@@ -1,14 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "executor_bridge.h"
 #include "wavevm_membership.h"
@@ -214,12 +210,8 @@ struct send_state {
 
 struct executor_stub {
     pthread_mutex_t lock;
-    int fd;
-    uint16_t port;
     unsigned int received;
     int valid;
-    int stopping;
-    pthread_t thread;
 };
 
 static int capture_response(void *opaque, const struct wvm_envelope *envelope,
@@ -276,142 +268,62 @@ static int wait_for_response(struct send_state *state, size_t expected)
     return result;
 }
 
-static int stub_stopping(struct executor_stub *stub)
-{
-    int stopping;
-
-    pthread_mutex_lock(&stub->lock);
-    stopping = stub->stopping;
-    pthread_mutex_unlock(&stub->lock);
-    return stopping;
-}
-
-static void *executor_stub_thread(void *opaque)
+static int executor_stub_execute(
+    void *opaque, const struct wvm_vcpu_handoff_request *request,
+    struct wvm_vcpu_handoff_result *result, uint8_t *result_context,
+    size_t result_context_capacity, char *error, size_t error_len)
 {
     struct executor_stub *stub = opaque;
+    wvm_tcg_context_t context;
+    uint64_t fields = 0;
+    size_t encoded_bytes = 0;
 
-    while (!stub_stopping(stub)) {
-        struct pollfd pollfd = {
-            .fd = stub->fd,
-            .events = POLLIN,
-        };
-        uint8_t packet[sizeof(struct wvm_header) +
-                       sizeof(struct wvm_ipc_cpu_run_req)];
-        struct sockaddr_in peer;
-        socklen_t peer_len = sizeof(peer);
-        ssize_t received;
-        int poll_result;
-
-        poll_result = poll(&pollfd, 1, 100);
-        if (poll_result <= 0) {
-            continue;
-        }
-        received = recvfrom(stub->fd, packet, sizeof(packet), 0,
-                            (struct sockaddr *)&peer, &peer_len);
-        if (received != (ssize_t)sizeof(packet)) {
+    if (!stub || !request || !result || !result_context ||
+        result_context_capacity < WVM_VCPU_HANDOFF_MAX_RESULT_CONTEXT_BYTES ||
+        request->backend != WVM_VCPU_BACKEND_TCG ||
+        request->vcpu_index != 3 ||
+        wvm_x86_context_decode(
+            request->backend, request->context, request->context_bytes,
+            &fields, &context, sizeof(context), error, error_len) != 0 ||
+        fields != request->context_valid_fields ||
+        context.eip != UINT64_C(0x1122334455667788)) {
+        if (stub) {
             pthread_mutex_lock(&stub->lock);
             stub->valid = 0;
             pthread_mutex_unlock(&stub->lock);
-            continue;
         }
-        {
-            const struct wvm_header *header =
-                (const struct wvm_header *)packet;
-            const struct wvm_ipc_cpu_run_req *request =
-                (const struct wvm_ipc_cpu_run_req *)(packet + sizeof(*header));
-            struct wvm_header response_header;
-            struct wvm_ipc_cpu_run_ack response_ack;
-            uint8_t response[sizeof(response_header) + sizeof(response_ack)];
-
-            if (ntohl(header->magic) != WVM_MAGIC ||
-                ntohs(header->msg_type) != MSG_VCPU_RUN ||
-                ntohs(header->payload_len) != sizeof(*request) ||
-                ntohl(header->slave_id) != WVM_ENCODE_ID(TEST_VM_ID, 7) ||
-                ntohl(header->target_id) != WVM_ENCODE_ID(TEST_VM_ID, 7) ||
-                request->mode_tcg != 1 ||
-                request->slave_id != WVM_NODE_AUTO_ROUTE ||
-                request->vcpu_index != 3 ||
-                request->ctx.tcg.eip != UINT64_C(0x1122334455667788)) {
-                pthread_mutex_lock(&stub->lock);
-                stub->valid = 0;
-                pthread_mutex_unlock(&stub->lock);
-                continue;
-            }
-            memset(&response_header, 0, sizeof(response_header));
-            memset(&response_ack, 0, sizeof(response_ack));
-            response_header.magic = htonl(WVM_MAGIC);
-            response_header.msg_type = htons(MSG_VCPU_EXIT);
-            response_header.payload_len = htons(sizeof(response_ack));
-            response_header.slave_id = header->target_id;
-            response_header.target_id = header->slave_id;
-            response_header.req_id = header->req_id;
-            response_ack.status = 0;
-            response_ack.mode_tcg = 1;
-            response_ack.ctx.tcg = request->ctx.tcg;
-            response_ack.ctx.tcg.eip += 4;
-            memcpy(response, &response_header, sizeof(response_header));
-            memcpy(response + sizeof(response_header), &response_ack,
-                   sizeof(response_ack));
-            if (sendto(stub->fd, response, sizeof(response), MSG_NOSIGNAL,
-                       (const struct sockaddr *)&peer, peer_len) !=
-                (ssize_t)sizeof(response)) {
-                pthread_mutex_lock(&stub->lock);
-                stub->valid = 0;
-                pthread_mutex_unlock(&stub->lock);
-            }
-        }
-        pthread_mutex_lock(&stub->lock);
-        stub->received++;
-        pthread_mutex_unlock(&stub->lock);
-        break;
+        return -EPROTO;
     }
-    return NULL;
-}
-
-static int executor_stub_start(struct executor_stub *stub)
-{
-    struct sockaddr_in address;
-    socklen_t address_len = sizeof(address);
-
-    memset(stub, 0, sizeof(*stub));
-    stub->fd = -1;
-    stub->valid = 1;
-    if (pthread_mutex_init(&stub->lock, NULL) != 0) {
-        return -1;
+    context.eip += 4;
+    if (wvm_x86_context_encode(
+            request->backend, request->context_valid_fields, &context,
+            sizeof(context), result_context, result_context_capacity,
+            &encoded_bytes, error, error_len) != 0) {
+        return -EPROTO;
     }
-    stub->fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (stub->fd < 0) {
-        pthread_mutex_destroy(&stub->lock);
-        return -1;
-    }
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(stub->fd, (const struct sockaddr *)&address, sizeof(address)) !=
-            0 ||
-        getsockname(stub->fd, (struct sockaddr *)&address, &address_len) !=
-            0 ||
-        pthread_create(&stub->thread, NULL, executor_stub_thread, stub) != 0) {
-        close(stub->fd);
-        pthread_mutex_destroy(&stub->lock);
-        return -1;
-    }
-    stub->port = ntohs(address.sin_port);
-    return 0;
-}
-
-static void executor_stub_stop(struct executor_stub *stub)
-{
-    if (!stub || stub->fd < 0) {
-        return;
-    }
+    memset(result, 0, sizeof(*result));
+    result->protocol_version = WVM_VCPU_HANDOFF_RESULT_VERSION;
+    result->status = WVM_VCPU_HANDOFF_RESULT_SUCCESS;
+    result->exit_class = WVM_VCPU_EXIT_BUDGET;
+    result->backend = request->backend;
+    result->vm_id = request->vm_id;
+    result->vm_incarnation = request->vm_incarnation;
+    result->manifest_generation = request->manifest_generation;
+    result->origin_physical_node_id = request->origin_physical_node_id;
+    result->origin_runtime_instance_id = request->origin_runtime_instance_id;
+    result->vcpu_index = request->vcpu_index;
+    result->handoff_sequence = request->handoff_sequence;
+    result->produced_memory_fence_id = request->memory_fence_id + 1U;
+    memcpy(result->operation_id, request->operation_id,
+           sizeof(result->operation_id));
+    result->context_schema_version = request->context_schema_version;
+    result->context_valid_fields = request->context_valid_fields;
+    result->context = result_context;
+    result->context_bytes = encoded_bytes;
     pthread_mutex_lock(&stub->lock);
-    stub->stopping = 1;
+    stub->received++;
     pthread_mutex_unlock(&stub->lock);
-    pthread_join(stub->thread, NULL);
-    close(stub->fd);
-    pthread_mutex_destroy(&stub->lock);
-    stub->fd = -1;
+    return 0;
 }
 
 static int make_request(const struct wvm_node_runtime_manifest *manifest,
@@ -532,7 +444,7 @@ int main(void)
     unsigned int stub_received = 0;
     int stub_valid = 0;
     int sent_initialized = 0;
-    int stub_started = 0;
+    int stub_initialized = 0;
     int exit_code = 1;
     void *bridge = NULL;
     char error[256] = {0};
@@ -611,14 +523,16 @@ int main(void)
         return 1;
     }
     sent_initialized = 1;
-    if (expect(executor_stub_start(&stub) == 0,
-               "start local legacy executor stub")) {
+    memset(&stub, 0, sizeof(stub));
+    stub.valid = 1;
+    if (expect(pthread_mutex_init(&stub.lock, NULL) == 0,
+               "initialize typed executor stub")) {
         pthread_cond_destroy(&sent.available);
         pthread_mutex_destroy(&sent.lock);
         wvm_route_runtime_destroy(&routes);
         return 1;
     }
-    stub_started = 1;
+    stub_initialized = 1;
     memset(&config, 0, sizeof(config));
     config.manifest = &manifest;
     config.runtime_gate = &gate;
@@ -628,7 +542,8 @@ int main(void)
     config.runtime_connection_id = connection_id;
     config.operation_retention_horizon_ms =
         snapshot.operation_retention_horizon_ms;
-    config.executor_service_port = stub.port;
+    config.execute_handoff = executor_stub_execute;
+    config.execute_handoff_opaque = &stub;
     config.send_envelope = capture_response;
     config.send_envelope_opaque = &sent;
     if (expect(wvm_executor_bridge_dispatch_init(&config, &bridge, error,
@@ -641,7 +556,7 @@ int main(void)
         expect(wvm_executor_bridge_dispatch(bridge, &envelope, error,
                                             sizeof(error)) == 0 &&
                    wait_for_response(&sent, 1) == 0,
-               "execute typed handoff through the local executor")) {
+               "execute typed handoff through the typed local executor ABI")) {
         goto out;
     }
     pthread_mutex_lock(&sent.lock);
@@ -744,8 +659,8 @@ int main(void)
     exit_code = 0;
 out:
     wvm_executor_bridge_dispatch_destroy(bridge);
-    if (stub_started) {
-        executor_stub_stop(&stub);
+    if (stub_initialized) {
+        pthread_mutex_destroy(&stub.lock);
     }
     if (sent_initialized) {
         pthread_cond_destroy(&sent.available);

@@ -11,9 +11,10 @@ specifications respectively. VM manifests and resource reservations are owned
 by `runtime-manifest-lifecycle.md` and `resource-placement-admission.md`; this
 specification supplies their eligible-member and route-snapshot inputs.
 
-This specification is normative for new membership and topology work. Current
-`NODE`, `ROUTE`, heartbeat, and gateway control paths describe compatibility
-behavior only; they are not automatically conforming implementations.
+This specification is normative for all membership and topology work. Current
+`NODE`, `ROUTE`, heartbeat, and legacy gateway control paths are not production
+inputs; topology records and authenticated membership control messages are the
+only authoritative inputs.
 
 ## 1. Goal and Non-Goals
 
@@ -43,6 +44,20 @@ Non-goals for V1:
   registration or removal operation.
 - Requiring a specific control-plane database, consensus implementation, or
   authentication mechanism before the state and transitions are specified.
+
+### 1.1 Minimum usable boundary
+
+The minimum usable system includes the ordinary control-plane path for member
+join, compute cordon, safe drain, and gateway replacement. A newly joined
+member becomes eligible only after identity/capability validation and an
+acknowledged route snapshot. Cordon blocks new placement, a compute drain
+rejects active VM dependencies, and gateway replacement requires a verified
+alternate path before publication.
+
+The minimum system does not include automatic live migration, coordinator high
+availability, transparent recovery of lost guest state, or aggregate
+multi-scope host transactions. Those are extended hardening work and must not
+weaken the fail-closed behavior of the basic operations.
 
 ## 2. Authority and Version Domains
 
@@ -511,6 +526,8 @@ completion from a member process still being alive.
 | --- | --- | --- |
 | `common_include/wavevm_resources.c` | Parses static `NODE` records and allocates sequential vnode ranges at startup. | Import as bootstrap input into the control-plane registry; do not make it the long-term authority. |
 | `common_include/wavevm_membership_controller.c` and `wavevm_membership_control.c` | The authority persists authenticated node/gateway registration, desired and observed member state, dependency counts, route prepare/ACK/commit/retire decisions, one-scope fail-closed gateway-drain prepare/commit/abort frames, and fenced compute/gateway cordon transitions. The V1 receiver exposes canonical `GatewayDrainRequest` and `MemberCordonRequest` only to transport-authenticated `EXECUTOR` actors accepted by separately configured route-management and membership-management callbacks, and durably replays successful registration, rejoin, drain, and cordon results. | Extend the bounded one-scope drain into an explicit aggregate transaction before permitting multi-scope gateway or host drains. Bind both management authorization callbacks to the real executor/control-plane trust domain rather than test adapters. The coordinator/topology owner captures deep-copied controller records, then combines that immutable membership revision with separately owned capability and reservation evidence. It must not construct runtime membership from `NODE`/`ROUTE` files. |
+| `common_include/wavevm_control_transport.[ch]` | Provides a length-prefixed, reliable ordered stream adapter for the authenticated membership receiver. It decodes local V1 envelopes, bounds frame allocation, obtains actor identity only from the transport authentication callback, invokes the one owner dispatch, and writes the fixed 72-byte `CTRL_RESULT` on the same stream. | Bind the adapter to the real control-plane owner and its authenticated stream listener lifecycle. The adapter must remain transport-only: it must not create a second membership authority or infer actor identity from packet fields, source addresses, or payloads. |
+| `common_include/wavevm_control_owner.[ch]` | Provides the lifecycle boundary for one protected local Unix stream listener, creates one transport instance per accepted client, and joins client threads during shutdown. It owns no membership or route records; typed `authenticate` and `apply`/`dispatch` callbacks remain the only authority boundary. | Embed this owner in the user-space control-plane service that supplies the durable membership plane and real authentication policy. A remote authenticated stream may use the same transport contract, but it must not bypass the owner or create a second membership cache. |
 | `common_include/wavevm_membership_coordinator.c` | Composes authenticated join, compute cordon/drain/remove, and one-scope gateway successor prepare/required-ACK/commit-or-abort operations. Replays committed or removed operations from the controller's durable state and uses a lock-safe member status copy. | Connect this coordinator to the real control-plane transport and manifest/topology planner. Aggregate multiple affected VM scopes and host-role drains before allowing production removal. |
 | `gateway_service/aggregator.c` | Parses `ROUTE` groups, learns addresses, and offers an in-place route add/update control path. | Consume prepared immutable snapshots; do not infer membership from packet source or modify live maps as membership operations. |
 | `master_core/user_backend.c` | Uses a fixed `WVM_MAX_GATEWAYS` table and sends through a local sidecar. | Keep only local sidecar/derived next-hop state in the node runtime; remove global flat-target assumptions after the route-scope contract exists. |
@@ -524,20 +541,20 @@ in this specification.
 
 ## 9. Compatibility and Migration
 
-1. Keep existing `NODE` and `ROUTE` parsing as an explicit bootstrap adapter.
-2. Add a control-plane registry that imports those records into versioned
-   desired state without changing packet behavior.
-3. Generate read-only route snapshots from the registry and compare them to
-   current script-generated tables in flat and fractal fixtures.
+1. Remove direct `NODE` and `ROUTE` parsing from production launch paths.
+2. Use the control-plane registry as the sole source of versioned desired
+   membership state.
+3. Generate immutable route snapshots from the registry for flat and fractal
+   topology fixtures.
 4. Add prepare/ack/commit/retire around gateway snapshot replacement before
    exposing live route updates.
 5. Add persisted RequiredAckSet, independent control ACK path, and
    predecessor operation-retention handling before permitting live replacement.
 6. Add compute/gateway cordon/drain checks and host-role/failure-domain
    transactions before permitting role or host removal.
-7. Replace fixed global route assumptions only after the identity/routing and
-   kernel-accelerator specifications define the correct per-Pod and per-VM
-   cache scope.
+7. Replace fixed global route assumptions using the identity/routing and
+   kernel-accelerator specifications; do not preserve a legacy flat cache as a
+   compatibility target.
 
 Compatibility must fail closed for a missing nonzero VM route. It must not strip
 the VM namespace, guess a member from a heartbeat, or treat a route-learning
@@ -545,8 +562,16 @@ entry as a substitute for an admitted snapshot.
 
 ## 10. Acceptance Tests
 
+The join, cordon, safe drain, route-snapshot publication, and verified gateway
+replacement tests form the minimum usable topology gate. Failure races and
+multi-scope host recovery are extended hardening and do not block the first
+correct member lifecycle.
+
 - A compute-node join remains non-routable and non-schedulable until every
   required route-snapshot prepare acknowledgement succeeds.
+- The control owner publishes a protected local stream before accepting clients;
+  concurrent clients receive independently correlated typed results, EOF closes
+  only that client, and owner stop joins clients and removes the listener.
 - A gateway join rejects cyclic, incomplete, or one-way topology links.
 - A snapshot update under active traffic never exposes a partially populated
   route map or changes VM namespace.
@@ -559,20 +584,20 @@ entry as a substitute for an admitted snapshot.
 - Gateway drain succeeds only with a verified alternate path and preserves
   bounded in-flight request behavior.
 - Attempting to remove a sole gateway path fails without producing a black hole.
-- Kill the departing gateway before/during/after successor prepare. The route
+- **Extended:** Kill the departing gateway before/during/after successor prepare. The route
   transaction either commits from its persisted survivor ACK set or returns a
   bounded failure; it never waits for the departed gateway's ACK.
-- Race cordon, gateway drain, health failure, and node/gateway instance change
+- **Extended:** Race cordon, gateway drain, health failure, and node/gateway instance change
   with every candidate admission stage. No invalidated candidate reaches
   `RUNNING`, while existing committed allocations are not silently replanned.
-- A host carrying an idle compute role and a gateway for another VM cannot be
+- **Extended:** A host carrying an idle compute role and a gateway for another VM cannot be
   removed until successor routes and predecessor drains finish. A host failure
   marks all hosted roles unavailable together.
 - VM A route-scope retirement and VM B route activation on one gateway retain
   distinct current/predecessor snapshots even with overlapping raw vnode IDs.
-- An unplanned compute-node or gateway failure produces the documented VM
+- **Extended:** An unplanned compute-node or gateway failure produces the documented VM
   degraded/paused/failed result rather than a false success.
-- A reappearing member with a stale instance ID cannot overwrite a newer record
+- **Extended:** A reappearing member with a stale instance ID cannot overwrite a newer record
   or become active without revalidation.
 - Flat and fractal fixtures retain the same VM namespace and route-generation
   semantics, while each leaf route domain remains within its declared fan-out.

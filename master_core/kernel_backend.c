@@ -73,7 +73,7 @@ struct wvm_mem_slot {
 
 // [Fix] Multi-VM: 引用全局 vm_id，用于 composite ID 编码
 // In kernel module context, define it here (main_wrapper.c is userspace-only)
-uint8_t g_my_vm_id = 0;
+uint32_t g_my_vm_id = 0;
 EXPORT_SYMBOL(g_my_vm_id);
 
 static int module_service_port = 9000;
@@ -247,13 +247,13 @@ static struct wvm_kernel_context *wvm_context_from_vma(
     return wvm_context_for_file(file_context);
 }
 
-uint8_t wvm_kernel_current_vm_id(void)
+uint32_t wvm_kernel_current_vm_id(void)
 {
     uint32_t vm_id = READ_ONCE(g_kernel_context.identity.vm_id);
 
     if (vm_id == 0)
         vm_id = READ_ONCE(g_my_vm_id);
-    return (uint8_t)vm_id;
+    return vm_id;
 }
 EXPORT_SYMBOL_GPL(wvm_kernel_current_vm_id);
 
@@ -1583,7 +1583,6 @@ static int wvm_context_request_valid(
         request->magic != WVM_KERNEL_CONTEXT_MAGIC ||
         request->version != WVM_KERNEL_CONTEXT_ABI_VERSION ||
         request->vm_id == 0 ||
-        request->vm_id > 0xffU ||
         request->vm_incarnation == 0 ||
         request->manifest_generation == 0 ||
         !wvm_bytes_nonzero(request->candidate_manifest_digest,
@@ -1656,7 +1655,7 @@ static int wvm_context_bind_file(
     file_context->context = &g_kernel_context;
     file_context->identity = identity;
     file_context->bound = 1;
-    WRITE_ONCE(g_my_vm_id, (uint8_t)identity.vm_id);
+    WRITE_ONCE(g_my_vm_id, identity.vm_id);
     atomic_inc(&g_kernel_context.refs);
     mutex_unlock(&g_context_mutex);
     return 0;
@@ -1692,7 +1691,7 @@ static int wvm_context_unbind_file(
     return result;
 }
 
-static int wvm_context_accepts_vm_id(uint8_t vm_id)
+static int wvm_context_accepts_vm_id(uint32_t vm_id)
 {
     int result = 0;
 
@@ -1899,7 +1898,7 @@ static long wvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
     }
 
     case IOCTL_SET_VM_ID: {
-        uint8_t vm_id;
+        uint32_t vm_id;
 
         if (copy_from_user(&vm_id, argp, sizeof(vm_id))) return -EFAULT;
         if (wvm_context_accepts_vm_id(vm_id) != 0) return -EPERM;

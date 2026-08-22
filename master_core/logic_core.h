@@ -37,10 +37,10 @@ extern int g_my_node_id;
 extern uint32_t g_curr_epoch;
 extern uint8_t g_my_node_state;
 #ifdef __KERNEL__
-uint8_t wvm_kernel_current_vm_id(void);
+uint32_t wvm_kernel_current_vm_id(void);
 #define WVM_CURRENT_VM_ID() wvm_kernel_current_vm_id()
 #else
-extern uint8_t g_my_vm_id;
+extern uint32_t g_my_vm_id;
 #define WVM_CURRENT_VM_ID() g_my_vm_id
 #endif
 

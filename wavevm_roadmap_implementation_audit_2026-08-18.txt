@@ -1,0 +1,359 @@
+WaveVM 纲领落地审计报告
+========================
+
+审计日期：2026-08-18
+审计对象：/workspaces/WaveVM_Frontier-X
+审计范围：docs/、docs/specs/、common_include/、node_runtime/、master_core/、
+          slave_daemon/、gateway_service/、ctl_tool/、wavevm-qemu/、scripts/、
+          artifacts/、tests/control-plane/
+
+一、先给结论
+------------
+
+这次审计评估的是“WaveVM 重构纲领/路线图在源码、测试和运行脚本中的实际落地程度”，
+不是评估文档是否写得完整。
+
+结论：项目已经明显脱离纯设计阶段，但还没有达到纲领所描述的完整产品状态，当前处于
+“Phase 0-4 的规范和原语基本铺开，Phase 5-7 开始接线，Phase 8-10 尚未完成”的迁移
+中间态。
+
+按不同口径估计：
+
+1. 规范、数据结构、协议原语和单元测试覆盖：约 60%-75%。
+2. 按路线图 acceptance criteria 衡量的可运行能力：约 40%-50%。
+3. 可对外宣称的完整端到端产品能力：约 25%-40%。
+
+这些不是按代码行数计算的精确百分比，而是按每个 Phase 的交付物、验收条件和可复现
+运行证据做的工程估计。主要差距来自：单测很多，但真实多节点/多 VM/故障恢复证据很少；
+同时 Mode A 内核加速仍然明确是 single-context，不能满足多 VM 目标。
+
+目前不能宣称已经实现以下完整能力：
+
+- manifest-driven 的所有启动路径；
+- 同一物理机上安全运行多个 Mode B VM；
+- 动态 membership、gateway drain/remove 和生命周期事务的完整端到端闭环；
+- 多 VM 安全的 Mode A/kernel accelerator；
+- 统一的 pluggable fault engine（尤其 UFFD）；
+- 按纲领重新生成、带故障注入和清理证明的 CI。
+
+二、审计方法和已执行验证
+------------------------
+
+审计依据：
+
+- docs/wavevm-refactor-roadmap.md（Phase 0-10 及 acceptance criteria）；
+- docs/wavevm-architecture-baseline.md；
+- docs/wavevm-mode-boundary-audit.md；
+- docs/specs/*.md 的当前代码映射、偏差和 acceptance tests；
+- 实际源码、构建文件、控制面测试和 artifacts/scripts 启动脚本。
+
+已执行验证：
+
+- tests/control-plane 下 40 个独立测试脚本，均以 bash 执行通过：
+  TOTAL=40 PASS=40 FAIL=0。
+- make -C gateway_service -B：成功；有既有 unused variable/function 警告。
+- make -C node_runtime -B：成功；有编译警告但未失败。
+- make -C ctl_tool -B：成功。
+- ./wavevm_node_runtime 无参数返回 rc=2，并打印：
+  Usage: ./wavevm_node_runtime --manifest FILE --node-instance N
+- 直接执行测试脚本会因仓库脚本缺少 executable 权限而得到 Permission denied；
+  用 bash 脚本执行时 40/40 通过。这个问题属于测试入口权限，不应误报为测试逻辑失败。
+
+未完成或未能证明的验证：
+
+- 真实跨主机双节点/多节点运行；
+- 同一物理机多 VM 的端口、SHM、socket、route、request ID、临时目录和日志隔离；
+- VM create -> prepare -> activate -> commit -> start -> running 的完整事务；
+- coordinator crash/restart recovery；
+- compute/gateway join、cordon、drain、remove 及故障注入；
+- gateway 失效恢复、同机 compute/gateway 移除和 route black-hole 防护；
+- 两个 Mode A VM 同时存在；
+- 统一 fault-engine contract 的跨后端测试。
+
+三、Phase 逐项落地判断
+----------------------
+
+状态标记：
+  基本落地 = 主要交付物已有，但仍可能有验收缺口；
+  部分落地 = 原语/接线存在，关键闭环或边界仍缺；
+  未完成 = 只有旧机制或局部实验，未达到路线图目标。
+
+Phase 0：冻结架构方向
+状态：基本落地（约 60%-70%）
+
+已落地：
+
+- architecture baseline 和 refactor roadmap 明确 Mode B 为 canonical baseline，
+  Mode A 为可选 accelerator；
+- master/slave 被重新解释为逻辑角色，node runtime/executor ABI 开始出现；
+- 新的 identity、manifest、route、membership 规格已建立。
+
+不足：
+
+- 这是架构和审查约束，不能仅靠文档证明“冻结”已经在所有入口生效；
+- scripts/artifacts 仍大量生成 NODE/ROUTE 和旧 master/slave 启动参数；
+- 旧 kernel/user semantic path 仍可被运行脚本直接启动。
+
+证据：docs/wavevm-refactor-roadmap.md:131-181；scripts/ci_dual_node.sh:193-345。
+
+Phase 1：记录当前 Mode A/Mode B 边界
+状态：基本落地（约 60%-70%）
+
+已落地：
+
+- baseline、mode-boundary-audit 和 kernel accelerator 规格记录了主要 owner、
+  IOCTL、用户态/内核态边界和兼容路径；
+- kernel context identity、manifest digest、route snapshot key 等边界字段已经
+  出现在实现中。
+
+不足：
+
+- 代码仍保留大量 module/global state 和 legacy injection；
+- 记录边界不等于所有调用路径已被强制收敛到单一 authority。
+
+Phase 2：memory/vCPU/local executor 语义契约
+状态：部分落地（约 45%-60%）
+
+已落地：
+
+- memory/local-memory、vCPU handoff、handoff cache、x86 context、executor bridge、
+  vCPU service 等结构和 API 已出现；
+- 对应 control-plane 单测已经覆盖 identity、handoff、cache、service、executor 等
+  多个原语；
+- node_runtime 已能把 memory service、vCPU service 和 executor bridge 接到同一入口。
+
+仍缺：
+
+- 完整的 ACK/version/epoch 语义和 dirty write 版本间隙恢复尚未由端到端证据证明；
+- subscriber 生命周期、并发 writer、锁序、取消、超时、重试和进程崩溃恢复仍有
+  规格与旧实现之间的偏差；
+- duplicate VCPU_RUN、跨 backend handoff、block flush/error propagation 的完整
+  acceptance 流程没有真实运行证明。
+
+Phase 3：identity、routing、wire/local IPC ABI
+状态：部分落地（约 55%-70%）
+
+已落地：
+
+- identity、canonical record、envelope、route snapshot、runtime dispatch 的源码和
+  单测已存在；
+- node_runtime 启动时读取 manifest、route snapshot、dispatch projection，并校验
+  VM/node/route identity。
+
+关键证据：
+
+- node_runtime/main.c:524-605：manifest gate、route snapshot 和 dispatch 校验；
+- node_runtime/main.c:607-675：强制 --manifest FILE --node-instance N；
+- common_include/ 与 tests/control-plane/ 中的 identity/canonical/envelope/route 测试。
+
+仍缺或有风险：
+
+- master_core/user_backend.c:57-86、:1120-1148 仍使用固定的
+  g_gateways[WVM_MAX_GATEWAYS]，并把 composite ID 解码为 raw node ID；
+- master_core/kernel_backend.c:197-210 仍有固定 gateway_table；
+- master_core/main_wrapper.c:282-328 明确存在 legacy flat route cache，fractal route
+  不能直接完全下沉到旧 raw-vnode 数组；
+- legacy NODE/ROUTE、vm_id=0 raw fallback 和固定 route domain 仍在生产/测试入口存在；
+- 因此不能据此宣称 flat/fractal 多 VM route namespace 已端到端隔离。
+
+Phase 4：capability、manifest、placement、admission、lifecycle
+状态：部分落地（约 40%-55%）
+
+已落地：
+
+- capability、manifest、placement、reservation、lifecycle、membership 等记录和
+  controller/coordinator 原语已加入 common_include；
+- candidate manifest、runtime gate、route snapshot、lifecycle projection 有测试；
+- ctl_tool 已能生成/读取部分 placement 结果。
+
+重要限制：
+
+- capability-fault-engines.md、runtime-manifest-lifecycle.md、
+  resource-placement-admission.md、cluster-membership-topology-lifecycle.md 等多份
+  spec 当前仍标记为“Status: proposed implementation specification”；
+- 尚未看到完整 capability probe/selection、manifest generator/orchestrator、
+  durable coordinator、live reservation RPC 和完整 join/cordon/drain/remove 控制链；
+- 规格中要求的 crash recovery、survivor RequiredAckSet、co-located failure domain
+  没有真实运行闭环证明。
+
+Phase 5：建立用户态 semantic authorities
+状态：部分落地（约 45%-60%）
+
+已落地：
+
+- wavevm_node_runtime 作为统一进程入口，按 manifest 启动 master 逻辑线程和本地
+  executor/slave 逻辑；
+- 启动顺序包含 manifest gate、route activation、dispatch projection、registration、
+  memory/vCPU/executor/ingress 初始化；
+- executor bridge 和 local IPC ABI 已开始替代直接跨节点 slave endpoint。
+
+关键证据：node_runtime/main.c:635-1000。
+
+仍缺：
+
+- 代码仍调用 wavevm_master_main()/wavevm_slave_main()，并保留旧 IPC、环境变量和
+  全局安装接口；
+- 还不能证明 control plane 已成为唯一 identity/placement/lifecycle authority；
+- kernel logic_core 和 IOCTL route injection 仍承载实际语义，而不只是派生 cache；
+- KVM/TCG 还没有一套被真实运行验证为等价的 contract-level event 流。
+
+Phase 6：VM runtime isolation
+状态：部分落地（约 35%-50%）
+
+已落地：
+
+- manifest gate 要求物理节点、instance、activation fence、route snapshot 和 dispatch
+  一致；
+- node_runtime 会从 manifest 派生 executor socket 等局部 endpoint（见
+  node_runtime/main.c:794-815）；
+- 统一 runtime 入口已经可以拒绝缺失参数和 identity mismatch。
+
+未达到验收条件：
+
+- 现有 flat/fractal/KVM 脚本仍手写固定端口、/wvm_* SHM、WVM_INSTANCE_ID、QEMU
+  -numa/-smp/-object 和 hostfwd；
+- 没有成功证据证明两个 Mode B VM 在同一 physical node 上所有独占资源均隔离；
+- 没有删除一个 VM 后另一个 VM 资源仍完整的测试；
+- legacy entry points 仍可能绕过 manifest gate。
+
+Phase 7：placement、admission、member lifecycle
+状态：部分落地（约 30%-45%）
+
+已落地：
+
+- membership_control/controller/coordinator、placement 和 lifecycle projection 原语
+  已有源码与单测；
+- 测试覆盖了若干 member/gateway 记录、依赖、successor transaction、drain reject
+  等局部规则；
+- 40/40 control-plane 测试通过，说明原语内部状态机质量已有基础。
+
+仍未证明的关键闭环：
+
+- VM create -> prepare -> activate -> commit -> start -> running；
+- 每个启动步骤失败后的精确资源清理；
+- coordinator crash/restart recovery 和单一 durable activation decision；
+- compute join/cordon/drain/remove、gateway join/drain/remove、unplanned failure；
+- gateway 失效时 RequiredAckSet 是否会被失效 gateway 自身 ACK 卡住；
+- 同一物理主机同时承担 compute/gateway 时移除是否会留下 route black hole；
+- route snapshot 在活跃流量中替换、回滚、retire 的真实包级证明。
+
+结论：这些问题在新 controller 原语和测试中已有设计痕迹，但尚未形成可运行的
+多节点控制面闭环，因此不能算“已完全解决”。
+
+Phase 8：kernel accelerator 多 context
+状态：未完成（约 10%-20%）
+
+这是当前最明确的硬阻塞。
+
+- master_core/kernel_backend.c:86-92 明确写着 transitional context boundary，
+  registry 只允许一个 manifest identity；
+- :134-135 仍是全局 g_context_mutex 和 g_kernel_context；
+- :1643-1647 对第二个不同 identity 返回 -EBUSY；
+- :1763-1766 暴露 max_concurrent_contexts=1 和 WVM_KERNEL_CAP_SINGLE_CONTEXT；
+- :1991-2070 初始化单一全局 context、单一 request namespace、page tree、transport。
+
+因此目前只实现了“带 identity 校验的单 context 防误覆盖”，没有实现纲领要求的
+per-VM context、每个 ioctl/mmap 绑定 context、独立 teardown 和两 VM 共存。
+
+Phase 9：pluggable fault engines
+状态：未完成（约 15%-25%）
+
+已存在的是旧/局部机制：
+
+- wavevm-qemu/accel/wavevm/wavevm-user-mem.c:44-60 使用大量全局内存/fault 状态；
+- :127-159 有 SIGSEGV/mprotect 保护路径，且仅在特定 TCG/slave 条件启用；
+- slave_daemon/slave_hybrid.c:1761 起有 KVM_GET_DIRTY_LOG 路径。
+
+缺失：
+
+- 完整 fault_engine_ops 注册/选择/生命周期接口；
+- UFFD capability probe、UFFD engine 和共同 adapter；
+- 所有 engine 共享同一个 page version/dirty/consistency contract 的测试；
+- engine 失败、切换和 no-root fallback 的统一状态转移。
+
+所以“已有 SIGSEGV、mprotect、KVM dirty log”不能等价于 Phase 9 已完成。
+
+Phase 10：按 contract/manifest 重建 CI
+状态：未完成（约 10%-20%）
+
+已有：
+
+- scripts/ci_dual_node.sh、artifacts/flat-tcg-test/run.sh、
+  artifacts/fract-tcg-test/run.sh、artifacts/fract-kvm-test/run_kvm_fractal.sh；
+- 部分脚本有 bounded log、guest SSH、远端 vCPU/TCG evidence 检查和 planner 输出。
+
+但这些脚本仍：
+
+- 直接写 NODE/ROUTE；
+- 直接设置固定端口、/wvm_* SHM、WVM_INSTANCE_ID 和环境变量；
+- 手写 QEMU -numa/-smp/-object/hostfwd；
+- 没有完整 manifest-driven 启动和 capability matrix 记录；
+- 没有纲领要求的网络 loss/duplication/reordering/delay fault injection；
+- 没有完整 QEMU/node-runtime/executor/gateway startup/runtime failure matrix；
+- 没有同机多 VM isolation、VM ID reuse、dirty gap、gateway rollback 等验收套件；
+- 不能仅凭进程存活或端口监听宣称分布式 guest 路径成功。
+
+四、跨阶段关键发现（按阻塞程度排序）
+--------------------------------------
+
+1. Mode A 多 VM 是硬阻塞
+   kernel backend 明确 single-context。即使用户态控制面原语继续增加，两个 Mode A
+   VM 仍不能安全共存于同一物理节点。
+
+2. 新 manifest 路径和旧启动路径并存
+   node_runtime 已有严格 manifest gate，但 artifacts/scripts 和旧 master/slave
+   binary 仍可绕过它。没有入口收敛，就不能把 manifest 视为全系统唯一事实来源。
+
+3. 控制面原语超过真实控制面
+   40 个单测全通过，证明数据结构和局部状态机有质量；但没有真实跨进程、跨节点、
+   crash/retry/failure injection 证据，不能把“原语完成”升级为“生命周期完成”。
+
+4. 路由兼容层仍按裸 node 组织
+   composite identity 虽已编码和校验，但 user/kernel backend 仍把 gateway table、
+   route cache 和部分 IOCTL 按 raw node/WVM_MAX_GATEWAYS 处理。这是多 VM/fractal
+   隔离的主要残留点。
+
+5. fault engine 仍是实现分支而非插件契约
+   TCG 的 mprotect/SIGSEGV 与 KVM dirty log 各自存在，尚未由统一 capability/fault
+   engine contract 驱动。
+
+6. 测试入口权限不一致
+   40 个脚本内容用 bash 全部通过，但脚本本身缺少 executable bit。CI 若直接执行路径，
+   会在测试逻辑前失败；这应作为 CI hygiene 项修复，而不是功能通过率的一部分。
+
+五、建议的下一组验收门槛（仅建议，不在本次修改）
+------------------------------------------------
+
+优先顺序建议：
+
+1. 先做 manifest-driven 双 VM 同机 Mode B E2E：验证端口、SHM、socket、route、
+   request ID、日志、临时目录和删除隔离，并把 guest login/远端 vCPU/远端 memory
+   作为成功条件。
+2. 把 create/prepare/activate/commit/start/abort/recovery 做成可注入故障的真实
+   控制面测试，覆盖 coordinator 重启和每一步精确清理。
+3. 固化 gateway ACK survivor set、gateway drain/remove、同机 compute+gateway host
+   removal 和 route black-hole 负例/正例。
+4. 完成 kernel per-VM context 前，明确把 Mode A 限制为 single-VM-per-node，并在
+   admission 中强制拒绝第二个 Mode A VM；完成后再做两 VM context isolation。
+5. 定义并实现 fault_engine_ops、UFFD probe/adapter，以及跨 SIGSEGV/KVM/UFFD 的
+   一致性合同测试。
+6. 最后将 flat/fractal、TCG/KVM、mixed accelerator、multi-VM 场景改为由 manifest
+   生成，并加入网络和生命周期 fault injection、固定超时和残留清理检查。
+
+六、最终判定
+------------
+
+WaveVM 不是“还没做”，而是已经完成了相当一部分架构收敛、协议原语和控制面基础；
+但纲领真正想解决的三件事——多 VM 隔离、动态生命周期/拓扑、Mode A 作为可选加速器
+而不是第二套语义 authority——目前都还没有完成闭环。
+
+最准确的状态描述是：
+
+  规范与原语：已铺开；
+  统一 runtime：已开始接线；
+  控制面：有局部状态机和单测，缺真实事务/故障闭环；
+  Mode A 多 context：未完成；
+  fault engine/manifest-driven CI：未完成。
+
+本报告为只读审计结果。未回滚或删除工作树中已有改动、构建产物、测试产物或
+session-backup；没有修改 WaveVM 源码和项目文档。

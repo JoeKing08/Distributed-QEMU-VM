@@ -6,8 +6,10 @@
 
 #include "wavevm_control.h"
 #include "wavevm_coordinator.h"
+#include "wavevm_membership_control.h"
 
 #define WVM_CONTROL_PLANE_MAX_RECORD_BYTES (1024U * 1024U)
+#define WVM_CONTROL_PLANE_PATH_MAX 4096U
 
 enum wvm_control_plane_submit_result {
     WVM_CONTROL_PLANE_SUBMIT_NEW = 1,
@@ -45,6 +47,32 @@ struct wvm_control_plane_runtime_manifest_entry {
 };
 
 /*
+ * Membership is configured as a component of the one control-plane owner.
+ * The caller supplies bounded tables and the transport-owned result sink;
+ * neither the controller nor the receiver creates a process-global registry.
+ */
+struct wvm_control_plane_membership_config {
+    struct wvm_membership_controller_member_entry *members;
+    size_t member_capacity;
+    struct wvm_membership_controller_route_entry *routes;
+    size_t route_capacity;
+    struct wvm_membership_dependency *dependencies;
+    size_t dependency_capacity;
+    struct wvm_membership_control_operation *operations;
+    size_t operation_capacity;
+    const char *membership_journal_path;
+    const char *control_journal_path;
+    wvm_membership_controller_authorize_fn authorize;
+    void *authorize_context;
+    wvm_membership_control_authorize_management_fn authorize_management;
+    void *authorize_management_context;
+    wvm_membership_control_authorize_membership_fn authorize_membership;
+    void *authorize_membership_context;
+    wvm_membership_control_result_sink_fn result_sink;
+    void *result_sink_context;
+};
+
+/*
  * One local control-plane writer owns this durable journal. The caller owns
  * the entry storage so capacity is explicit and independent coordinators can
  * run without a hidden global registry.
@@ -61,6 +89,14 @@ struct wvm_control_plane {
     struct wvm_control_plane_runtime_manifest_entry *runtime_manifest_entries;
     size_t runtime_manifest_entry_count;
     size_t runtime_manifest_entry_capacity;
+    struct wvm_membership_controller membership_controller;
+    struct wvm_membership_control membership_control;
+    struct wvm_membership_control_dispatch_context membership_dispatch_context;
+    char membership_journal_path[WVM_CONTROL_PLANE_PATH_MAX];
+    char membership_control_journal_path[WVM_CONTROL_PLANE_PATH_MAX];
+    int membership_configured;
+    int membership_initialized;
+    int membership_open;
 };
 
 void wvm_control_plane_init(struct wvm_control_plane *plane,
@@ -85,6 +121,28 @@ void wvm_control_plane_set_runtime_manifest_entries(
     struct wvm_control_plane *plane,
     struct wvm_control_plane_runtime_manifest_entry *runtime_manifest_entries,
     size_t runtime_manifest_entry_capacity);
+
+/* Configure and open the durable membership authority owned by this plane. */
+int wvm_control_plane_configure_membership(
+    struct wvm_control_plane *plane,
+    const struct wvm_control_plane_membership_config *config,
+    char *error, size_t error_len);
+int wvm_control_plane_open_membership(struct wvm_control_plane *plane,
+                                      char *error, size_t error_len);
+void wvm_control_plane_close_membership(struct wvm_control_plane *plane);
+
+/* Signature-compatible ingress adapter for the authoritative control plane. */
+int wvm_control_plane_membership_dispatch(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor, char *error,
+    size_t error_len);
+
+/* Per-connection typed-result adapter; does not use the shared result sink. */
+int wvm_control_plane_membership_apply(
+    void *opaque, const struct wvm_envelope *request,
+    const struct wvm_member_key *authenticated_actor,
+    struct wvm_membership_control_result *result, char *error,
+    size_t error_len);
 
 /*
  * Replays the journal, verifies every completed frame, and restores all

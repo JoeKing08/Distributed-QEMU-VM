@@ -7,7 +7,7 @@ TARGET = ../wavevm_node_runtime
 
 MASTER_OBJS = master_logic.o master_user.o master_main.o
 SLAVE_OBJS = slave_hybrid.o slave_vfio.o
-COMMON_OBJS = resources.o sha256.o canonical.o identity.o runtime_names.o manifest.o lifecycle.o runtime_gate.o runtime_dispatch.o executor_abi.o envelope.o memory.o vcpu_handoff.o vcpu_handoff_cache.o x86_context.o local_memory.o route_runtime.o executor_bridge.o vcpu_coordinator.o vcpu_service.o memory_service.o ingress.o directory_store.o kvm_page_cache.o control.o route_delivery.o
+COMMON_OBJS = resources.o sha256.o canonical.o identity.o runtime_names.o manifest.o lifecycle.o runtime_gate.o runtime_dispatch.o executor_abi.o executor_session.o envelope.o memory.o vcpu_handoff.o vcpu_handoff_cache.o x86_context.o local_memory.o route_runtime.o executor_bridge.o vcpu_coordinator.o vcpu_service.o memory_service.o ingress.o directory_store.o kvm_page_cache.o control.o route_delivery.o
 
 all: $(TARGET)
 
@@ -23,11 +23,11 @@ master_logic.o: ../master_core/logic_core.c
 master_user.o: ../master_core/user_backend.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-master_main.o: ../master_core/main_wrapper.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Dmain=wavevm_master_main -c $< -o $@
+master_main.o: ../master_core/main_wrapper.c runtime_context.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-slave_hybrid.o: ../slave_daemon/slave_hybrid.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Dmain=wavevm_slave_main -c $< -o $@
+slave_hybrid.o: ../slave_daemon/slave_hybrid.c runtime_context.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 slave_vfio.o: ../slave_daemon/slave_vfio.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
@@ -60,6 +60,9 @@ runtime_dispatch.o: ../common_include/wavevm_runtime_dispatch.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 executor_abi.o: ../common_include/wavevm_executor_abi.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+executor_session.o: ../common_include/wavevm_executor_session.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 envelope.o: ../common_include/wavevm_envelope.c
