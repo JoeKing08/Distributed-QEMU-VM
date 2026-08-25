@@ -353,14 +353,40 @@ static int allocate_route_scope_id(void *context, uint64_t *route_scope_id,
 static int build_prepared_route(
     const struct wvm_coordinator_transaction *transaction,
     const struct wvm_gateway_record *gateway,
+    struct wvm_route_rule_record route_rules[1],
     struct wvm_required_ack_entry ack_entries[1],
-    struct wvm_required_ack_set *ack_set,
+    struct wvm_route_snapshot_record *snapshot,
     struct wvm_coordinator_prepared_route *prepared_route, char *error,
     size_t error_len)
 {
-    struct wvm_required_ack_set raw_ack_set;
-    uint8_t bytes[2048];
+    uint8_t bytes[4096];
+    uint8_t digest[WVM_SHA256_DIGEST_BYTES];
     size_t encoded_bytes;
+
+    if (!transaction || !gateway || !route_rules || !ack_entries || !snapshot ||
+        !prepared_route) {
+        return -1;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->route_snapshot_key.scope_key = transaction->route_scope_key;
+    snapshot->route_snapshot_key.topology_revision = 6;
+    snapshot->route_snapshot_key.route_generation = 1;
+    snapshot->membership_revision = 6;
+    snapshot->topology_kind = WVM_ROUTE_TOPOLOGY_FLAT;
+    snapshot->operation_retention_horizon_ms = 6000;
+    snapshot->retirement_policy = 1;
+    memset(route_rules, 0, sizeof(*route_rules));
+    route_rules[0].destination_kind = WVM_ROUTE_DESTINATION_EXACT_VNODE;
+    route_rules[0].destination_vnode_or_endpoint = gateway->gateway_id;
+    route_rules[0].next_hop_kind = WVM_ROUTE_NEXT_HOP_GATEWAY;
+    route_rules[0].next_hop_member.role_type = WVM_MANIFEST_ROLE_GATEWAY;
+    route_rules[0].next_hop_member.role_id = gateway->gateway_id;
+    route_rules[0].next_hop_member.instance_id = gateway->gateway_instance_id;
+    route_rules[0].next_hop_endpoint = gateway->endpoint;
+    route_rules[0].hop_limit = 1;
+    snapshot->next_hop_rules.entries = route_rules;
+    snapshot->next_hop_rules.count = 1;
+    snapshot->next_hop_rules.capacity = 1;
 
     memset(ack_entries, 0, sizeof(*ack_entries));
     ack_entries[0].member_key.role_type = WVM_MANIFEST_ROLE_GATEWAY;
@@ -368,30 +394,23 @@ static int build_prepared_route(
     ack_entries[0].member_key.instance_id = gateway->gateway_instance_id;
     ack_entries[0].endpoint = gateway->endpoint;
     ack_entries[0].role_type = WVM_MANIFEST_ROLE_GATEWAY;
-    ack_entries[0].expected_snapshot_key.scope_key = transaction->route_scope_key;
-    ack_entries[0].expected_snapshot_key.topology_revision = 6;
-    ack_entries[0].expected_snapshot_key.route_generation = 1;
-    memset(ack_entries[0].expected_snapshot_key.snapshot_digest, 0x91,
-           sizeof(ack_entries[0].expected_snapshot_key.snapshot_digest));
-
-    memset(&raw_ack_set, 0, sizeof(raw_ack_set));
-    raw_ack_set.entries.entries = ack_entries;
-    raw_ack_set.entries.count = 1;
-    raw_ack_set.entries.capacity = 1;
-    if (wvm_required_ack_set_encode(&raw_ack_set, bytes, sizeof(bytes),
-                                    &encoded_bytes, error, error_len) != 0) {
+    ack_entries[0].expected_snapshot_key = snapshot->route_snapshot_key;
+    snapshot->required_ack_set.entries.entries = ack_entries;
+    snapshot->required_ack_set.entries.count = 1;
+    snapshot->required_ack_set.entries.capacity = 1;
+    if (wvm_route_snapshot_record_encode(snapshot, bytes, sizeof(bytes),
+                                         &encoded_bytes, digest, error,
+                                         error_len) != 0) {
         return -1;
     }
-    memset(ack_set, 0, sizeof(*ack_set));
-    ack_set->entries.entries = ack_entries;
-    ack_set->entries.capacity = 1;
-    if (wvm_required_ack_set_decode(bytes, encoded_bytes, ack_set, error,
-                                    error_len) != 0) {
+    memcpy(snapshot->route_snapshot_key.snapshot_digest, digest, sizeof(digest));
+    memcpy(ack_entries[0].expected_snapshot_key.snapshot_digest, digest,
+           sizeof(digest));
+    if (wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0) {
         return -1;
     }
-    prepared_route->route_snapshot_key =
-        ack_entries[0].expected_snapshot_key;
-    prepared_route->required_ack_set = ack_set;
+    prepared_route->route_snapshot_key = snapshot->route_snapshot_key;
+    prepared_route->required_ack_set = &snapshot->required_ack_set;
     return 0;
 }
 
@@ -433,8 +452,8 @@ enum orchestrator_test_failure {
 
 struct orchestrator_test_hooks {
     const struct wvm_gateway_record *gateway;
+    struct wvm_route_rule_record *route_rules;
     struct wvm_required_ack_entry *ack_entries;
-    struct wvm_required_ack_set *ack_set;
     uint8_t route_operation_suffix;
     enum orchestrator_test_failure failure;
     unsigned route_prepares;
@@ -452,14 +471,15 @@ struct orchestrator_test_hooks {
 static int orchestrator_route_plan(
     void *opaque, const struct wvm_coordinator_transaction *transaction,
     struct wvm_coordinator_prepared_route *prepared_route,
-    struct wvm_route_transaction_record *route_transaction, char *error,
+    struct wvm_route_transaction_record *route_transaction,
+    struct wvm_route_snapshot_record *route_snapshot, char *error,
     size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
-    return build_prepared_route(transaction, hooks->gateway, hooks->ack_entries,
-                                hooks->ack_set, prepared_route, error,
-                                error_len) == 0 &&
+    return build_prepared_route(transaction, hooks->gateway, hooks->route_rules,
+                                hooks->ack_entries, route_snapshot,
+                                prepared_route, error, error_len) == 0 &&
                    build_route_transaction(prepared_route,
                                             hooks->route_operation_suffix,
                                             route_transaction, error,
@@ -470,11 +490,13 @@ static int orchestrator_route_plan(
 
 static int orchestrator_route_prepare(
     void *opaque, const struct wvm_route_transaction_record *transaction,
-    char *error, size_t error_len)
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
     (void)transaction;
+    (void)snapshot;
     (void)error;
     (void)error_len;
     hooks->route_prepares++;
@@ -483,11 +505,13 @@ static int orchestrator_route_prepare(
 
 static int orchestrator_route_commit(
     void *opaque, const struct wvm_route_transaction_record *transaction,
-    char *error, size_t error_len)
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
     (void)transaction;
+    (void)snapshot;
     (void)error;
     (void)error_len;
     hooks->route_commits++;
@@ -496,11 +520,13 @@ static int orchestrator_route_commit(
 
 static int orchestrator_route_abort(
     void *opaque, const struct wvm_route_transaction_record *transaction,
-    char *error, size_t error_len)
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
     (void)transaction;
+    (void)snapshot;
     (void)error;
     (void)error_len;
     hooks->route_aborts++;
@@ -630,10 +656,12 @@ int main(void)
     };
     struct wvm_coordinator_transaction transaction;
     struct wvm_coordinator_transaction abort_transaction;
+    struct wvm_route_rule_record route_rules[1];
+    struct wvm_route_rule_record abort_route_rules[1];
     struct wvm_required_ack_entry ack_entries[1];
     struct wvm_required_ack_entry abort_ack_entries[1];
-    struct wvm_required_ack_set ack_set;
-    struct wvm_required_ack_set abort_ack_set;
+    struct wvm_route_snapshot_record route_snapshot;
+    struct wvm_route_snapshot_record abort_route_snapshot;
     struct wvm_coordinator_prepared_route prepared_route;
     struct wvm_coordinator_prepared_route abort_prepared_route;
     struct wvm_route_transaction_record route_transaction;
@@ -799,7 +827,8 @@ int main(void)
                  sizeof(placement_bytes), candidate_bytes, sizeof(candidate_bytes));
     fill_node_launch_plans(&options, launch_plans, nodes, listener_plans,
                            listener_leases);
-    if (expect(build_prepared_route(&transaction, &gateway, ack_entries, &ack_set,
+    if (expect(build_prepared_route(&transaction, &gateway, route_rules,
+                                    ack_entries, &route_snapshot,
                                     &prepared_route, error, sizeof(error)) == 0,
                "build prepared canonical route ACK set")) {
         return 1;
@@ -858,6 +887,15 @@ int main(void)
                        &control_plane, &route_transaction, error,
                        sizeof(error)) == 0,
                "persist exact prepared route transaction") ||
+        expect(wvm_control_plane_transition(
+                   &control_plane, &transaction, WVM_LIFECYCLE_PLANNED,
+                   WVM_LIFECYCLE_ROUTE_SCOPE_PREPARED, error,
+                   sizeof(error)) != 0,
+               "reject transaction-only route preparation") ||
+        expect(wvm_control_plane_record_route_snapshot(
+                   &control_plane, route_transaction.operation_id,
+                   &route_snapshot, error, sizeof(error)) == 0,
+               "persist complete prepared route snapshot") ||
         expect(wvm_control_plane_transition(
                    &control_plane, &transaction, WVM_LIFECYCLE_PLANNED,
                    WVM_LIFECYCLE_ROUTE_SCOPE_PREPARED, error,
@@ -953,7 +991,8 @@ int main(void)
             abort_launch_plans[i].launch_plan.local_executor_service_port;
     }
     if (expect(build_prepared_route(
-                   &abort_transaction, &gateway, abort_ack_entries, &abort_ack_set,
+                   &abort_transaction, &gateway, abort_route_rules,
+                   abort_ack_entries, &abort_route_snapshot,
                    &abort_prepared_route, error, sizeof(error)) == 0,
                "build route for abortable transaction")) {
         return 1;
@@ -979,6 +1018,9 @@ int main(void)
                    wvm_control_plane_record_route_transaction(
                        &control_plane, &abort_route_transaction, error,
                        sizeof(error)) == 0 &&
+                   wvm_control_plane_record_route_snapshot(
+                       &control_plane, abort_route_transaction.operation_id,
+                       &abort_route_snapshot, error, sizeof(error)) == 0 &&
                    wvm_control_plane_transition(
                        &control_plane, &abort_transaction,
                        WVM_LIFECYCLE_PLANNED,
@@ -1277,8 +1319,9 @@ int main(void)
         struct wvm_coordinator_prepared_vm orchestrator_prepared;
         struct wvm_coordinator_prepared_route orchestrator_route;
         struct wvm_route_transaction_record orchestrator_route_transaction;
+        struct wvm_route_snapshot_record orchestrator_route_snapshot;
+        struct wvm_route_rule_record orchestrator_route_rules[1];
         struct wvm_required_ack_entry orchestrator_ack_entries[1];
-        struct wvm_required_ack_set orchestrator_ack_set;
         struct wvm_activation_record orchestrator_activation;
         struct wvm_route_snapshot_key orchestrator_activation_keys[1];
         struct orchestrator_test_hooks hooks;
@@ -1321,6 +1364,8 @@ int main(void)
         memset(&orchestrator_route, 0, sizeof(orchestrator_route));
         memset(&orchestrator_route_transaction, 0,
                sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_route_snapshot, 0,
+               sizeof(orchestrator_route_snapshot));
         memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
         orchestrator_activation.required_route_snapshot_keys =
             orchestrator_activation_keys;
@@ -1331,8 +1376,8 @@ int main(void)
         activation_options.decided_at = 3000;
         memset(&hooks, 0, sizeof(hooks));
         hooks.gateway = &gateway;
+        hooks.route_rules = orchestrator_route_rules;
         hooks.ack_entries = orchestrator_ack_entries;
-        hooks.ack_set = &orchestrator_ack_set;
         hooks.route_operation_suffix = 0x53;
         memset(&callbacks, 0, sizeof(callbacks));
         callbacks.route_plan = orchestrator_route_plan;
@@ -1359,6 +1404,7 @@ int main(void)
         orchestrator_input.activation = &orchestrator_activation;
         orchestrator_input.route_transaction =
             &orchestrator_route_transaction;
+        orchestrator_input.route_snapshot = &orchestrator_route_snapshot;
         orchestrator_input.callbacks = &callbacks;
         orchestrator_input.callback_context = &hooks;
         orchestrator_input.transaction_out = &orchestrator_transaction;
@@ -1455,6 +1501,8 @@ int main(void)
         memset(&orchestrator_route, 0, sizeof(orchestrator_route));
         memset(&orchestrator_route_transaction, 0,
                sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_route_snapshot, 0,
+               sizeof(orchestrator_route_snapshot));
         memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
         orchestrator_activation.required_route_snapshot_keys =
             orchestrator_activation_keys;
@@ -1510,6 +1558,8 @@ int main(void)
         memset(&orchestrator_route, 0, sizeof(orchestrator_route));
         memset(&orchestrator_route_transaction, 0,
                sizeof(orchestrator_route_transaction));
+        memset(&orchestrator_route_snapshot, 0,
+               sizeof(orchestrator_route_snapshot));
         memset(&orchestrator_activation, 0, sizeof(orchestrator_activation));
         orchestrator_activation.required_route_snapshot_keys =
             orchestrator_activation_keys;
@@ -1538,6 +1588,7 @@ int main(void)
         recovery_input.prepared_vm = &orchestrator_prepared;
         recovery_input.activation = &orchestrator_activation;
         recovery_input.route_transaction = &orchestrator_route_transaction;
+        recovery_input.route_snapshot = &orchestrator_route_snapshot;
         recovery_input.callbacks = &callbacks;
         recovery_input.callback_context = &hooks;
         if (expect(wvm_admission_orchestrator_recover(

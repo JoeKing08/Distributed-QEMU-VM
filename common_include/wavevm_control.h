@@ -241,6 +241,15 @@ int wvm_required_ack_set_decode(const uint8_t *bytes, size_t encoded_bytes,
 int wvm_route_snapshot_record_validate(
     const struct wvm_route_snapshot_record *snapshot, char *error,
     size_t error_len);
+/*
+ * A route transaction may publish only the immutable snapshot body it names.
+ * This checks predecessor, retention, and required-ACK binding as well as the
+ * snapshot key.
+ */
+int wvm_route_snapshot_record_binds_transaction(
+    const struct wvm_route_snapshot_record *snapshot,
+    const struct wvm_route_transaction_record *transaction, char *error,
+    size_t error_len);
 int wvm_route_snapshot_record_encode(
     const struct wvm_route_snapshot_record *snapshot, uint8_t *bytes,
     size_t capacity, size_t *encoded_bytes,

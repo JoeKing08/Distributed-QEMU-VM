@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "wavevm_membership.h"
@@ -80,12 +81,41 @@ static int recovery_input_valid(
 {
     if (!input || !input->control_plane || !input->transaction ||
         !input->prepared_vm || !input->activation ||
-        !input->route_transaction ||
+        !input->route_transaction || !input->route_snapshot ||
         recovery_callbacks_valid(input->callbacks, error, error_len) != 0) {
         set_error(error, error_len, "admission recovery input is invalid");
         return -1;
     }
     return 0;
+}
+
+static int reconstruct_durable_route_snapshot(
+    const struct wvm_admission_recovery_input *input, char *error,
+    size_t error_len)
+{
+    uint8_t *bytes;
+    size_t encoded_bytes = 0;
+    int result = -1;
+
+    bytes = malloc(WVM_CONTROL_PLANE_MAX_RECORD_BYTES);
+    if (!bytes) {
+        set_error(error, error_len, "cannot allocate route snapshot recovery");
+        return -1;
+    }
+    if (wvm_control_plane_read_route_snapshot(
+            input->control_plane, input->route_transaction->operation_id, bytes,
+            WVM_CONTROL_PLANE_MAX_RECORD_BYTES, &encoded_bytes, error,
+            error_len) == 0 &&
+        wvm_route_snapshot_record_decode(bytes, encoded_bytes,
+                                         input->route_snapshot, error,
+                                         error_len) == 0 &&
+        wvm_route_snapshot_record_binds_transaction(
+            input->route_snapshot, input->route_transaction, error,
+            error_len) == 0) {
+        result = 0;
+    }
+    free(bytes);
+    return result;
 }
 
 static int recover_activation(
@@ -113,7 +143,8 @@ static int recover_activation(
         }
     }
     if (input->callbacks->route_commit(input->callback_context,
-                                       input->route_transaction, error,
+                                       input->route_transaction,
+                                       input->route_snapshot, error,
                                        error_len) != 0 ||
         durable_route_state(input, WVM_ROUTE_TRANSACTION_ACTIVATED, error,
                             error_len) != 0 ||
@@ -146,7 +177,8 @@ static int recover_abort(
         wvm_coordinator_abort_local(input->transaction, input->prepared_vm,
                                     input->activation, error, error_len) != 0 ||
         input->callbacks->route_abort(input->callback_context,
-                                      input->route_transaction, error,
+                                      input->route_transaction,
+                                      input->route_snapshot, error,
                                       error_len) != 0 ||
         durable_route_state(input, WVM_ROUTE_TRANSACTION_ABORTED, error,
                             error_len) != 0 ||
@@ -165,6 +197,9 @@ int wvm_admission_orchestrator_recover(
     const struct wvm_control_plane_entry *entry;
 
     if (recovery_input_valid(input, error, error_len) != 0) {
+        return -1;
+    }
+    if (reconstruct_durable_route_snapshot(input, error, error_len) != 0) {
         return -1;
     }
     entry = wvm_control_plane_find_request(

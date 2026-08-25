@@ -14,12 +14,14 @@
  */
 typedef int (*wvm_admission_route_stage_fn)(
     void *context, const struct wvm_route_transaction_record *transaction,
-    char *error, size_t error_len);
+    const struct wvm_route_snapshot_record *snapshot, char *error,
+    size_t error_len);
 
 typedef int (*wvm_admission_route_plan_fn)(
     void *context, const struct wvm_coordinator_transaction *transaction,
     struct wvm_coordinator_prepared_route *prepared_route,
-    struct wvm_route_transaction_record *route_transaction, char *error,
+    struct wvm_route_transaction_record *route_transaction,
+    struct wvm_route_snapshot_record *route_snapshot, char *error,
     size_t error_len);
 
 typedef int (*wvm_admission_reservation_stage_fn)(
@@ -69,6 +71,7 @@ struct wvm_admission_orchestrator_input {
     const struct wvm_coordinator_activation_options *activation_options;
     struct wvm_activation_record *activation;
     struct wvm_route_transaction_record *route_transaction;
+    struct wvm_route_snapshot_record *route_snapshot;
     const struct wvm_admission_orchestrator_callbacks *callbacks;
     void *callback_context;
     wvm_admission_input_prepare_fn prepare_input;
@@ -95,6 +98,7 @@ struct wvm_admission_recovery_input {
     struct wvm_coordinator_prepared_vm *prepared_vm;
     const struct wvm_activation_record *activation;
     struct wvm_route_transaction_record *route_transaction;
+    struct wvm_route_snapshot_record *route_snapshot;
     const struct wvm_admission_orchestrator_callbacks *callbacks;
     void *callback_context;
 };

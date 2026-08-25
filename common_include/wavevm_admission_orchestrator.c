@@ -122,7 +122,8 @@ static int abort_pre_activation(
     }
     if (route_prepared &&
         input->callbacks->route_abort(input->callback_context,
-                                       input->route_transaction, cleanup_error,
+                                       input->route_transaction,
+                                       input->route_snapshot, cleanup_error,
                                        sizeof(cleanup_error)) != 0) {
         cleanup_failed = 1;
     }
@@ -197,7 +198,7 @@ static int prepared_input_valid(
     if (!input || !input->records || !input->prepared_route ||
         !input->prepare_options || !input->prepared_vm ||
         !input->activation_options || !input->activation ||
-        !input->route_transaction) {
+        !input->route_transaction || !input->route_snapshot) {
         set_error(error, error_len,
                   "admission authority did not supply complete planning input");
         return -1;
@@ -237,7 +238,8 @@ int wvm_admission_orchestrator_run(
     }
     if (input->callbacks->route_plan(
             input->callback_context, transaction, input->prepared_route,
-            input->route_transaction, error, error_len) != 0) {
+            input->route_transaction, input->route_snapshot, error,
+            error_len) != 0) {
         return abort_identity_transaction(input, transaction, error, error_len);
     }
     if (wvm_coordinator_prepare(
@@ -245,8 +247,9 @@ int wvm_admission_orchestrator_run(
             input->prepare_options, input->prepared_vm, error, error_len) != 0) {
         return abort_identity_transaction(input, transaction, error, error_len);
     }
-    if (wvm_route_transaction_record_validate(input->route_transaction, error,
-                                              error_len) != 0 ||
+    if (wvm_route_snapshot_record_binds_transaction(
+            input->route_snapshot, input->route_transaction, error,
+            error_len) != 0 ||
         input->route_transaction->state != WVM_ROUTE_TRANSACTION_PREPARING ||
         !route_snapshot_key_matches(
             &input->route_transaction->route_snapshot_key,
@@ -273,9 +276,16 @@ int wvm_admission_orchestrator_run(
         return -1;
     }
     route_durable = 1;
+    if (wvm_control_plane_record_route_snapshot(
+            input->control_plane, input->route_transaction->operation_id,
+            input->route_snapshot, error, error_len) != 0) {
+        return abort_pre_activation(input, transaction, route_prepared, error,
+                                    error_len);
+    }
     route_prepared = 1;
     if (input->callbacks->route_prepare(input->callback_context,
-                                        input->route_transaction, error,
+                                        input->route_transaction,
+                                        input->route_snapshot, error,
                                         error_len) != 0) {
         return abort_pre_activation(input, transaction, route_prepared, error,
                                     error_len);
@@ -333,7 +343,8 @@ int wvm_admission_orchestrator_run(
         }
     }
     if (input->callbacks->route_commit(input->callback_context,
-                                        input->route_transaction, error,
+                                        input->route_transaction,
+                                        input->route_snapshot, error,
                                         error_len) != 0 ||
         durable_route_state(input, WVM_ROUTE_TRANSACTION_ACTIVATED, error,
                             error_len) != 0 ||

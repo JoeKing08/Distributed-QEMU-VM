@@ -2570,6 +2570,88 @@ int wvm_route_transaction_record_validate(
     return 0;
 }
 
+static int route_snapshot_endpoint_equal(const struct wvm_endpoint *left,
+                                         const struct wvm_endpoint *right)
+{
+    if (!left || !right || left->data_transport != right->data_transport ||
+        left->data_address_bytes != right->data_address_bytes ||
+        left->data_port != right->data_port ||
+        left->control_transport != right->control_transport ||
+        left->has_control_address != right->has_control_address ||
+        left->control_port != right->control_port ||
+        left->has_server_name != right->has_server_name ||
+        memcmp(left->data_address, right->data_address,
+               left->data_address_bytes) != 0) {
+        return 0;
+    }
+    if (left->has_control_address &&
+        (left->control_address_bytes != right->control_address_bytes ||
+         memcmp(left->control_address, right->control_address,
+                left->control_address_bytes) != 0)) {
+        return 0;
+    }
+    return !left->has_server_name ||
+           strcmp(left->server_name, right->server_name) == 0;
+}
+
+static int route_snapshot_ack_sets_equal(
+    const struct wvm_required_ack_set *left,
+    const struct wvm_required_ack_set *right)
+{
+    size_t i;
+
+    if (!left || !right || left->entries.count != right->entries.count) {
+        return 0;
+    }
+    for (i = 0; i < left->entries.count; i++) {
+        const struct wvm_required_ack_entry *left_entry =
+            &left->entries.entries[i];
+        const struct wvm_required_ack_entry *right_entry =
+            &right->entries.entries[i];
+
+        if (left_entry->member_key.role_type != right_entry->member_key.role_type ||
+            left_entry->member_key.role_id != right_entry->member_key.role_id ||
+            left_entry->member_key.instance_id !=
+                right_entry->member_key.instance_id ||
+            !route_snapshot_endpoint_equal(&left_entry->endpoint,
+                                           &right_entry->endpoint) ||
+            left_entry->role_type != right_entry->role_type ||
+            !route_snapshot_key_full_equal(&left_entry->expected_snapshot_key,
+                                           &right_entry->expected_snapshot_key)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int wvm_route_snapshot_record_binds_transaction(
+    const struct wvm_route_snapshot_record *snapshot,
+    const struct wvm_route_transaction_record *transaction, char *error,
+    size_t error_len)
+{
+    if (wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0 ||
+        wvm_route_transaction_record_validate(transaction, error, error_len) !=
+            0) {
+        return -1;
+    }
+    if (!route_snapshot_key_full_equal(&snapshot->route_snapshot_key,
+                                       &transaction->route_snapshot_key) ||
+        snapshot->has_predecessor_snapshot_key !=
+            transaction->has_predecessor_snapshot_key ||
+        (snapshot->has_predecessor_snapshot_key &&
+         !route_snapshot_key_full_equal(&snapshot->predecessor_snapshot_key,
+                                        &transaction->predecessor_snapshot_key)) ||
+        snapshot->operation_retention_horizon_ms !=
+            transaction->operation_retention_horizon_ms ||
+        !route_snapshot_ack_sets_equal(&snapshot->required_ack_set,
+                                       &transaction->required_ack_set)) {
+        set_error(error, error_len,
+                  "route snapshot does not bind the route transaction");
+        return -1;
+    }
+    return 0;
+}
+
 int wvm_route_transaction_record_encode(
     const struct wvm_route_transaction_record *transaction, uint8_t *bytes,
     size_t capacity, size_t *encoded_bytes, char *error, size_t error_len)

@@ -676,81 +676,6 @@ static int decode_route_transaction_alloc(
     return 0;
 }
 
-static int endpoint_equal(const struct wvm_endpoint *left,
-                          const struct wvm_endpoint *right)
-{
-    if (!left || !right || left->data_transport != right->data_transport ||
-        left->data_address_bytes != right->data_address_bytes ||
-        left->data_port != right->data_port ||
-        left->control_transport != right->control_transport ||
-        left->has_control_address != right->has_control_address ||
-        left->control_port != right->control_port ||
-        left->has_server_name != right->has_server_name ||
-        memcmp(left->data_address, right->data_address,
-               left->data_address_bytes) != 0) {
-        return 0;
-    }
-    if (left->has_control_address &&
-        (left->control_address_bytes != right->control_address_bytes ||
-         memcmp(left->control_address, right->control_address,
-                left->control_address_bytes) != 0)) {
-        return 0;
-    }
-    return !left->has_server_name ||
-           strcmp(left->server_name, right->server_name) == 0;
-}
-
-static int member_key_equal(const struct wvm_member_key *left,
-                            const struct wvm_member_key *right)
-{
-    return left && right && left->role_type == right->role_type &&
-           left->role_id == right->role_id &&
-           left->instance_id == right->instance_id;
-}
-
-static int required_ack_sets_equal(const struct wvm_required_ack_set *left,
-                                   const struct wvm_required_ack_set *right)
-{
-    size_t i;
-
-    if (!left || !right || left->entries.count != right->entries.count) {
-        return 0;
-    }
-    for (i = 0; i < left->entries.count; i++) {
-        const struct wvm_required_ack_entry *left_entry =
-            &left->entries.entries[i];
-        const struct wvm_required_ack_entry *right_entry =
-            &right->entries.entries[i];
-
-        if (!member_key_equal(&left_entry->member_key, &right_entry->member_key) ||
-            !endpoint_equal(&left_entry->endpoint, &right_entry->endpoint) ||
-            left_entry->role_type != right_entry->role_type ||
-            !route_snapshot_key_equal(&left_entry->expected_snapshot_key,
-                                      &right_entry->expected_snapshot_key)) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int route_snapshot_matches_transaction(
-    const struct wvm_route_snapshot_record *snapshot,
-    const struct wvm_route_transaction_record *transaction)
-{
-    return snapshot && transaction &&
-           route_snapshot_key_equal(&snapshot->route_snapshot_key,
-                                    &transaction->route_snapshot_key) &&
-           snapshot->has_predecessor_snapshot_key ==
-               transaction->has_predecessor_snapshot_key &&
-           (!snapshot->has_predecessor_snapshot_key ||
-            route_snapshot_key_equal(&snapshot->predecessor_snapshot_key,
-                                     &transaction->predecessor_snapshot_key)) &&
-           snapshot->operation_retention_horizon_ms ==
-               transaction->operation_retention_horizon_ms &&
-           required_ack_sets_equal(&snapshot->required_ack_set,
-                                   &transaction->required_ack_set);
-}
-
 static int route_entry_has_matching_snapshot(
     const struct wvm_control_plane_route_entry *entry,
     const struct wvm_route_snapshot_key *snapshot_key, char *error,
@@ -1101,9 +1026,8 @@ static int validate_route_snapshot_binding(
                   "route snapshot has an invalid durable route operation");
         goto out;
     }
-    if (!route_snapshot_matches_transaction(snapshot, &decoded.record)) {
-        set_error(error, error_len,
-                  "route snapshot does not match durable route operation");
+    if (wvm_route_snapshot_record_binds_transaction(snapshot, &decoded.record,
+                                                     error, error_len) != 0) {
         goto out;
     }
     result = 0;
