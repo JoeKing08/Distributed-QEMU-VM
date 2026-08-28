@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "wavevm_canonical.h"
+#include "wavevm_admission_orchestrator.h"
 #include "wavevm_runtime_names.h"
 #include "wavevm_membership.h"
 #include "wavevm_sha256.h"
@@ -68,6 +69,24 @@ static void set_error(char *error, size_t error_len, const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(error, error_len, fmt, ap);
     va_end(ap);
+}
+
+static int admission_authority_complete(
+    const struct wvm_admission_authority *authority)
+{
+    const struct wvm_admission_orchestrator_callbacks *callbacks;
+
+    if (!authority || !authority->prepare_input ||
+        !authority->refresh_input) {
+        return 0;
+    }
+    callbacks = &authority->callbacks;
+    return callbacks->route_plan && callbacks->route_prepare &&
+           callbacks->route_commit && callbacks->route_abort &&
+           callbacks->reservation_prepare &&
+           callbacks->reservation_commit && callbacks->reservation_abort &&
+           callbacks->participant_prepare && callbacks->participant_commit &&
+           callbacks->participant_abort && callbacks->participant_ready;
 }
 
 static void write_be16(uint8_t *dst, uint16_t value)
@@ -1930,6 +1949,22 @@ void wvm_control_plane_set_runtime_manifest_entries(
                runtime_manifest_entry_capacity *
                    sizeof(*runtime_manifest_entries));
     }
+}
+
+int wvm_control_plane_set_admission_authority(
+    struct wvm_control_plane *plane,
+    const struct wvm_admission_authority *authority, char *error,
+    size_t error_len)
+{
+    if (!plane || !authority || plane->journal_fd >= 0 ||
+        plane->membership_open || plane->admission_authority ||
+        !admission_authority_complete(authority)) {
+        set_error(error, error_len,
+                  "control-plane admission authority binding is invalid");
+        return -EINVAL;
+    }
+    plane->admission_authority = authority;
+    return 0;
 }
 
 static int copy_membership_journal_path(char destination[WVM_CONTROL_PLANE_PATH_MAX],

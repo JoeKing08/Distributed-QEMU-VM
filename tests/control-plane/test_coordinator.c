@@ -352,6 +352,7 @@ static int allocate_route_scope_id(void *context, uint64_t *route_scope_id,
 
 static int build_prepared_route(
     const struct wvm_coordinator_transaction *transaction,
+    const struct wvm_cluster_record_set *records,
     const struct wvm_gateway_record *gateway,
     struct wvm_route_rule_record route_rules[1],
     struct wvm_required_ack_entry ack_entries[1],
@@ -363,15 +364,15 @@ static int build_prepared_route(
     uint8_t digest[WVM_SHA256_DIGEST_BYTES];
     size_t encoded_bytes;
 
-    if (!transaction || !gateway || !route_rules || !ack_entries || !snapshot ||
-        !prepared_route) {
+    if (!transaction || !records || !gateway || !route_rules || !ack_entries ||
+        !snapshot || !prepared_route) {
         return -1;
     }
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->route_snapshot_key.scope_key = transaction->route_scope_key;
-    snapshot->route_snapshot_key.topology_revision = 6;
+    snapshot->route_snapshot_key.topology_revision = records->topology_revision;
     snapshot->route_snapshot_key.route_generation = 1;
-    snapshot->membership_revision = 6;
+    snapshot->membership_revision = records->membership_revision;
     snapshot->topology_kind = WVM_ROUTE_TOPOLOGY_FLAT;
     snapshot->operation_retention_horizon_ms = 6000;
     snapshot->retirement_policy = 1;
@@ -403,10 +404,11 @@ static int build_prepared_route(
                                          error_len) != 0) {
         return -1;
     }
-    memcpy(snapshot->route_snapshot_key.snapshot_digest, digest, sizeof(digest));
-    memcpy(ack_entries[0].expected_snapshot_key.snapshot_digest, digest,
-           sizeof(digest));
-    if (wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0) {
+    if (wvm_route_snapshot_record_decode(bytes, encoded_bytes, snapshot, error,
+                                         error_len) != 0 ||
+        memcmp(snapshot->route_snapshot_key.snapshot_digest, digest,
+               sizeof(digest)) != 0 ||
+        wvm_route_snapshot_record_validate(snapshot, error, error_len) != 0) {
         return -1;
     }
     prepared_route->route_snapshot_key = snapshot->route_snapshot_key;
@@ -419,6 +421,11 @@ static int build_route_transaction(
     uint8_t operation_suffix, struct wvm_route_transaction_record *transaction,
     char *error, size_t error_len)
 {
+    struct wvm_required_ack_set raw_ack_set;
+    struct wvm_required_ack_set decoded_ack_set;
+    uint8_t bytes[4096];
+    size_t encoded_bytes;
+
     if (!prepared_route || !prepared_route->required_ack_set || !transaction) {
         return -1;
     }
@@ -426,6 +433,16 @@ static int build_route_transaction(
     transaction->operation_id[WVM_IDENTITY_ID_BYTES - 1] = operation_suffix;
     transaction->route_snapshot_key = prepared_route->route_snapshot_key;
     transaction->required_ack_set = *prepared_route->required_ack_set;
+    raw_ack_set = transaction->required_ack_set;
+    memset(raw_ack_set.entries_digest, 0, sizeof(raw_ack_set.entries_digest));
+    decoded_ack_set = transaction->required_ack_set;
+    if (wvm_required_ack_set_encode(&raw_ack_set, bytes, sizeof(bytes),
+                                    &encoded_bytes, error, error_len) != 0 ||
+        wvm_required_ack_set_decode(bytes, encoded_bytes, &decoded_ack_set,
+                                    error, error_len) != 0) {
+        return -1;
+    }
+    transaction->required_ack_set = decoded_ack_set;
     transaction->operation_retention_horizon_ms = 6000;
     transaction->state = WVM_ROUTE_TRANSACTION_PREPARING;
     return wvm_route_transaction_record_validate(transaction, error, error_len);
@@ -470,6 +487,7 @@ struct orchestrator_test_hooks {
 
 static int orchestrator_route_plan(
     void *opaque, const struct wvm_coordinator_transaction *transaction,
+    const struct wvm_cluster_record_set *records,
     struct wvm_coordinator_prepared_route *prepared_route,
     struct wvm_route_transaction_record *route_transaction,
     struct wvm_route_snapshot_record *route_snapshot, char *error,
@@ -477,7 +495,11 @@ static int orchestrator_route_plan(
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
-    return build_prepared_route(transaction, hooks->gateway, hooks->route_rules,
+    if (!records || records->node_count != 2 || records->gateway_count != 1) {
+        return -1;
+    }
+    return build_prepared_route(transaction, records, hooks->gateway,
+                                hooks->route_rules,
                                 hooks->ack_entries, route_snapshot,
                                 prepared_route, error, error_len) == 0 &&
                    build_route_transaction(prepared_route,
@@ -486,6 +508,21 @@ static int orchestrator_route_plan(
                                             error_len) == 0
                ? 0
                : -1;
+}
+
+static int orchestrator_prepare_input(
+    void *opaque, const struct wvm_vm_request *request,
+    const struct wvm_coordinator_transaction *transaction,
+    struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
+{
+    (void)opaque;
+    (void)request;
+    (void)transaction;
+    (void)input;
+    (void)error;
+    (void)error_len;
+    return 0;
 }
 
 static int orchestrator_route_prepare(
@@ -827,7 +864,8 @@ int main(void)
                  sizeof(placement_bytes), candidate_bytes, sizeof(candidate_bytes));
     fill_node_launch_plans(&options, launch_plans, nodes, listener_plans,
                            listener_leases);
-    if (expect(build_prepared_route(&transaction, &gateway, route_rules,
+    if (expect(build_prepared_route(&transaction, &records, &gateway,
+                                    route_rules,
                                     ack_entries, &route_snapshot,
                                     &prepared_route, error, sizeof(error)) == 0,
                "build prepared canonical route ACK set")) {
@@ -991,7 +1029,7 @@ int main(void)
             abort_launch_plans[i].launch_plan.local_executor_service_port;
     }
     if (expect(build_prepared_route(
-                   &abort_transaction, &gateway, abort_route_rules,
+                   &abort_transaction, &records, &gateway, abort_route_rules,
                    abort_ack_entries, &abort_route_snapshot,
                    &abort_prepared_route, error, sizeof(error)) == 0,
                "build route for abortable transaction")) {
@@ -1407,6 +1445,7 @@ int main(void)
         orchestrator_input.route_snapshot = &orchestrator_route_snapshot;
         orchestrator_input.callbacks = &callbacks;
         orchestrator_input.callback_context = &hooks;
+        orchestrator_input.prepare_input = orchestrator_prepare_input;
         orchestrator_input.transaction_out = &orchestrator_transaction;
         orchestrator_input.submit_result_out = &orchestrator_submit_result;
         if (expect(wvm_admission_orchestrator_run(

@@ -49,6 +49,20 @@ static int callbacks_valid(
     return 0;
 }
 
+int wvm_admission_authority_validate(
+    const struct wvm_admission_authority *authority, char *error,
+    size_t error_len)
+{
+    if (!authority || !authority->prepare_input ||
+        !authority->refresh_input ||
+        callbacks_valid(&authority->callbacks, error, error_len) != 0) {
+        set_error(error, error_len,
+                  "admission authority binding is incomplete");
+        return -1;
+    }
+    return 0;
+}
+
 static int callback_reservations(
     const struct wvm_admission_orchestrator_input *input,
     wvm_admission_reservation_stage_fn callback, char *error, size_t error_len)
@@ -195,7 +209,11 @@ static int prepared_input_valid(
     const struct wvm_admission_orchestrator_input *input, char *error,
     size_t error_len)
 {
-    if (!input || !input->records || !input->prepared_route ||
+    if (!input || (input->records && input->membership_controller) ||
+        (!input->records &&
+         (!input->membership_controller || !input->membership_capture ||
+          !input->refresh_input)) ||
+        !input->prepared_route ||
         !input->prepare_options || !input->prepared_vm ||
         !input->activation_options || !input->activation ||
         !input->route_transaction || !input->route_snapshot) {
@@ -206,12 +224,60 @@ static int prepared_input_valid(
     return callbacks_valid(input->callbacks, error, error_len);
 }
 
+static int refresh_membership_evidence(
+    struct wvm_admission_orchestrator_input *input,
+    enum wvm_admission_input_phase phase,
+    const struct wvm_coordinator_transaction *transaction, char *error,
+    size_t error_len)
+{
+    if (!input || !input->membership_controller) {
+        return 0;
+    }
+    if (!input->refresh_input ||
+        input->refresh_input(input->refresh_input_context, phase,
+                             input->request, transaction, input, error,
+                             error_len) != 0) {
+        if (!error || error[0] == '\0') {
+            set_error(error, error_len,
+                      "admission authority could not refresh evidence");
+        }
+        return -1;
+    }
+    if (!input->membership_evidence) {
+        set_error(error, error_len,
+                  "admission authority returned no membership evidence");
+        return -1;
+    }
+    return 0;
+}
+
+static int route_plan_matches_records(
+    const struct wvm_cluster_record_set *records,
+    const struct wvm_route_snapshot_record *route_snapshot,
+    const struct wvm_route_transaction_record *route_transaction, char *error,
+    size_t error_len)
+{
+    if (!records || !route_snapshot || !route_transaction ||
+        route_snapshot->membership_revision != records->membership_revision ||
+        route_snapshot->route_snapshot_key.topology_revision !=
+            records->topology_revision ||
+        route_transaction->route_snapshot_key.topology_revision !=
+            records->topology_revision) {
+        set_error(error, error_len,
+                  "admission route plan is stale for captured membership");
+        return -1;
+    }
+    return 0;
+}
+
 int wvm_admission_orchestrator_run(
     struct wvm_admission_orchestrator_input *input, char *error,
     size_t error_len)
 {
     enum wvm_control_plane_submit_result submit_result;
     struct wvm_coordinator_transaction *transaction;
+    struct wvm_cluster_record_set captured_records;
+    const struct wvm_cluster_record_set *records;
     int route_prepared = 0;
     int candidate_durable = 0;
     int route_durable = 0;
@@ -220,6 +286,7 @@ int wvm_admission_orchestrator_run(
         return -1;
     }
     transaction = input->transaction_out;
+    records = input->records;
     if (wvm_control_plane_begin(
             input->control_plane, input->request, input->namespace_allocator,
             input->id_provider, &submit_result, transaction, error,
@@ -236,14 +303,33 @@ int wvm_admission_orchestrator_run(
         prepared_input_valid(input, error, error_len) != 0) {
         return abort_identity_transaction(input, transaction, error, error_len);
     }
+    if (refresh_membership_evidence(input, WVM_ADMISSION_INPUT_PREPARE,
+                                    transaction, error, error_len) != 0) {
+        return abort_identity_transaction(input, transaction, error, error_len);
+    }
+    if (!records) {
+        if (wvm_coordinator_capture_current_membership_records(
+                input->membership_controller, input->membership_capture,
+                input->membership_evidence, &captured_records, error,
+                error_len) != 0) {
+            return abort_identity_transaction(input, transaction, error,
+                                              error_len);
+        }
+        records = &captured_records;
+    }
     if (input->callbacks->route_plan(
-            input->callback_context, transaction, input->prepared_route,
-            input->route_transaction, input->route_snapshot, error,
-            error_len) != 0) {
+            input->callback_context, transaction, records,
+            input->prepared_route, input->route_transaction,
+            input->route_snapshot, error, error_len) != 0) {
+        return abort_identity_transaction(input, transaction, error, error_len);
+    }
+    if (route_plan_matches_records(records, input->route_snapshot,
+                                   input->route_transaction, error,
+                                   error_len) != 0) {
         return abort_identity_transaction(input, transaction, error, error_len);
     }
     if (wvm_coordinator_prepare(
-            input->request, transaction, input->records, input->prepared_route,
+            input->request, transaction, records, input->prepared_route,
             input->prepare_options, input->prepared_vm, error, error_len) != 0) {
         return abort_identity_transaction(input, transaction, error, error_len);
     }
@@ -310,10 +396,20 @@ int wvm_admission_orchestrator_run(
             input->control_plane, transaction,
             WVM_LIFECYCLE_RESERVATIONS_PREPARED,
             WVM_LIFECYCLE_PARTICIPANTS_PREPARED, error, error_len) != 0 ||
-        wvm_coordinator_decide_activation(
-            input->request, transaction, input->records, input->prepared_route,
-            input->id_provider, input->activation_options, input->prepared_vm,
-            input->activation, error, error_len) != 0 ||
+        (refresh_membership_evidence(input, WVM_ADMISSION_INPUT_ACTIVATION,
+                                    transaction, error, error_len) != 0) ||
+        (input->membership_controller
+             ? wvm_coordinator_decide_activation_current_membership(
+                   input->membership_controller, input->membership_capture,
+                   input->membership_evidence, input->request, transaction,
+                   input->prepared_route, input->id_provider,
+                   input->activation_options, input->prepared_vm,
+                   input->activation, error, error_len)
+             : wvm_coordinator_decide_activation(
+                   input->request, transaction, records,
+                   input->prepared_route, input->id_provider,
+                   input->activation_options, input->prepared_vm,
+                   input->activation, error, error_len)) != 0 ||
         wvm_control_plane_record_activation(input->control_plane, transaction,
                                             input->activation, error,
                                             error_len) != 0) {

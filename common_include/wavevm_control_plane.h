@@ -8,6 +8,8 @@
 #include "wavevm_coordinator.h"
 #include "wavevm_membership_control.h"
 
+struct wvm_admission_authority;
+
 #define WVM_CONTROL_PLANE_MAX_RECORD_BYTES (1024U * 1024U)
 #define WVM_CONTROL_PLANE_PATH_MAX 4096U
 
@@ -107,6 +109,7 @@ struct wvm_control_plane {
     int membership_configured;
     int membership_initialized;
     int membership_open;
+    const struct wvm_admission_authority *admission_authority;
 };
 
 void wvm_control_plane_init(struct wvm_control_plane *plane,
@@ -131,6 +134,16 @@ void wvm_control_plane_set_runtime_manifest_entries(
     struct wvm_control_plane *plane,
     struct wvm_control_plane_runtime_manifest_entry *runtime_manifest_entries,
     size_t runtime_manifest_entry_capacity);
+
+/*
+ * Bind the complete admission authority before the control service opens.
+ * The plane retains the caller-owned binding for its lifetime; it never
+ * manufactures evidence, route plans, listener leases, or participant ACKs.
+ */
+int wvm_control_plane_set_admission_authority(
+    struct wvm_control_plane *plane,
+    const struct wvm_admission_authority *authority, char *error,
+    size_t error_len);
 
 /* Configure and open the durable membership authority owned by this plane. */
 int wvm_control_plane_configure_membership(

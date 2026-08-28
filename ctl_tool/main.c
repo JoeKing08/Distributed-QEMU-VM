@@ -203,6 +203,7 @@ static int apply_create_vm(void *opaque, const struct wvm_envelope *request,
     struct wvm_vm_request vm_request;
     struct wvm_coordinator_transaction transaction;
     struct wvm_admission_orchestrator_input admission_input;
+    const struct wvm_admission_authority *admission_authority;
     struct wvm_coordinator_id_provider id_provider;
     enum wvm_control_plane_submit_result submit_result;
     const struct wvm_control_plane_entry *entry;
@@ -266,9 +267,21 @@ static int apply_create_vm(void *opaque, const struct wvm_envelope *request,
     admission_input.namespace_allocator = context->namespace_allocator;
     admission_input.id_provider = &id_provider;
     admission_input.request = &vm_request;
-    admission_input.prepare_input = context->admission_input_builder;
-    admission_input.prepare_input_context =
-        context->admission_input_builder_context;
+    admission_authority = context->plane->admission_authority;
+    if (admission_authority) {
+        admission_input.membership_controller =
+            &context->plane->membership_controller;
+        admission_input.callbacks = &admission_authority->callbacks;
+        admission_input.callback_context = admission_authority->context;
+        admission_input.prepare_input = admission_authority->prepare_input;
+        admission_input.prepare_input_context = admission_authority->context;
+        admission_input.refresh_input = admission_authority->refresh_input;
+        admission_input.refresh_input_context = admission_authority->context;
+    } else {
+        admission_input.prepare_input = context->admission_input_builder;
+        admission_input.prepare_input_context =
+            context->admission_input_builder_context;
+    }
     admission_input.transaction_out = &transaction;
     admission_input.submit_result_out = &submit_result;
     pthread_mutex_lock(&context->lock);

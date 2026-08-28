@@ -19,6 +19,7 @@ typedef int (*wvm_admission_route_stage_fn)(
 
 typedef int (*wvm_admission_route_plan_fn)(
     void *context, const struct wvm_coordinator_transaction *transaction,
+    const struct wvm_cluster_record_set *records,
     struct wvm_coordinator_prepared_route *prepared_route,
     struct wvm_route_transaction_record *route_transaction,
     struct wvm_route_snapshot_record *route_snapshot, char *error,
@@ -34,6 +35,11 @@ typedef int (*wvm_admission_participant_stage_fn)(
 
 struct wvm_admission_orchestrator_input;
 
+enum wvm_admission_input_phase {
+    WVM_ADMISSION_INPUT_PREPARE = 1,
+    WVM_ADMISSION_INPUT_ACTIVATION = 2,
+};
+
 /*
  * An authority supplies the current membership, capability, inventory, route,
  * and participant projections only for a newly allocated transaction.  A
@@ -41,6 +47,19 @@ struct wvm_admission_orchestrator_input;
  */
 typedef int (*wvm_admission_input_prepare_fn)(
     void *context, const struct wvm_vm_request *request,
+    const struct wvm_coordinator_transaction *transaction,
+    struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len);
+
+/*
+ * Refresh the external capability/inventory/reservation evidence immediately
+ * before one membership capture. The provider must replace the evidence view
+ * in INPUT with a coherent immutable set for the requested phase. It may not
+ * mutate membership state or any already prepared candidate.
+ */
+typedef int (*wvm_admission_input_refresh_fn)(
+    void *context, enum wvm_admission_input_phase phase,
+    const struct wvm_vm_request *request,
     const struct wvm_coordinator_transaction *transaction,
     struct wvm_admission_orchestrator_input *input, char *error,
     size_t error_len);
@@ -59,12 +78,38 @@ struct wvm_admission_orchestrator_callbacks {
     wvm_admission_participant_stage_fn participant_ready;
 };
 
+/*
+ * The control-plane owner installs one complete provider before opening its
+ * service. Its storage and transport callbacks remain caller-owned and must
+ * describe real registered authorities; an absent binding is a deliberate
+ * fail-closed state.
+ */
+struct wvm_admission_authority {
+    wvm_admission_input_prepare_fn prepare_input;
+    wvm_admission_input_refresh_fn refresh_input;
+    struct wvm_admission_orchestrator_callbacks callbacks;
+    void *context;
+};
+
+int wvm_admission_authority_validate(
+    const struct wvm_admission_authority *authority, char *error,
+    size_t error_len);
+
 struct wvm_admission_orchestrator_input {
     struct wvm_control_plane *control_plane;
     struct wvm_vm_namespace_allocator *namespace_allocator;
     const struct wvm_coordinator_id_provider *id_provider;
     const struct wvm_vm_request *request;
     const struct wvm_cluster_record_set *records;
+    /*
+     * Production callers may provide the live membership authority and its
+     * immutable evidence view instead of supplying a pre-captured record set.
+     * The orchestrator captures membership before prepare and recaptures it
+     * before activation; pure record-level callers continue to use records.
+     */
+    const struct wvm_membership_controller *membership_controller;
+    struct wvm_membership_controller_capture *membership_capture;
+    const struct wvm_coordinator_membership_evidence *membership_evidence;
     struct wvm_coordinator_prepared_route *prepared_route;
     const struct wvm_coordinator_prepare_options *prepare_options;
     struct wvm_coordinator_prepared_vm *prepared_vm;
@@ -76,6 +121,8 @@ struct wvm_admission_orchestrator_input {
     void *callback_context;
     wvm_admission_input_prepare_fn prepare_input;
     void *prepare_input_context;
+    wvm_admission_input_refresh_fn refresh_input;
+    void *refresh_input_context;
     struct wvm_coordinator_transaction *transaction_out;
     enum wvm_control_plane_submit_result *submit_result_out;
 };
