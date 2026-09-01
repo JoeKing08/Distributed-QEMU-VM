@@ -2,7 +2,7 @@
 #define WAVEVM_ROUTE_CONTROL_H
 
 /*
- * Durable local consumer for V1 route transactions.  A control transport
+ * Durable local consumer for typed route transactions. A control transport
  * authenticates the peer and passes decoded local-control envelopes here;
  * this module records and replays only the participant-side route install
  * state.  It is not a second membership or placement authority.
@@ -22,6 +22,7 @@ struct wvm_route_control_operation;
 struct wvm_route_control_result {
     uint16_t recorded_state;
     struct wvm_route_snapshot_key route_snapshot_key;
+    uint8_t required_ack_set_digest[WVM_SHA256_DIGEST_BYTES];
     uint64_t operation_retention_horizon_ms;
 };
 
@@ -37,7 +38,7 @@ struct wvm_route_control {
 
 /*
  * Opens or creates one append-only participant journal and replays every
- * completed V1 route control frame into RUNTIME.  A torn tail is discarded;
+ * completed route control frame into RUNTIME. A torn tail is discarded;
  * a completed malformed frame rejects startup rather than guessing state.
  */
 int wvm_route_control_open(struct wvm_route_control *control,
@@ -48,8 +49,8 @@ int wvm_route_control_open(struct wvm_route_control *control,
 void wvm_route_control_close(struct wvm_route_control *control);
 
 /*
- * Applies exactly one decoded V1 local-control frame.  Only
- * ROUTE_PREPARE, ROUTE_COMMIT, and ROUTE_RETIRE are accepted.  The operation
+ * Applies exactly one decoded local-control frame. Only ROUTE_PREPARE,
+ * ROUTE_COMMIT, ROUTE_ABORT, and ROUTE_RETIRE are accepted. The operation
  * identity is idempotent per message type; reuse with a different semantic
  * payload digest is rejected.
  */

@@ -400,16 +400,17 @@ tags starting at one; no listed field is optional unless marked optional.
 | `0x0101` | `REGISTER_MEMBER` | Exact canonical `NodeRecord` or `GatewayRecord` payload; the receiver derives `MemberKey` from that record | `vm_id=0`, fresh member instance, authenticated registrar | Registered `PENDING`/`RECOVERING` desired-state record; retained through member removal/quarantine. |
 | `0x0102` | `CORDON` | Exact canonical `MemberCordonRequest` (`0x102c`) | Authenticated actor is an `EXECUTOR` principal accepted by the separately configured membership-management authorizer. Target is a registered `NODE_RUNTIME` or `GATEWAY`; all three expected revisions are exact. | Target enters `CORDONED`; membership and admission-eligibility revisions advance by one, topology revision is unchanged; one durable replayable result is retained through removal/quarantine. |
 | `0x0103` | `DRAIN` | Exact canonical `GatewayDrainRequest` (`0x102b`) | Authenticated actor is an `EXECUTOR` principal accepted by the receiver's separately configured management-authorizer callback. A missing callback fails closed. `PREPARE` requires exact current membership/topology/eligibility revisions and one complete successor route at `topology_revision = current + 1`; `COMMIT` and `ABORT` carry the same pre-prepare fence and the controller validates the durable post-prepare eligibility state. | One durable replayable result per operation. `PREPARE` advances eligibility only; `COMMIT` atomically activates the successor, marks the target gateway `DRAINING`, and advances all three revisions; `ABORT` leaves membership/topology unchanged but retains the monotonic eligibility invalidation from `PREPARE`. |
-| `0x0201` | `PREPARE_RESERVATION` | `admission_tx_id:ID16`, candidate `Digest32`, eligibility-fence `Digest32`, plan `Digest32`, expected `MemberKey`, resource reservation record, `prepared_expiry:u64` | Member/capability/fence still eligible and local capacity/name lease free | Prepared reservation ID/digest/expiry; retained until abort or expiry if no activation fence. |
-| `0x0202` | `COMMIT_RESERVATION` | `admission_tx_id`, candidate digest, eligibility-fence digest, `activation_fence:ID16`, reservation ID | Matching unexpired prepared record and durable activation decision | Committed reservation digest; retained through VM retirement. |
-| `0x0203` | `ABORT_RESERVATION` | `admission_tx_id`, candidate digest, reservation ID, reason | No matching activation fence, or explicit compensating-teardown record | Released/teardown-pending result; retained through cleanup horizon. |
-| `0x0301` | `PREPARE_MANIFEST` | `admission_tx_id`, full candidate manifest record/digest, eligibility-fence digest, required `SnapshotKey`, local role record, reservation IDs | Exact member instance, route snapshot, capability profile, and prepared reservation | Prepared local-manifest record/expiry; retained until abort/activation. |
-| `0x0302` | `ACTIVATE_MANIFEST` | `admission_tx_id`, candidate digest, `activation_fence`, required snapshot key, reservation IDs | Matching prepared record and unchanged fence | Activated local-manifest result; retained through VM retirement. |
-| `0x0303` | `ABORT_MANIFEST` | `admission_tx_id`, candidate digest, reason | No activation, or compensating teardown after activation | Removed/teardown-pending result; retained through cleanup horizon. |
+| `0x0201` | `PREPARE_RESERVATION` | Exact canonical `AdmissionReservationStage` (`0x102d`) with candidate and `PREPARED` reservation only | Member/capability/fence still eligible and local capacity/name lease free | Prepared reservation ID/digest/expiry; retained until abort or expiry if no activation fence. |
+| `0x0202` | `COMMIT_RESERVATION` | Exact canonical `AdmissionReservationStage` with candidate, committed reservation, and durable `ActivationRecord` | Matching unexpired prepared record and durable activation decision | Committed reservation digest; retained through VM retirement. |
+| `0x0203` | `ABORT_RESERVATION` | Exact canonical `AdmissionReservationStage` with candidate, unactivated reservation, and nonzero abort reason | No matching activation fence, or explicit compensating-teardown record | Released/teardown-pending result; retained through cleanup horizon. |
+| `0x0301` | `PREPARE_MANIFEST` | Exact canonical `AdmissionParticipantStage` (`0x102e`) with candidate and non-activated local projection | Exact member instance, route snapshot, capability profile, and prepared reservation | Prepared local-manifest record/expiry; retained until abort/activation. |
+| `0x0302` | `ACTIVATE_MANIFEST` | Exact canonical `AdmissionParticipantStage` with activation-fenced projection and durable `ActivationRecord` | Matching prepared record and unchanged fence | Activated local-manifest result; retained through VM retirement. |
+| `0x0303` | `ABORT_MANIFEST` | Exact canonical `AdmissionParticipantStage` with non-activated projection and nonzero abort reason | No activation, or compensating teardown after activation | Removed/teardown-pending result; retained through cleanup horizon. |
 | `0x0304` | `QUERY_TX` | target `operation_id:ID16`, candidate digest optional, activation fence optional | Caller may query only a role/transaction it is authorized to inspect | Recorded transaction state/digest/expiry; retained as the target record requires. |
 | `0x0401` | `ROUTE_PREPARE` | `SnapshotKey`, snapshot canonical record, predecessor key optional, `RequiredAckSet` record/digest, eligibility-fence digest, operation-retention horizon | All ACK-set entries are surviving eligible members; departing/failed gateway absent from required set | Prepared snapshot result; retained until activate/abort. |
 | `0x0402` | `ROUTE_COMMIT` | `SnapshotKey`, route transaction ID, required-ACK-set digest | Matching prepared snapshot and persisted required ACK set | Activated snapshot result; retained through predecessor retirement. |
 | `0x0403` | `ROUTE_RETIRE` | retiring `SnapshotKey`, successor key optional, route transaction ID | No active operation reference and query/retry horizon complete, or typed terminal outcome recorded | Retired snapshot result; retained through VM namespace quarantine. |
+| `0x0404` | `ROUTE_ABORT` | Exact canonical `RouteTransaction` with `state=ABORTED` | Matching prepared snapshot, transaction ID, and required-ACK-set digest; no durable activation of that transaction | Removes only the matching prepared snapshot and retains the idempotent abort result through the operation horizon. |
 | `0x0501` | `REJOIN` | Exact canonical `RejoinMemberRequest` (`0x102a`), containing a `NodeRecord` or `GatewayRecord`, optional prior `MemberKey`, and recovery evidence digest | Fresh registration only; no implicit use of old instance identity | `VALIDATING` membership result. It never rebinds a running V1 VM. |
 | `0x0502` | `RECOVERY_REBIND` | old/new `MemberKey`, manifest/snapshot digests, reservation proof, memory/vCPU/storage recovery proof | Not supported in V1 without a separately accepted recovery specification | `UNSUPPORTED` in V1; retained as audit evidence. |
 
@@ -500,9 +501,13 @@ and never authorizes a second state transition.
 
 ### 4.3 Manifest and Route Records
 
-`PREPARE_MANIFEST` carries the exact `CandidateVmManifest` schema from
-`canonical-record-schema.md`. Its digest covers every semantic field and uses
-the documented self-digest preimage rule.
+`PREPARE_MANIFEST`, `ACTIVATE_MANIFEST`, and `ABORT_MANIFEST` carry the exact
+`AdmissionParticipantStage` schema from `canonical-record-schema.md`.
+`PREPARE_RESERVATION`, `COMMIT_RESERVATION`, and `ABORT_RESERVATION` carry the
+corresponding `AdmissionReservationStage`. The embedded candidate's digest
+covers every semantic field and uses the documented self-digest preimage rule;
+the carrier prevents a receiver from inventing a candidate, reservation,
+runtime projection, or activation decision from mutable local state.
 
 `ROUTE_PREPARE` carries the exact `RouteSnapshot` schema from
 `canonical-record-schema.md`. No receiver accepts a field-by-field route update

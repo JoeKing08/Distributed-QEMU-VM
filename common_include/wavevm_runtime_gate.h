@@ -79,7 +79,8 @@ struct wvm_runtime_connection {
 };
 
 struct wvm_runtime_gate {
-    const struct wvm_node_runtime_manifest *manifest;
+    /* The caller keeps this prepared projection alive for the gate lifetime. */
+    struct wvm_node_runtime_manifest *manifest;
     uint32_t local_physical_node_id;
     uint64_t local_node_instance_id;
     enum wvm_runtime_gate_state state;
@@ -119,13 +120,29 @@ void wvm_runtime_gate_init(struct wvm_runtime_gate *gate);
 
 int wvm_runtime_gate_prepare(
     struct wvm_runtime_gate *gate,
-    const struct wvm_node_runtime_manifest *manifest,
+    struct wvm_node_runtime_manifest *manifest,
     uint32_t local_physical_node_id, uint64_t local_node_instance_id,
     char *error, size_t error_len);
+
+/*
+ * Bind the activation-fenced projection of an already prepared manifest.
+ * Every immutable field must match the prepared projection; only the
+ * activation fence may be added by this transition.
+ */
+int wvm_runtime_gate_bind_activation(
+    struct wvm_runtime_gate *gate,
+    const struct wvm_node_runtime_manifest *activated_manifest, char *error,
+    size_t error_len);
 
 int wvm_runtime_gate_activate(struct wvm_runtime_gate *gate,
                               const uint8_t activation_fence[WVM_IDENTITY_ID_BYTES],
                               char *error, size_t error_len);
+
+/* Abort only the exact, not-yet-activated local prepare projection. */
+int wvm_runtime_gate_abort_prepared(
+    struct wvm_runtime_gate *gate,
+    const struct wvm_node_runtime_manifest *prepared_manifest, char *error,
+    size_t error_len);
 
 int wvm_runtime_gate_quiesce(struct wvm_runtime_gate *gate, char *error,
                              size_t error_len);

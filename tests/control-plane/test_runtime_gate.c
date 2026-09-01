@@ -18,6 +18,7 @@ static int expect(int condition, const char *message)
 int main(void)
 {
     struct wvm_node_runtime_manifest manifest;
+    struct wvm_node_runtime_manifest prepared_manifest;
     struct wvm_runtime_gate gate;
     struct wvm_runtime_registration registration;
     struct wvm_runtime_operation operation;
@@ -201,7 +202,11 @@ int main(void)
     unlink(manifest_path);
 
     wvm_runtime_gate_init(&gate);
-    if (expect(wvm_runtime_gate_prepare(&gate, &manifest, 17, 101, error,
+    prepared_manifest = manifest;
+    prepared_manifest.has_activation_fence = 0;
+    memset(prepared_manifest.activation_fence, 0,
+           sizeof(prepared_manifest.activation_fence));
+    if (expect(wvm_runtime_gate_prepare(&gate, &prepared_manifest, 17, 101, error,
                                         sizeof(error)) == 0,
                "prepare exact local manifest")) {
         return 1;
@@ -245,6 +250,15 @@ int main(void)
                    second_connection_id != 0 &&
                    second_connection_id != connection_id,
                "register separate local connection from same process") ||
+        expect(wvm_runtime_gate_bind_activation(&gate, &manifest, error,
+                                                sizeof(error)) == 0,
+               "bind exact activation projection") ||
+        expect(gate.manifest == &prepared_manifest &&
+                   prepared_manifest.has_activation_fence &&
+                   memcmp(prepared_manifest.activation_fence,
+                          manifest.activation_fence,
+                          sizeof(manifest.activation_fence)) == 0,
+               "retain prepared storage while binding activation fence") ||
         expect(wvm_runtime_gate_activate(&gate, manifest.activation_fence, error,
                                          sizeof(error)) == 0,
                "activate exact fence")) {
@@ -297,6 +311,37 @@ int main(void)
                                            sizeof(error)) == 0,
                "keep the second local connection authorized")) {
         return 1;
+    }
+
+    prepared_manifest = manifest;
+    prepared_manifest.has_activation_fence = 0;
+    memset(prepared_manifest.activation_fence, 0,
+           sizeof(prepared_manifest.activation_fence));
+    wvm_runtime_gate_init(&gate);
+    if (expect(wvm_runtime_gate_prepare(&gate, &prepared_manifest, 17, 101,
+                                        error, sizeof(error)) == 0,
+               "prepare abortable projection")) {
+        return 1;
+    }
+    {
+        struct wvm_node_runtime_manifest conflicting_manifest =
+            prepared_manifest;
+
+        conflicting_manifest.local_role_bits ^=
+            WVM_RUNTIME_ROLE_BIT(WVM_MANIFEST_ROLE_GATEWAY);
+        if (expect(wvm_runtime_gate_bind_activation(
+                       &gate, &conflicting_manifest, error, sizeof(error)) != 0,
+                   "reject activation projection with changed role") ||
+            expect(wvm_runtime_gate_abort_prepared(
+                       &gate, &conflicting_manifest, error, sizeof(error)) != 0,
+                   "reject abort for a different prepared projection") ||
+            expect(wvm_runtime_gate_abort_prepared(
+                       &gate, &prepared_manifest, error, sizeof(error)) == 0 &&
+                       gate.state == WVM_RUNTIME_GATE_EMPTY &&
+                       gate.manifest == NULL,
+                   "abort only the matching prepared projection")) {
+            return 1;
+        }
     }
 
     puts("runtime-gate tests: PASS");

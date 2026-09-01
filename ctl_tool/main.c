@@ -22,8 +22,6 @@ struct control_context {
     struct wvm_control_plane *plane;
     struct wvm_vm_namespace_allocator *namespace_allocator;
     size_t request_list_capacity;
-    wvm_admission_input_prepare_fn admission_input_builder;
-    void *admission_input_builder_context;
     pthread_mutex_t lock;
     int lock_initialized;
 };
@@ -277,10 +275,6 @@ static int apply_create_vm(void *opaque, const struct wvm_envelope *request,
         admission_input.prepare_input_context = admission_authority->context;
         admission_input.refresh_input = admission_authority->refresh_input;
         admission_input.refresh_input_context = admission_authority->context;
-    } else {
-        admission_input.prepare_input = context->admission_input_builder;
-        admission_input.prepare_input_context =
-            context->admission_input_builder_context;
     }
     admission_input.transaction_out = &transaction;
     admission_input.submit_result_out = &submit_result;

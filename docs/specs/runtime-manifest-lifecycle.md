@@ -489,7 +489,7 @@ not merely SSH listener creation or process survival.
 
 Before `ACTIVATION_DECIDED`, a rejection, expiry, or fence invalidation causes
 the coordinator to persist `ABORT`, send idempotent abort/teardown to prepared
-participants, retire the prepared route scope, and release all prepared
+participants, send `ROUTE_ABORT` for the prepared route scope, and release all prepared
 reservations. Prepared records may expire only after they confirm that no
 activation fence was observed.
 

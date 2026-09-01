@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "wavevm_canonical.h"
+#include "wavevm_membership.h"
 #include "wavevm_route_delivery.h"
 
 #define WVM_ROUTE_CONTROL_JOURNAL_VERSION 1U
@@ -33,6 +34,12 @@ struct route_snapshot_storage {
     struct wvm_route_snapshot_record snapshot;
     struct wvm_route_rule_record *rules;
     struct wvm_required_ack_entry *ack_entries;
+};
+
+struct route_transaction_storage {
+    struct wvm_route_transaction_record transaction;
+    struct wvm_required_ack_entry *required_ack_entries;
+    struct wvm_required_ack_entry *optional_drain_entries;
 };
 
 static void set_error(char *error, size_t error_len, const char *fmt, ...)
@@ -143,7 +150,21 @@ static int operation_type_valid(uint16_t message_type)
 {
     return message_type == WVM_ENVELOPE_MSG_ROUTE_PREPARE ||
            message_type == WVM_ENVELOPE_MSG_ROUTE_COMMIT ||
+           message_type == WVM_ENVELOPE_MSG_ROUTE_ABORT ||
            message_type == WVM_ENVELOPE_MSG_ROUTE_RETIRE;
+}
+
+static int route_key_equal(const struct wvm_route_snapshot_key *left,
+                           const struct wvm_route_snapshot_key *right)
+{
+    return left && right &&
+           left->scope_key.vm_id == right->scope_key.vm_id &&
+           left->scope_key.vm_incarnation == right->scope_key.vm_incarnation &&
+           left->scope_key.route_scope_id == right->scope_key.route_scope_id &&
+           left->topology_revision == right->topology_revision &&
+           left->route_generation == right->route_generation &&
+           memcmp(left->snapshot_digest, right->snapshot_digest,
+                  sizeof(left->snapshot_digest)) == 0;
 }
 
 static int request_matches_route_key(
@@ -159,6 +180,75 @@ static int request_matches_route_key(
     return 0;
 }
 
+/*
+ * RouteSnapshot encodes its required ACK entries with the snapshot key's
+ * digest normalized away to avoid a self-reference.  RouteTransaction uses
+ * the ordinary canonical ACK-set digest, so derive that form before binding
+ * an abort to a previously prepared snapshot.
+ */
+static int required_ack_set_full_digest(
+    const struct wvm_required_ack_set *ack_set,
+    uint8_t digest[WVM_SHA256_DIGEST_BYTES], char *error, size_t error_len)
+{
+    struct wvm_required_ack_set standard_ack_set;
+    struct wvm_canonical_record record;
+    struct wvm_canonical_field field;
+    uint8_t *bytes = NULL;
+    size_t capacity = 1024;
+    size_t encoded_bytes;
+    size_t offset;
+    int next;
+    int result = -1;
+
+    if (!ack_set || !digest) {
+        set_error(error, error_len, "route ACK set is missing");
+        return -1;
+    }
+    standard_ack_set = *ack_set;
+    memset(standard_ack_set.entries_digest, 0,
+           sizeof(standard_ack_set.entries_digest));
+    while (capacity <= WVM_ENVELOPE_MAX_LOCAL_PAYLOAD) {
+        bytes = malloc(capacity);
+        if (!bytes) {
+            set_error(error, error_len, "cannot allocate route ACK encoding");
+            return -1;
+        }
+        if (wvm_required_ack_set_encode(&standard_ack_set, bytes, capacity,
+                                        &encoded_bytes, error, error_len) == 0) {
+            break;
+        }
+        free(bytes);
+        bytes = NULL;
+        if (capacity == WVM_ENVELOPE_MAX_LOCAL_PAYLOAD) {
+            return -1;
+        }
+        capacity *= 2U;
+        if (capacity > WVM_ENVELOPE_MAX_LOCAL_PAYLOAD) {
+            capacity = WVM_ENVELOPE_MAX_LOCAL_PAYLOAD;
+        }
+    }
+    if (!bytes ||
+        wvm_canonical_record_parse(bytes, encoded_bytes, &record) != 0 ||
+        record.record_type != WVM_RECORD_REQUIRED_ACK_SET) {
+        set_error(error, error_len, "route ACK set encoding is malformed");
+        goto out;
+    }
+    offset = 0;
+    while ((next = wvm_canonical_record_next(&record, &offset, &field)) == 1) {
+        if (field.tag == 2 && field.value_bytes == WVM_SHA256_DIGEST_BYTES) {
+            memcpy(digest, field.value, WVM_SHA256_DIGEST_BYTES);
+            result = 0;
+            break;
+        }
+    }
+    if (next < 0 || result != 0) {
+        set_error(error, error_len, "route ACK set digest is missing");
+    }
+out:
+    free(bytes);
+    return result;
+}
+
 static void route_snapshot_storage_free(struct route_snapshot_storage *storage)
 {
     if (!storage) {
@@ -167,6 +257,153 @@ static void route_snapshot_storage_free(struct route_snapshot_storage *storage)
     free(storage->rules);
     free(storage->ack_entries);
     memset(storage, 0, sizeof(*storage));
+}
+
+static void route_transaction_storage_free(
+    struct route_transaction_storage *storage)
+{
+    if (!storage) {
+        return;
+    }
+    free(storage->required_ack_entries);
+    free(storage->optional_drain_entries);
+    memset(storage, 0, sizeof(*storage));
+}
+
+static int record_list_count(const uint8_t *bytes, size_t byte_count,
+                             size_t *count_out)
+{
+    uint32_t encoded_count;
+    size_t offset = 4;
+    uint32_t i;
+
+    if (!bytes || !count_out || byte_count < 4) {
+        return -1;
+    }
+    encoded_count = read_be32(bytes);
+    for (i = 0; i < encoded_count; i++) {
+        uint32_t item_bytes;
+
+        if (byte_count - offset < 4) {
+            return -1;
+        }
+        item_bytes = read_be32(bytes + offset);
+        offset += 4;
+        if (item_bytes == 0 || item_bytes > byte_count - offset) {
+            return -1;
+        }
+        offset += item_bytes;
+    }
+    if (offset != byte_count) {
+        return -1;
+    }
+    *count_out = encoded_count;
+    return 0;
+}
+
+static int route_transaction_list_counts(const uint8_t *bytes,
+                                         size_t byte_count,
+                                         size_t *required_ack_count_out,
+                                         size_t *optional_drain_count_out)
+{
+    struct wvm_canonical_record transaction_record;
+    struct wvm_canonical_record ack_set_record;
+    struct wvm_canonical_field field;
+    size_t offset = 0;
+    int have_ack_set = 0;
+    int have_drain_set = 0;
+    int next;
+
+    if (!bytes || !required_ack_count_out || !optional_drain_count_out ||
+        wvm_canonical_record_parse(bytes, byte_count, &transaction_record) != 0 ||
+        transaction_record.record_type != WVM_RECORD_ROUTE_TRANSACTION) {
+        return -1;
+    }
+    while ((next = wvm_canonical_record_next(&transaction_record, &offset,
+                                               &field)) == 1) {
+        if (field.tag == 4) {
+            struct wvm_canonical_field ack_field;
+            size_t ack_offset = 0;
+            int ack_next;
+
+            if (have_ack_set ||
+                wvm_canonical_record_parse(field.value, field.value_bytes,
+                                           &ack_set_record) != 0 ||
+                ack_set_record.record_type != WVM_RECORD_REQUIRED_ACK_SET) {
+                return -1;
+            }
+            while ((ack_next = wvm_canonical_record_next(&ack_set_record,
+                                                          &ack_offset,
+                                                          &ack_field)) == 1) {
+                if (ack_field.tag == 1) {
+                    if (record_list_count(ack_field.value,
+                                          ack_field.value_bytes,
+                                          required_ack_count_out) != 0) {
+                        return -1;
+                    }
+                    have_ack_set = 1;
+                    break;
+                }
+            }
+            if (ack_next < 0 || !have_ack_set) {
+                return -1;
+            }
+        } else if (field.tag == 5) {
+            if (have_drain_set ||
+                record_list_count(field.value, field.value_bytes,
+                                  optional_drain_count_out) != 0) {
+                return -1;
+            }
+            have_drain_set = 1;
+        }
+    }
+    return next == 0 && have_ack_set && have_drain_set ? 0 : -1;
+}
+
+static int route_transaction_decode_alloc(
+    const uint8_t *bytes, size_t byte_count,
+    struct route_transaction_storage *storage, char *error, size_t error_len)
+{
+    size_t required_ack_count;
+    size_t optional_drain_count;
+
+    if (!storage ||
+        route_transaction_list_counts(bytes, byte_count, &required_ack_count,
+                                      &optional_drain_count) != 0 ||
+        required_ack_count > WVM_ROUTE_RUNTIME_MAX_ENTRIES ||
+        optional_drain_count > WVM_ROUTE_RUNTIME_MAX_ENTRIES) {
+        set_error(error, error_len, "route abort payload is not a transaction");
+        return -1;
+    }
+    memset(storage, 0, sizeof(*storage));
+    storage->required_ack_entries =
+        calloc(required_ack_count, sizeof(*storage->required_ack_entries));
+    storage->optional_drain_entries =
+        optional_drain_count
+            ? calloc(optional_drain_count,
+                     sizeof(*storage->optional_drain_entries))
+            : NULL;
+    if (!storage->required_ack_entries ||
+        (optional_drain_count && !storage->optional_drain_entries)) {
+        set_error(error, error_len,
+                  "cannot allocate route abort transaction lists");
+        route_transaction_storage_free(storage);
+        return -1;
+    }
+    storage->transaction.required_ack_set.entries.entries =
+        storage->required_ack_entries;
+    storage->transaction.required_ack_set.entries.capacity = required_ack_count;
+    storage->transaction.optional_departure_drain_set.entries =
+        storage->optional_drain_entries;
+    storage->transaction.optional_departure_drain_set.capacity =
+        optional_drain_count;
+    if (wvm_route_transaction_record_decode(bytes, byte_count,
+                                            &storage->transaction, error,
+                                            error_len) != 0) {
+        route_transaction_storage_free(storage);
+        return -1;
+    }
+    return 0;
 }
 
 static int route_snapshot_list_counts(const uint8_t *bytes, size_t byte_count,
@@ -278,6 +515,61 @@ static struct wvm_route_control_operation *find_operation(
     return NULL;
 }
 
+static int prepared_snapshot_matches_abort(
+    const struct wvm_route_control *control,
+    const struct wvm_route_transaction_record *transaction)
+{
+    size_t i;
+
+    if (!control || !transaction) {
+        return 0;
+    }
+    for (i = 0; i < control->operation_count; i++) {
+        const struct wvm_route_control_operation *operation =
+            &control->operations[i];
+
+        if (operation->message_type == WVM_ENVELOPE_MSG_ROUTE_PREPARE &&
+            operation->result.recorded_state == 1 &&
+            route_key_equal(&operation->result.route_snapshot_key,
+                            &transaction->route_snapshot_key) &&
+            memcmp(operation->result.required_ack_set_digest,
+                   transaction->required_ack_set.entries_digest,
+                   WVM_SHA256_DIGEST_BYTES) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int validate_route_abort(struct wvm_route_control *control,
+                                const struct wvm_envelope *request,
+                                char *error, size_t error_len)
+{
+    struct route_transaction_storage storage;
+    int result = -1;
+
+    memset(&storage, 0, sizeof(storage));
+    if (!control || !request ||
+        route_transaction_decode_alloc(request->payload, request->payload_bytes,
+                                       &storage, error, error_len) != 0 ||
+        request_matches_route_key(request, &storage.transaction.route_snapshot_key,
+                                  error, error_len) != 0 ||
+        storage.transaction.state != WVM_ROUTE_TRANSACTION_ABORTED ||
+        !prepared_snapshot_matches_abort(control, &storage.transaction) ||
+        !wvm_route_runtime_has_prepared_snapshot(
+            control->runtime, &storage.transaction.route_snapshot_key)) {
+        if (error && error[0] == '\0') {
+            set_error(error, error_len,
+                      "route abort does not match a prepared snapshot");
+        }
+        goto out;
+    }
+    result = 0;
+out:
+    route_transaction_storage_free(&storage);
+    return result;
+}
+
 static int remember_operation(struct wvm_route_control *control,
                               const struct wvm_envelope *request,
                               const struct wvm_route_control_result *result,
@@ -326,6 +618,7 @@ static int apply_unlogged(struct wvm_route_control *control,
                           struct wvm_route_control_result *result_out)
 {
     struct route_snapshot_storage storage;
+    struct route_transaction_storage transaction_storage;
     struct wvm_route_snapshot_key key;
     int result;
 
@@ -350,10 +643,53 @@ static int apply_unlogged(struct wvm_route_control *control,
             result_out->recorded_state = 1;
             result_out->route_snapshot_key =
                 storage.snapshot.route_snapshot_key;
+            if (required_ack_set_full_digest(
+                    &storage.snapshot.required_ack_set,
+                    result_out->required_ack_set_digest, error,
+                    error_len) != 0) {
+                route_snapshot_storage_free(&storage);
+                return -1;
+            }
             result_out->operation_retention_horizon_ms =
                 storage.snapshot.operation_retention_horizon_ms;
         }
         route_snapshot_storage_free(&storage);
+        return result;
+    }
+    if (request->message_type == WVM_ENVELOPE_MSG_ROUTE_ABORT) {
+        memset(&transaction_storage, 0, sizeof(transaction_storage));
+        if (route_transaction_decode_alloc(request->payload,
+                                           request->payload_bytes,
+                                           &transaction_storage, error,
+                                           error_len) != 0 ||
+            request_matches_route_key(
+                request, &transaction_storage.transaction.route_snapshot_key,
+                error, error_len) != 0 ||
+            transaction_storage.transaction.state !=
+                WVM_ROUTE_TRANSACTION_ABORTED ||
+            !prepared_snapshot_matches_abort(control,
+                                             &transaction_storage.transaction)) {
+            route_transaction_storage_free(&transaction_storage);
+            if (error && error[0] == '\0') {
+                set_error(error, error_len,
+                          "route abort does not match a prepared snapshot");
+            }
+            return -1;
+        }
+        result = wvm_route_runtime_abort_prepared(
+            control->runtime, &transaction_storage.transaction.route_snapshot_key,
+            error, error_len);
+        if (result == 0 && result_out) {
+            result_out->recorded_state = 3;
+            result_out->route_snapshot_key =
+                transaction_storage.transaction.route_snapshot_key;
+            memcpy(result_out->required_ack_set_digest,
+                   transaction_storage.transaction.required_ack_set.entries_digest,
+                   sizeof(result_out->required_ack_set_digest));
+            result_out->operation_retention_horizon_ms =
+                transaction_storage.transaction.operation_retention_horizon_ms;
+        }
+        route_transaction_storage_free(&transaction_storage);
         return result;
     }
     if (wvm_route_snapshot_key_decode(request->payload, request->payload_bytes,
@@ -587,6 +923,7 @@ int wvm_route_control_apply(struct wvm_route_control *control,
                             struct wvm_route_control_result *result_out,
                             char *error, size_t error_len)
 {
+    struct wvm_envelope normalized_request;
     uint8_t *frame = NULL;
     size_t frame_bytes = 0;
     int result;
@@ -597,11 +934,22 @@ int wvm_route_control_apply(struct wvm_route_control *control,
         return -1;
     }
     if (encode_local_frame(request, &frame, &frame_bytes, error, error_len) !=
-        0) {
+        0 ||
+        wvm_envelope_decode(frame, frame_bytes, WVM_ENVELOPE_TRANSPORT_LOCAL,
+                            &normalized_request, error, error_len) != 0) {
+        free(frame);
         return -1;
     }
     pthread_mutex_lock(&control->lock);
-    result = apply_and_record(control, request, frame, frame_bytes, 0,
+    if (normalized_request.message_type == WVM_ENVELOPE_MSG_ROUTE_ABORT &&
+        !find_operation(control, &normalized_request) &&
+        validate_route_abort(control, &normalized_request, error, error_len) !=
+            0) {
+        pthread_mutex_unlock(&control->lock);
+        free(frame);
+        return -1;
+    }
+    result = apply_and_record(control, &normalized_request, frame, frame_bytes, 0,
                               result_out, error, error_len);
     pthread_mutex_unlock(&control->lock);
     free(frame);

@@ -13,7 +13,8 @@
  * tolerate the item that failed to prepare.
  */
 typedef int (*wvm_admission_route_stage_fn)(
-    void *context, const struct wvm_route_transaction_record *transaction,
+    void *context, const struct wvm_coordinator_transaction *coordinator_transaction,
+    const struct wvm_route_transaction_record *transaction,
     const struct wvm_route_snapshot_record *snapshot, char *error,
     size_t error_len);
 
@@ -26,12 +27,31 @@ typedef int (*wvm_admission_route_plan_fn)(
     size_t error_len);
 
 typedef int (*wvm_admission_reservation_stage_fn)(
-    void *context, const struct wvm_resource_reservation *reservation,
-    char *error, size_t error_len);
+    void *context, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_resource_reservation *reservation, char *error,
+    size_t error_len);
+
+/*
+ * Commit callbacks receive the exact durable activation decision. This makes
+ * the activation fence an explicit transport input rather than permitting a
+ * participant to infer it from mutable local state.
+ */
+typedef int (*wvm_admission_reservation_commit_fn)(
+    void *context, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_resource_reservation *reservation,
+    const struct wvm_activation_record *activation, char *error,
+    size_t error_len);
 
 typedef int (*wvm_admission_participant_stage_fn)(
-    void *context, const struct wvm_node_runtime_manifest *runtime_manifest,
-    char *error, size_t error_len);
+    void *context, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *runtime_manifest, char *error,
+    size_t error_len);
+
+typedef int (*wvm_admission_participant_commit_fn)(
+    void *context, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *runtime_manifest,
+    const struct wvm_activation_record *activation, char *error,
+    size_t error_len);
 
 struct wvm_admission_orchestrator_input;
 
@@ -70,10 +90,10 @@ struct wvm_admission_orchestrator_callbacks {
     wvm_admission_route_stage_fn route_commit;
     wvm_admission_route_stage_fn route_abort;
     wvm_admission_reservation_stage_fn reservation_prepare;
-    wvm_admission_reservation_stage_fn reservation_commit;
+    wvm_admission_reservation_commit_fn reservation_commit;
     wvm_admission_reservation_stage_fn reservation_abort;
     wvm_admission_participant_stage_fn participant_prepare;
-    wvm_admission_participant_stage_fn participant_commit;
+    wvm_admission_participant_commit_fn participant_commit;
     wvm_admission_participant_stage_fn participant_abort;
     wvm_admission_participant_stage_fn participant_ready;
 };

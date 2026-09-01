@@ -70,7 +70,7 @@ static int callback_reservations(
     size_t i;
 
     for (i = 0; i < input->prepared_vm->reservation_count; i++) {
-        if (callback(input->callback_context,
+        if (callback(input->callback_context, &input->prepared_vm->candidate,
                      &input->prepared_vm->reservations[i], error,
                      error_len) != 0) {
             return -1;
@@ -86,9 +86,43 @@ static int callback_participants(
     size_t i;
 
     for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
-        if (callback(input->callback_context,
+        if (callback(input->callback_context, &input->prepared_vm->candidate,
                      &input->prepared_vm->node_runtime_manifests[i], error,
                      error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int callback_reservation_commits(
+    const struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->reservation_count; i++) {
+        if (input->callbacks->reservation_commit(
+                input->callback_context, &input->prepared_vm->candidate,
+                &input->prepared_vm->reservations[i], input->activation,
+                error, error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int callback_participant_commits(
+    const struct wvm_admission_orchestrator_input *input, char *error,
+    size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
+        if (input->callbacks->participant_commit(
+                input->callback_context, &input->prepared_vm->candidate,
+                &input->prepared_vm->node_runtime_manifests[i],
+                input->activation, error, error_len) != 0) {
             return -1;
         }
     }
@@ -136,7 +170,7 @@ static int abort_pre_activation(
     }
     if (route_prepared &&
         input->callbacks->route_abort(input->callback_context,
-                                       input->route_transaction,
+                                       transaction, input->route_transaction,
                                        input->route_snapshot, cleanup_error,
                                        sizeof(cleanup_error)) != 0) {
         cleanup_failed = 1;
@@ -370,7 +404,7 @@ int wvm_admission_orchestrator_run(
     }
     route_prepared = 1;
     if (input->callbacks->route_prepare(input->callback_context,
-                                        input->route_transaction,
+                                        transaction, input->route_transaction,
                                         input->route_snapshot, error,
                                         error_len) != 0) {
         return abort_pre_activation(input, transaction, route_prepared, error,
@@ -420,10 +454,8 @@ int wvm_admission_orchestrator_run(
     /* From this point the durable activation decision is authoritative. */
     if (wvm_coordinator_commit_local(transaction, input->prepared_vm,
                                      input->activation, error, error_len) != 0 ||
-        callback_reservations(input, input->callbacks->reservation_commit,
-                              error, error_len) != 0 ||
-        callback_participants(input, input->callbacks->participant_commit,
-                              error, error_len) != 0) {
+        callback_reservation_commits(input, error, error_len) != 0 ||
+        callback_participant_commits(input, error, error_len) != 0) {
         return -1;
     }
     {
@@ -439,7 +471,7 @@ int wvm_admission_orchestrator_run(
         }
     }
     if (input->callbacks->route_commit(input->callback_context,
-                                        input->route_transaction,
+                                        transaction, input->route_transaction,
                                         input->route_snapshot, error,
                                         error_len) != 0 ||
         durable_route_state(input, WVM_ROUTE_TRANSACTION_ACTIVATED, error,

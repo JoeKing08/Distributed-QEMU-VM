@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "wavevm_route_control.h"
+#include "wavevm_membership.h"
 
 static int expect(int condition, const char *message)
 {
@@ -105,6 +106,34 @@ static int encode_key(const struct wvm_route_snapshot_key *key, uint8_t *bytes,
                                          error, error_len);
 }
 
+static int encode_aborted_transaction(
+    const struct wvm_route_snapshot_record *snapshot, uint8_t operation_tail,
+    uint8_t *bytes, size_t capacity, size_t *byte_count, char *error,
+    size_t error_len)
+{
+    struct wvm_route_transaction_record transaction;
+
+    memset(&transaction, 0, sizeof(transaction));
+    transaction.operation_id[WVM_IDENTITY_ID_BYTES - 1] = operation_tail;
+    transaction.route_snapshot_key = snapshot->route_snapshot_key;
+    transaction.required_ack_set = snapshot->required_ack_set;
+    memset(transaction.required_ack_set.entries_digest, 0,
+           sizeof(transaction.required_ack_set.entries_digest));
+    if (wvm_required_ack_set_encode(&transaction.required_ack_set, bytes,
+                                    capacity, byte_count, error, error_len) !=
+            0 ||
+        wvm_required_ack_set_decode(bytes, *byte_count,
+                                    &transaction.required_ack_set, error,
+                                    error_len) != 0) {
+        return -1;
+    }
+    transaction.operation_retention_horizon_ms =
+        snapshot->operation_retention_horizon_ms;
+    transaction.state = WVM_ROUTE_TRANSACTION_ABORTED;
+    return wvm_route_transaction_record_encode(&transaction, bytes, capacity,
+                                               byte_count, error, error_len);
+}
+
 static void make_request(struct wvm_envelope *request, uint16_t message_type,
                          uint8_t operation_tail, const uint8_t *payload,
                          size_t payload_bytes)
@@ -120,6 +149,8 @@ static void make_request(struct wvm_envelope *request, uint16_t message_type,
     request->delivery_attempt_id = 1;
     request->payload = payload;
     request->payload_bytes = payload_bytes;
+    wvm_envelope_semantic_digest(payload, payload_bytes,
+                                 request->semantic_payload_digest);
 }
 
 static void make_lookup_envelope(
@@ -148,16 +179,19 @@ int main(void)
     struct wvm_route_control first_control;
     struct wvm_route_control recovered_control;
     struct wvm_route_snapshot_record first_snapshot;
+    struct wvm_route_snapshot_record aborted_snapshot;
     struct wvm_route_snapshot_record successor_snapshot;
     struct wvm_route_rule_record first_rule;
+    struct wvm_route_rule_record aborted_rule;
     struct wvm_route_rule_record successor_rule;
     struct wvm_required_ack_entry first_ack;
+    struct wvm_required_ack_entry aborted_ack;
     struct wvm_required_ack_entry successor_ack;
     struct wvm_envelope request;
     struct wvm_envelope lookup;
     struct wvm_route_runtime_next_hop next_hop;
     uint8_t snapshot_bytes[8192];
-    uint8_t key_bytes[512];
+    uint8_t key_bytes[8192];
     size_t snapshot_byte_count;
     size_t key_byte_count;
     char error[256] = {0};
@@ -172,8 +206,10 @@ int main(void)
 
     if (finalize_snapshot(&first_snapshot, &first_rule, &first_ack, 1, 19001,
                           error, sizeof(error)) != 0 ||
+        finalize_snapshot(&aborted_snapshot, &aborted_rule, &aborted_ack, 2,
+                          19002, error, sizeof(error)) != 0 ||
         finalize_snapshot(&successor_snapshot, &successor_rule, &successor_ack,
-                          2, 19002, error, sizeof(error)) != 0) {
+                          3, 19003, error, sizeof(error)) != 0) {
         fprintf(stderr, "route-control setup: %s\n", error);
         unlink(journal);
         return 1;
@@ -228,7 +264,60 @@ int main(void)
         return 1;
     }
 
-    if (expect(encode_snapshot(&successor_snapshot, snapshot_bytes,
+    if (expect(encode_snapshot(&aborted_snapshot, snapshot_bytes,
+                               sizeof(snapshot_bytes), &snapshot_byte_count,
+                               error, sizeof(error)) == 0,
+               "encode abortable snapshot")) {
+        wvm_route_control_close(&first_control);
+        wvm_route_runtime_destroy(&first_runtime);
+        unlink(journal);
+        return 1;
+    }
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 3,
+                 snapshot_bytes, snapshot_byte_count);
+    if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
+                                       sizeof(error)) == 0,
+               "prepare abortable snapshot") ||
+        expect(encode_aborted_transaction(&aborted_snapshot, 9, key_bytes,
+                                          sizeof(key_bytes), &key_byte_count,
+                                          error, sizeof(error)) == 0,
+               "encode route abort transaction")) {
+        wvm_route_control_close(&first_control);
+        wvm_route_runtime_destroy(&first_runtime);
+        unlink(journal);
+        return 1;
+    }
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_ABORT, 4, key_bytes,
+                 key_byte_count);
+    if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
+                                       sizeof(error)) == 0,
+               "abort exact prepared snapshot") ||
+        expect(wvm_route_control_apply(&first_control, &request, NULL, error,
+                                       sizeof(error)) == 0,
+               "replay duplicate route abort") ||
+        expect(!wvm_route_runtime_has_snapshot(
+                   &first_runtime, &aborted_snapshot.route_snapshot_key),
+               "aborted snapshot is never active")) {
+        wvm_route_control_close(&first_control);
+        wvm_route_runtime_destroy(&first_runtime);
+        unlink(journal);
+        return 1;
+    }
+    if (expect(encode_aborted_transaction(&aborted_snapshot, 10, key_bytes,
+                                          sizeof(key_bytes), &key_byte_count,
+                                          error, sizeof(error)) == 0,
+               "encode conflicting route abort transaction")) {
+        wvm_route_control_close(&first_control);
+        wvm_route_runtime_destroy(&first_runtime);
+        unlink(journal);
+        return 1;
+    }
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_ABORT, 4, key_bytes,
+                 key_byte_count);
+    if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
+                                       sizeof(error)) != 0,
+               "reject route abort operation ID payload conflict") ||
+        expect(encode_snapshot(&successor_snapshot, snapshot_bytes,
                                sizeof(snapshot_bytes), &snapshot_byte_count,
                                error, sizeof(error)) == 0,
                "encode successor snapshot")) {
@@ -237,7 +326,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 3,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_PREPARE, 5,
                  snapshot_bytes, snapshot_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -251,11 +340,25 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_COMMIT, 4, key_bytes,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_COMMIT, 6, key_bytes,
                  key_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
                "commit successor snapshot") ||
+        expect(encode_aborted_transaction(&successor_snapshot, 11, key_bytes,
+                                          sizeof(key_bytes), &key_byte_count,
+                                          error, sizeof(error)) == 0,
+               "encode active route abort transaction")) {
+        wvm_route_control_close(&first_control);
+        wvm_route_runtime_destroy(&first_runtime);
+        unlink(journal);
+        return 1;
+    }
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_ABORT, 7, key_bytes,
+                 key_byte_count);
+    if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
+                                       sizeof(error)) != 0,
+               "reject route abort after activation") ||
         expect(encode_key(&first_snapshot.route_snapshot_key, key_bytes,
                           sizeof(key_bytes), &key_byte_count, error,
                           sizeof(error)) == 0,
@@ -265,7 +368,7 @@ int main(void)
         unlink(journal);
         return 1;
     }
-    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_RETIRE, 5, key_bytes,
+    make_request(&request, WVM_ENVELOPE_MSG_ROUTE_RETIRE, 8, key_bytes,
                  key_byte_count);
     if (expect(wvm_route_control_apply(&first_control, &request, NULL, error,
                                        sizeof(error)) == 0,
@@ -303,7 +406,7 @@ int main(void)
     make_lookup_envelope(&lookup, &successor_snapshot.route_snapshot_key);
     if (expect(wvm_route_runtime_lookup(&recovered_runtime, &lookup,
                                         &next_hop, error, sizeof(error)) == 0 &&
-                   next_hop.next_hop_endpoint.data_port == 19002,
+                   next_hop.next_hop_endpoint.data_port == 19003,
                "recovered successor remains active")) {
         wvm_route_control_close(&recovered_control);
         wvm_route_runtime_destroy(&recovered_runtime);

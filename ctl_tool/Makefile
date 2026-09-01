@@ -18,6 +18,11 @@ SRCS = main.c \
 	$(COMMON_DIR)/wavevm_reservation_runtime.c \
 	$(COMMON_DIR)/wavevm_fault_engine.c \
 	$(COMMON_DIR)/wavevm_coordinator.c \
+	$(COMMON_DIR)/wavevm_admission_evidence.c \
+	$(COMMON_DIR)/wavevm_admission_provider.c \
+	$(COMMON_DIR)/wavevm_admission_stage.c \
+	$(COMMON_DIR)/wavevm_admission_transport.c \
+	$(COMMON_DIR)/wavevm_admission_route.c \
 	$(COMMON_DIR)/wavevm_membership_coordinator.c \
 	$(COMMON_DIR)/wavevm_admission_orchestrator.c \
 	$(COMMON_DIR)/wavevm_control_plane.c \

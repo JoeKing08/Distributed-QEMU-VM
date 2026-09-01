@@ -526,12 +526,14 @@ static int orchestrator_prepare_input(
 }
 
 static int orchestrator_route_prepare(
-    void *opaque, const struct wvm_route_transaction_record *transaction,
+    void *opaque, const struct wvm_coordinator_transaction *coordinator_transaction,
+    const struct wvm_route_transaction_record *transaction,
     const struct wvm_route_snapshot_record *snapshot, char *error,
     size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)coordinator_transaction;
     (void)transaction;
     (void)snapshot;
     (void)error;
@@ -541,12 +543,14 @@ static int orchestrator_route_prepare(
 }
 
 static int orchestrator_route_commit(
-    void *opaque, const struct wvm_route_transaction_record *transaction,
+    void *opaque, const struct wvm_coordinator_transaction *coordinator_transaction,
+    const struct wvm_route_transaction_record *transaction,
     const struct wvm_route_snapshot_record *snapshot, char *error,
     size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)coordinator_transaction;
     (void)transaction;
     (void)snapshot;
     (void)error;
@@ -556,12 +560,14 @@ static int orchestrator_route_commit(
 }
 
 static int orchestrator_route_abort(
-    void *opaque, const struct wvm_route_transaction_record *transaction,
+    void *opaque, const struct wvm_coordinator_transaction *coordinator_transaction,
+    const struct wvm_route_transaction_record *transaction,
     const struct wvm_route_snapshot_record *snapshot, char *error,
     size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)coordinator_transaction;
     (void)transaction;
     (void)snapshot;
     (void)error;
@@ -571,11 +577,13 @@ static int orchestrator_route_abort(
 }
 
 static int orchestrator_reservation_prepare(
-    void *opaque, const struct wvm_resource_reservation *reservation,
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_resource_reservation *reservation,
     char *error, size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)reservation;
     (void)error;
     (void)error_len;
@@ -584,12 +592,18 @@ static int orchestrator_reservation_prepare(
 }
 
 static int orchestrator_reservation_commit(
-    void *opaque, const struct wvm_resource_reservation *reservation,
-    char *error, size_t error_len)
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_resource_reservation *reservation,
+    const struct wvm_activation_record *activation, char *error,
+    size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)reservation;
+    if (!activation || !activation->has_activation_fence) {
+        return -1;
+    }
     (void)error;
     (void)error_len;
     hooks->reservation_commits++;
@@ -597,11 +611,13 @@ static int orchestrator_reservation_commit(
 }
 
 static int orchestrator_reservation_abort(
-    void *opaque, const struct wvm_resource_reservation *reservation,
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_resource_reservation *reservation,
     char *error, size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)reservation;
     (void)error;
     (void)error_len;
@@ -610,11 +626,13 @@ static int orchestrator_reservation_abort(
 }
 
 static int orchestrator_participant_prepare(
-    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *manifest,
     char *error, size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)manifest;
     (void)error;
     (void)error_len;
@@ -623,12 +641,18 @@ static int orchestrator_participant_prepare(
 }
 
 static int orchestrator_participant_commit(
-    void *opaque, const struct wvm_node_runtime_manifest *manifest,
-    char *error, size_t error_len)
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *manifest,
+    const struct wvm_activation_record *activation, char *error,
+    size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)manifest;
+    if (!activation || !activation->has_activation_fence) {
+        return -1;
+    }
     (void)error;
     (void)error_len;
     hooks->participant_commits++;
@@ -636,11 +660,13 @@ static int orchestrator_participant_commit(
 }
 
 static int orchestrator_participant_abort(
-    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *manifest,
     char *error, size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     (void)manifest;
     (void)error;
     (void)error_len;
@@ -649,11 +675,13 @@ static int orchestrator_participant_abort(
 }
 
 static int orchestrator_participant_ready(
-    void *opaque, const struct wvm_node_runtime_manifest *manifest,
+    void *opaque, const struct wvm_candidate_vm_manifest *candidate,
+    const struct wvm_node_runtime_manifest *manifest,
     char *error, size_t error_len)
 {
     struct orchestrator_test_hooks *hooks = opaque;
 
+    (void)candidate;
     hooks->participant_readies++;
     return wvm_runtime_ready_publish(manifest,
                                       manifest->expected_node_instance_id,

@@ -139,6 +139,8 @@ The V1 enum registry is:
 | `0x102a` | `RejoinMemberRequest` | `1:Record<NodeRecord or GatewayRecord>:member_record`, `2:Record<MemberKey>:prior_member_key?`, `3:Digest32:recovery_evidence_digest` |
 | `0x102b` | `GatewayDrainRequest` | `1:U16:action`, `2:Record<MemberKey>:target_gateway_member_key`, `3:U64:expected_membership_revision`, `4:U64:expected_topology_revision`, `5:U64:expected_admission_eligibility_revision`, `6:Record<RouteTransaction>:successor_transaction?`, `7:Record<RouteSnapshot>:successor_snapshot?`, `8:ID16:route_operation_id` |
 | `0x102c` | `MemberCordonRequest` | `1:Record<MemberKey>:target_member_key`, `2:U64:expected_membership_revision`, `3:U64:expected_topology_revision`, `4:U64:expected_admission_eligibility_revision`, `5:U16:reason_code` |
+| `0x102d` | `AdmissionReservationStage` | `1:Record<CandidateVmManifest>:candidate`, `2:Record<ResourceReservation>:reservation`, `3:Record<ActivationRecord>:activation?`, `4:U16:abort_reason?` |
+| `0x102e` | `AdmissionParticipantStage` | `1:Record<CandidateVmManifest>:candidate`, `2:Record<NodeRuntimeManifest>:runtime_manifest`, `3:Record<ActivationRecord>:activation?`, `4:U16:abort_reason?` |
 
 ## 3. Cross-Record Constraints
 
@@ -238,6 +240,16 @@ The V1 enum registry is:
   `activation_fence` and is valid only before one is durable. `COMMITTED` is a
   later lifecycle state reached after all required participant promotions have
   been acknowledged.
+- `AdmissionReservationStage` and `AdmissionParticipantStage` are envelope
+  payload carriers, not independent admission authorities. `PREPARE_*` carries
+  a `PREPARED` reservation or a non-activated runtime projection with neither
+  field three nor field four. `COMMIT_RESERVATION` carries the committed
+  reservation and the exact durable `ACTIVATE` record. `ACTIVATE_MANIFEST`
+  carries the activation-fenced runtime projection and that same exact
+  `ACTIVATE` record. `ABORT_*` carries the unactivated object and a nonzero
+  implementation-independent abort reason, without an activation record.
+  Every embedded candidate must match the reservation/projection identity,
+  transaction, candidate digest, eligibility fence, and VM identity exactly.
 - `NodeRuntimeManifest` is a filtered projection of exactly one candidate
   manifest. It contains only assignments on `physical_node_id`; its
   `candidate_manifest_digest`, route key, profile, and reservation must match

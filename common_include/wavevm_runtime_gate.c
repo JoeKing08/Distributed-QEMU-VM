@@ -483,9 +483,82 @@ void wvm_runtime_gate_init(struct wvm_runtime_gate *gate)
     }
 }
 
+static int runtime_manifest_equal(
+    const struct wvm_node_runtime_manifest *left,
+    const struct wvm_node_runtime_manifest *right, char *error,
+    size_t error_len)
+{
+    size_t capacity = 4096U;
+
+    while (capacity <= WVM_RUNTIME_MANIFEST_MAX_BYTES) {
+        uint8_t *left_bytes = malloc(capacity);
+        uint8_t *right_bytes = malloc(capacity);
+        size_t left_count = 0;
+        size_t right_count = 0;
+        int equal;
+
+        if (!left_bytes || !right_bytes) {
+            free(left_bytes);
+            free(right_bytes);
+            set_error(error, error_len,
+                      "cannot allocate runtime manifest comparison");
+            return -1;
+        }
+        if (wvm_node_runtime_manifest_encode(left, left_bytes, capacity,
+                                             &left_count, error, error_len) ==
+                0 &&
+            wvm_node_runtime_manifest_encode(right, right_bytes, capacity,
+                                             &right_count, error, error_len) ==
+                0) {
+            equal = left_count == right_count &&
+                    memcmp(left_bytes, right_bytes, left_count) == 0;
+            free(right_bytes);
+            free(left_bytes);
+            return equal;
+        }
+        free(right_bytes);
+        free(left_bytes);
+        if (capacity == WVM_RUNTIME_MANIFEST_MAX_BYTES) {
+            break;
+        }
+        capacity *= 2U;
+        if (capacity > WVM_RUNTIME_MANIFEST_MAX_BYTES) {
+            capacity = WVM_RUNTIME_MANIFEST_MAX_BYTES;
+        }
+    }
+    set_error(error, error_len, "runtime manifest exceeds gate comparison limit");
+    return -1;
+}
+
+static int runtime_manifest_same_prepared_projection(
+    const struct wvm_node_runtime_manifest *prepared,
+    const struct wvm_node_runtime_manifest *activated, char *error,
+    size_t error_len)
+{
+    struct wvm_node_runtime_manifest normalized_prepared;
+    struct wvm_node_runtime_manifest normalized_activated;
+
+    if (!prepared || !activated || prepared->has_activation_fence ||
+        !activated->has_activation_fence) {
+        set_error(error, error_len,
+                  "runtime manifest activation transition is invalid");
+        return -1;
+    }
+    normalized_prepared = *prepared;
+    normalized_activated = *activated;
+    normalized_prepared.has_activation_fence = 0;
+    normalized_activated.has_activation_fence = 0;
+    memset(normalized_prepared.activation_fence, 0,
+           sizeof(normalized_prepared.activation_fence));
+    memset(normalized_activated.activation_fence, 0,
+           sizeof(normalized_activated.activation_fence));
+    return runtime_manifest_equal(&normalized_prepared, &normalized_activated,
+                                  error, error_len);
+}
+
 int wvm_runtime_gate_prepare(
     struct wvm_runtime_gate *gate,
-    const struct wvm_node_runtime_manifest *manifest,
+    struct wvm_node_runtime_manifest *manifest,
     uint32_t local_physical_node_id, uint64_t local_node_instance_id,
     char *error, size_t error_len)
 {
@@ -507,13 +580,52 @@ int wvm_runtime_gate_prepare(
     return 0;
 }
 
+int wvm_runtime_gate_bind_activation(
+    struct wvm_runtime_gate *gate,
+    const struct wvm_node_runtime_manifest *activated_manifest, char *error,
+    size_t error_len)
+{
+    if (!gate || !gate->manifest || !activated_manifest ||
+        (gate->state != WVM_RUNTIME_GATE_PREPARED &&
+         gate->state != WVM_RUNTIME_GATE_ACTIVE) ||
+        wvm_node_runtime_manifest_validate(activated_manifest, error,
+                                           error_len) != 0 ||
+        activated_manifest->physical_node_id != gate->local_physical_node_id ||
+        activated_manifest->expected_node_instance_id !=
+            gate->local_node_instance_id) {
+        set_error(error, error_len,
+                  "activation manifest does not match prepared projection");
+        return -1;
+    }
+    if (gate->state == WVM_RUNTIME_GATE_ACTIVE) {
+        if (runtime_manifest_equal(gate->manifest, activated_manifest, error,
+                                   error_len) != 1) {
+            set_error(error, error_len,
+                      "activation replay does not match active projection");
+            return -1;
+        }
+        return 0;
+    }
+    if (runtime_manifest_same_prepared_projection(
+            gate->manifest, activated_manifest, error, error_len) != 1) {
+        set_error(error, error_len,
+                  "activation manifest does not match prepared projection");
+        return -1;
+    }
+    gate->manifest->has_activation_fence = 1;
+    memcpy(gate->manifest->activation_fence, activated_manifest->activation_fence,
+           sizeof(gate->manifest->activation_fence));
+    return 0;
+}
+
 int wvm_runtime_gate_activate(
     struct wvm_runtime_gate *gate,
     const uint8_t activation_fence[WVM_IDENTITY_ID_BYTES], char *error,
     size_t error_len)
 {
     if (!gate || !gate->manifest ||
-        gate->state != WVM_RUNTIME_GATE_PREPARED ||
+        (gate->state != WVM_RUNTIME_GATE_PREPARED &&
+         gate->state != WVM_RUNTIME_GATE_ACTIVE) ||
         !activation_fence || bytes_are_zero(activation_fence,
                                              WVM_IDENTITY_ID_BYTES) ||
         !gate->manifest->has_activation_fence ||
@@ -523,7 +635,36 @@ int wvm_runtime_gate_activate(
                   "activation fence does not match admitted manifest");
         return -1;
     }
+    if (gate->state == WVM_RUNTIME_GATE_ACTIVE) {
+        return 0;
+    }
     gate->state = WVM_RUNTIME_GATE_ACTIVE;
+    return 0;
+}
+
+int wvm_runtime_gate_abort_prepared(
+    struct wvm_runtime_gate *gate,
+    const struct wvm_node_runtime_manifest *prepared_manifest, char *error,
+    size_t error_len)
+{
+    int equal;
+
+    if (!gate || !gate->manifest || !prepared_manifest ||
+        gate->state != WVM_RUNTIME_GATE_PREPARED ||
+        prepared_manifest->has_activation_fence) {
+        set_error(error, error_len, "runtime gate is not abortable");
+        return -1;
+    }
+    equal = runtime_manifest_equal(gate->manifest, prepared_manifest, error,
+                                   error_len);
+    if (equal != 1) {
+        if (equal == 0) {
+            set_error(error, error_len,
+                      "runtime abort does not match prepared projection");
+        }
+        return -1;
+    }
+    wvm_runtime_gate_init(gate);
     return 0;
 }
 

@@ -406,6 +406,68 @@ int wvm_route_runtime_activate(struct wvm_route_runtime *runtime,
     return 0;
 }
 
+int wvm_route_runtime_abort_prepared(
+    struct wvm_route_runtime *runtime, const struct wvm_route_snapshot_key *key,
+    char *error, size_t error_len)
+{
+    struct route_scope_slot *scopes;
+    struct route_scope_slot *scope;
+    size_t scope_index;
+
+    if (!runtime || !key ||
+        wvm_route_snapshot_key_validate(key, error, error_len) != 0) {
+        if (!error || error[0] == '\0') {
+            set_error(error, error_len, "route abort key is invalid");
+        }
+        return -1;
+    }
+    pthread_rwlock_wrlock(&runtime->lock);
+    scope = find_scope(runtime, &key->scope_key);
+    if (!scope || !scope->has_prepared ||
+        !snapshot_key_equal(&scope->prepared.key, key)) {
+        pthread_rwlock_unlock(&runtime->lock);
+        set_error(error, error_len, "route abort key is not prepared");
+        return -1;
+    }
+    if (scope->has_active && snapshot_key_equal(&scope->active.key, key)) {
+        pthread_rwlock_unlock(&runtime->lock);
+        set_error(error, error_len, "active route cannot be aborted");
+        return -1;
+    }
+    snapshot_clear(&scope->prepared);
+    scope->has_prepared = 0;
+    if (!scope->has_active && !scope->has_predecessor) {
+        scopes = scope_slots(runtime);
+        scope_index = (size_t)(scope - scopes);
+        if (scope_index + 1U != runtime->scope_count) {
+            scopes[scope_index] = scopes[runtime->scope_count - 1U];
+        }
+        memset(&scopes[runtime->scope_count - 1U], 0,
+               sizeof(scopes[runtime->scope_count - 1U]));
+        runtime->scope_count--;
+    }
+    pthread_rwlock_unlock(&runtime->lock);
+    return 0;
+}
+
+int wvm_route_runtime_has_prepared_snapshot(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_route_snapshot_key *key)
+{
+    const struct route_scope_slot *scope;
+    int found;
+
+    if (!runtime || !key) {
+        return 0;
+    }
+    pthread_rwlock_rdlock((pthread_rwlock_t *)&runtime->lock);
+    scope = find_scope_const(runtime, &key->scope_key);
+    found = scope && scope->has_prepared &&
+            snapshot_key_equal(&scope->prepared.key, key);
+    pthread_rwlock_unlock((pthread_rwlock_t *)&runtime->lock);
+    return found;
+}
+
 int wvm_route_runtime_retire(struct wvm_route_runtime *runtime,
                              const struct wvm_route_snapshot_key *key,
                              char *error, size_t error_len)

@@ -21,6 +21,9 @@ gcc -Wall -Wextra -Werror -std=c11 -D_POSIX_C_SOURCE=200809L \
     "$repo_root/common_include/wavevm_fault_engine.c" \
     "$repo_root/common_include/wavevm_coordinator.c" \
     "$repo_root/common_include/wavevm_control_plane.c" \
+    "$repo_root/common_include/wavevm_envelope.c" \
+    "$repo_root/common_include/wavevm_membership_controller.c" \
+    "$repo_root/common_include/wavevm_membership_control.c" \
     "$repo_root/tests/control-plane/test_control_route_transaction_journal.c" \
     -pthread -o "$tmpdir/test_control_route_transaction_journal"
 "$tmpdir/test_control_route_transaction_journal"

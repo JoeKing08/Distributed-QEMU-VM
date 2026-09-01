@@ -41,7 +41,7 @@ static int recover_reservations(
     size_t i;
 
     for (i = 0; i < input->prepared_vm->reservation_count; i++) {
-        if (callback(input->callback_context,
+        if (callback(input->callback_context, &input->prepared_vm->candidate,
                      &input->prepared_vm->reservations[i], error,
                      error_len) != 0) {
             return -1;
@@ -57,9 +57,43 @@ static int recover_participants(
     size_t i;
 
     for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
-        if (callback(input->callback_context,
+        if (callback(input->callback_context, &input->prepared_vm->candidate,
                      &input->prepared_vm->node_runtime_manifests[i], error,
                      error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int recover_reservation_commits(
+    const struct wvm_admission_recovery_input *input, char *error,
+    size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->reservation_count; i++) {
+        if (input->callbacks->reservation_commit(
+                input->callback_context, &input->prepared_vm->candidate,
+                &input->prepared_vm->reservations[i], input->activation,
+                error, error_len) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int recover_participant_commits(
+    const struct wvm_admission_recovery_input *input, char *error,
+    size_t error_len)
+{
+    size_t i;
+
+    for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
+        if (input->callbacks->participant_commit(
+                input->callback_context, &input->prepared_vm->candidate,
+                &input->prepared_vm->node_runtime_manifests[i],
+                input->activation, error, error_len) != 0) {
             return -1;
         }
     }
@@ -128,10 +162,8 @@ static int recover_activation(
         !input->activation->has_activation_fence ||
         wvm_coordinator_commit_local(input->transaction, input->prepared_vm,
                                      input->activation, error, error_len) != 0 ||
-        recover_reservations(input, input->callbacks->reservation_commit, error,
-                             error_len) != 0 ||
-        recover_participants(input, input->callbacks->participant_commit, error,
-                             error_len) != 0) {
+        recover_reservation_commits(input, error, error_len) != 0 ||
+        recover_participant_commits(input, error, error_len) != 0) {
         return -1;
     }
     for (i = 0; i < input->prepared_vm->node_runtime_manifest_count; i++) {
@@ -143,6 +175,7 @@ static int recover_activation(
         }
     }
     if (input->callbacks->route_commit(input->callback_context,
+                                       input->transaction,
                                        input->route_transaction,
                                        input->route_snapshot, error,
                                        error_len) != 0 ||
@@ -177,6 +210,7 @@ static int recover_abort(
         wvm_coordinator_abort_local(input->transaction, input->prepared_vm,
                                     input->activation, error, error_len) != 0 ||
         input->callbacks->route_abort(input->callback_context,
+                                      input->transaction,
                                       input->route_transaction,
                                       input->route_snapshot, error,
                                       error_len) != 0 ||

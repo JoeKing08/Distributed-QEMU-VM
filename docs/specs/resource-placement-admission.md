@@ -413,7 +413,10 @@ CONTROL_PLANE_BEGIN
 ```
 
 Every route, reservation, and participant callback is idempotent for the
-admission transaction and manifest identity. A failure before the durable
+admission transaction and manifest identity. Route prepare, commit, and abort
+use distinct operation IDs derived from the immutable route transaction, stage,
+and target member; the `RouteTransaction.operation_id` remains the stable
+transaction identifier carried by the canonical record. A failure before the durable
 `ACTIVATE` decision records `ABORT`, invokes only prepared-resource cleanup,
 and reaches `ABORTED` only after route, participant, reservation, and local
 cleanup succeeds. A failure after `ACTIVATE` is not converted into a new

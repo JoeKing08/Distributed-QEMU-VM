@@ -51,6 +51,16 @@ int wvm_route_runtime_activate(struct wvm_route_runtime *runtime,
                                const struct wvm_route_snapshot_key *key,
                                char *error, size_t error_len);
 
+/* Remove only an exact prepared snapshot. Active routing is never aborted. */
+int wvm_route_runtime_abort_prepared(
+    struct wvm_route_runtime *runtime, const struct wvm_route_snapshot_key *key,
+    char *error, size_t error_len);
+
+/* True only while KEY names the exact pending successor in its route scope. */
+int wvm_route_runtime_has_prepared_snapshot(
+    const struct wvm_route_runtime *runtime,
+    const struct wvm_route_snapshot_key *key);
+
 /*
  * Retire one exact active or retained predecessor. A successor activation
  * retains one predecessor so control/query work can drain without exposing a
