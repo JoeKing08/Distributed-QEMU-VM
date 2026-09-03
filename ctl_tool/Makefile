@@ -20,6 +20,7 @@ SRCS = main.c \
 	$(COMMON_DIR)/wavevm_coordinator.c \
 	$(COMMON_DIR)/wavevm_admission_evidence.c \
 	$(COMMON_DIR)/wavevm_admission_provider.c \
+	$(COMMON_DIR)/wavevm_admission_authority_owner.c \
 	$(COMMON_DIR)/wavevm_admission_stage.c \
 	$(COMMON_DIR)/wavevm_admission_transport.c \
 	$(COMMON_DIR)/wavevm_admission_route.c \
